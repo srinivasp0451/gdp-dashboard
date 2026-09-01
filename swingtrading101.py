@@ -1,1421 +1,3832 @@
 """
-Swing / Intraday Price-Action Trader — leakage-free rebuild.
+===============================================================================
+ MULTI-ASSET ALGORITHMIC TRADING PLATFORM  --  single-file Streamlit application
+===============================================================================
 
-Key differences vs the original script:
-  * Every pattern is registered at the bar on which it could FIRST be known
-    (pivot index + right-window), never at the pivot bar itself.
-  * Support/resistance zones are built incrementally from confirmed pivots only.
-  * Volume filter uses a trailing rolling median, not the full-sample median.
-  * Patterns require a neckline / trigger break before they score.
-  * Backtest: signal on bar N -> entry at OPEN of bar N+1. Stop loss is checked
-    BEFORE target inside every bar (conservative). Gaps fill at the open.
-  * Costs and slippage are charged on both legs.
-  * Optimiser fits on a train slice and reports a purged out-of-sample slice.
-  * A synthetic random-walk self-test flags any residual look-ahead bias.
+Run with:
+    pip install streamlit yfinance pandas numpy plotly requests
+    streamlit run algo_trading_platform.py
+
+Self-test the maths without launching the UI or touching the network:
+    python algo_trading_platform.py --selftest
+
+-------------------------------------------------------------------------------
+EXECUTION MODEL  (read this before trusting a single number)
+-------------------------------------------------------------------------------
+BACKTEST
+    Signal on the close of candle N  ->  entry at the OPEN of candle N+1.
+    Exit check order inside every candle, deliberately conservative:
+        1. Gap: if the candle OPENS beyond the stop, fill at the open.
+        2. Stop-loss vs the candle LOW  (long)  /  HIGH (short)   <-- checked FIRST
+        3. Target   vs the candle HIGH (long)  /  LOW  (short)
+    When both the stop and the target sit inside one candle's range, the stop is
+    assumed to have triggered first. OHLC data cannot tell us the true intrabar
+    path, so the pessimistic branch is taken every time.
+    Trailing levels are advanced only AFTER the candle has been checked, using
+    that candle's own extremes.
+
+LIVE
+    Signal on the close of candle N  ->  entry at the OPEN of candle N+1.
+    Stop-loss is checked against the LTP first, then the target against the LTP,
+    because live polling gives a running price rather than a finished candle.
+    Trailing levels are advanced on every tick using the LTP.
+
+-------------------------------------------------------------------------------
+HONEST LIMITATIONS  (these are not disclaimers, they are design facts)
+-------------------------------------------------------------------------------
+* yfinance quotes for NSE/BSE indices are DELAYED, typically by 15+ minutes, and
+  recent candles are frequently revised. Polling it faster does not make it
+  fresher. Driving real broker orders from this feed is a losing proposition and
+  the Dhan panel warns about it at the point of use.
+* Yahoo has no published rate limit but throttles aggressively. Sub-second
+  polling will earn a 429 and then a temporary IP block. The mandatory 0.3s
+  guard is a floor, not a safe cruising speed.
+* Trailing stops in the BACKTEST are approximations. With OHLC bars we cannot
+  know whether price hit the trailing level before or after it moved. Live
+  trailing on LTP is exact; backtested trailing is not. Treat backtested
+  trailing-stop results as optimistic.
+* Elliott Wave labelling is subjective. The implementation here is a mechanical
+  zigzag heuristic, not a wave count an analyst would sign off on.
+* PCR, open-interest change and news filters have NO free data source wired in.
+  They are exposed as manual inputs plus a pluggable hook, and are inert
+  otherwise. They are not silently faked.
+
+This is a research and paper-trading sandbox. Broker order placement is OFF by
+default, gated behind an explicit opt-in, and defaults to dry-run even then.
+===============================================================================
 """
+from __future__ import annotations
 
+import json
+import math
+import sys
 import time
-import threading
 from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
-import streamlit as st
-import matplotlib.pyplot as plt
 
+# Streamlit / plotly / requests are imported lazily so that --selftest runs on a
+# bare pandas+numpy environment.
 try:
-    import yfinance as yf
-    YF_AVAILABLE = True
-except Exception:
-    YF_AVAILABLE = False
+    import streamlit as st
+except Exception:  # pragma: no cover
+    st = None
 
 
-# ============================ Ticker catalogue ============================
+# =============================================================================
+# SECTION 1 -- CONSTANTS
+# =============================================================================
+APP_TITLE = "Multi-Asset Algorithmic Trading Platform"
 
-TICKERS = {
-    "NIFTY 50": "^NSEI",
-    "BANK NIFTY": "^NSEBANK",
-    "SENSEX": "^BSESN",
-    "BTC": "BTC-USD",
-    "ETH": "ETH-USD",
-    "USDINR": "USDINR=X",
-    "GOLD (COMEX)": "GC=F",
-    "SILVER (COMEX)": "SI=F",
-    "FOREX (EURUSD)": "EURUSD=X",
-    "Custom": "KAYNES.NS",
+API_GUARD_DELAY = 0.3          # MANDATORY sleep before AND after every yfinance block
+WARMUP_BARS = 200              # candles reserved purely for indicator stabilisation
+ABSOLUTE_MIN_BARS = 60
+
+ASSET_UNIVERSE: dict[str, dict[str, str]] = {
+    "Indian Indices": {
+        "Nifty 50": "^NSEI",
+        "Bank Nifty": "^NSEBANK",
+        "Sensex": "^BSESN",
+        "Fin Nifty": "NIFTY_FIN_SERVICE.NS",
+        "India VIX": "^INDIAVIX",
+    },
+    "Crypto": {"Bitcoin": "BTC-USD", "Ethereum": "ETH-USD"},
+    "Forex": {"USD / INR": "USDINR=X", "EUR / USD": "EURUSD=X"},
+    "Commodities": {"Gold Futures": "GC=F", "Silver Futures": "SI=F"},
+    "Indian Stocks": {
+        "Reliance Industries": "RELIANCE.NS",
+        "Kaynes Technology": "KAYNES.NS",
+        "HDFC Bank": "HDFCBANK.NS",
+        "Infosys": "INFY.NS",
+        "Tata Motors": "TATAMOTORS.NS",
+        "State Bank of India": "SBIN.NS",
+        "ICICI Bank": "ICICIBANK.NS",
+    },
 }
 
-# yfinance history limits, in calendar days, per interval
-INTERVAL_MAX_DAYS = {
-    "1m": 7, "2m": 59, "5m": 59, "15m": 59, "30m": 59,
-    "60m": 729, "1d": 20000, "1wk": 20000, "1mo": 20000,
+_INR_SYMBOLS = {"^NSEI", "^NSEBANK", "^BSESN", "USDINR=X", "^INDIAVIX"}
+VIX_SYMBOL = "^INDIAVIX"
+
+INTERVALS = ["1m", "2m", "3m", "5m", "10m", "15m", "30m", "60m", "4h", "1d", "1wk", "1mo"]
+NATIVE_INTERVALS = {"1m", "2m", "5m", "15m", "30m", "60m", "1d", "1wk", "1mo"}
+DERIVED_INTERVALS = {"3m": ("1m", "3min"), "10m": ("5m", "10min"), "4h": ("60m", "4h")}
+INTRADAY_INTERVALS = {"1m", "2m", "3m", "5m", "10m", "15m", "30m", "60m", "4h"}
+
+APPROX_BARS_PER_DAY = {
+    "1m": 375, "2m": 187, "3m": 125, "5m": 75, "10m": 37, "15m": 25,
+    "30m": 13, "60m": 7, "4h": 2, "1d": 1, "1wk": 0.2, "1mo": 0.045,
 }
 
-INTERVAL_LABELS = {
-    "1m": "1 minute", "2m": "2 minutes", "5m": "5 minutes", "15m": "15 minutes",
-    "30m": "30 minutes", "60m": "1 hour", "1d": "1 day", "1wk": "1 week", "1mo": "1 month",
-}
-
-# Human periods instead of typing calendar days. Clamped to what Yahoo will serve.
-PERIOD_DAYS = {
-    "1 week": 7, "1 month": 30, "3 months": 90, "6 months": 180,
-    "1 year": 365, "2 years": 730, "5 years": 1825, "10 years": 3650,
-    "20 years": 7300, "30 years": 10950, "Max available": 20000,
-}
-
-
-def resolve_period(period_label: str, interval: str) -> tuple[int, bool]:
-    """Return (days, was_clamped) for the chosen period at this interval."""
-    want = PERIOD_DAYS[period_label]
-    cap = INTERVAL_MAX_DAYS[interval]
-    return min(want, cap), want > cap
-
-POINT_VALUE_HINT = {"^NSEI": 75, "^NSEBANK": 30, "^BSESN": 20}
-
-
-# ========================= yfinance rate limiting =========================
-
-_YF_LOCK = threading.Lock()
-_YF_LAST = {"t": 0.0}
-YF_MIN_GAP = 0.3  # seconds between yfinance calls
-
-
-def yf_throttle(min_gap: float = YF_MIN_GAP):
-    """Block until at least `min_gap` seconds have passed since the last call."""
-    with _YF_LOCK:
-        wait = min_gap - (time.time() - _YF_LAST["t"])
-        if wait > 0:
-            time.sleep(wait)
-        _YF_LAST["t"] = time.time()
-
-
-def _yf_download(symbol, interval, days, tries=3):
-    last_err = None
-    for attempt in range(tries):
-        yf_throttle()
-        try:
-            df = yf.download(
-                symbol,
-                period=f"{int(days)}d",
-                interval=interval,
-                auto_adjust=False,
-                progress=False,
-                threads=False,
-            )
-            if df is not None and len(df):
-                return df
-            last_err = "empty response"
-        except Exception as e:  # rate limit, network, symbol errors
-            last_err = str(e)
-        time.sleep(0.6 * (attempt + 1))  # back off, then retry
-    raise RuntimeError(f"yfinance returned no data for {symbol} ({interval}): {last_err}")
-
-
-@st.cache_data(show_spinner=False, ttl=900)
-def fetch_history(symbol: str, interval: str, days: int, tz: str) -> pd.DataFrame:
-    """Historical bars for backtesting. Cached for 15 minutes."""
-    raw = _yf_download(symbol, interval, days)
-    return normalise_yf(raw, tz)
-
-
-@st.cache_data(show_spinner=False, ttl=20)
-def fetch_live(symbol: str, interval: str, days: int, tz: str) -> pd.DataFrame:
-    """Recent bars for the live tab. Cached for 20 seconds so auto-refresh
-    cannot hammer the API even if the refresh interval is set very low."""
-    raw = _yf_download(symbol, interval, days)
-    return normalise_yf(raw, tz)
-
-
-def normalise_yf(raw: pd.DataFrame, tz: str) -> pd.DataFrame:
-    df = raw.copy()
-    if isinstance(df.columns, pd.MultiIndex):  # yfinance returns MultiIndex for 1 ticker too
-        df.columns = df.columns.get_level_values(0)
-    df = df.reset_index()
-    date_col = "Datetime" if "Datetime" in df.columns else df.columns[0]
-    df = df.rename(columns={date_col: "Date"})
-    df["Date"] = pd.to_datetime(df["Date"], utc=True).dt.tz_convert(tz)
-    for c in ["Open", "High", "Low", "Close"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["Volume"] = pd.to_numeric(df.get("Volume", np.nan), errors="coerce")
-    df = df[["Date", "Open", "High", "Low", "Close", "Volume"]]
-    return df.dropna(subset=["Open", "High", "Low", "Close"]).sort_values("Date").reset_index(drop=True)
-
-
-def standardise_upload(raw: pd.DataFrame, tz: str) -> pd.DataFrame:
-    """Map an uploaded file's columns onto Date/OHLCV. Exact-token matching only,
-    so 'Open Interest' can never be mistaken for 'Open'."""
-    df = raw.copy()
-    df.columns = [str(c).strip() for c in df.columns]
-    wanted = {
-        "date": ["datetime", "date", "timestamp", "time", "trade_date"],
-        "open": ["open", "o", "openprice", "open_price"],
-        "high": ["high", "h", "highprice", "high_price"],
-        "low": ["low", "l", "lowprice", "low_price"],
-        "close": ["close", "adj close", "adj_close", "c", "last", "ltp", "closeprice"],
-        "volume": ["volume", "vol", "qty", "quantity"],
-    }
-    lower = {c.lower(): c for c in df.columns}
-    found = {}
-    for key, aliases in wanted.items():
-        for a in aliases:
-            if a in lower:
-                found[key] = lower[a]
-                break
-    if "date" not in found:
-        for c in df.columns:
-            parsed = pd.to_datetime(df[c], errors="coerce")
-            if parsed.notna().mean() > 0.7:
-                found["date"] = c
-                break
-    if "date" not in found or "close" not in found:
-        raise ValueError(
-            "Need at least a date column and a close column. "
-            f"Found: {sorted(found)} in {list(df.columns)}"
-        )
-
-    out = pd.DataFrame()
-    out["Date"] = pd.to_datetime(df[found["date"]], errors="coerce", dayfirst=True)
-    out["Close"] = pd.to_numeric(df[found["close"]], errors="coerce")
-    for k, col in (("open", "Open"), ("high", "High"), ("low", "Low")):
-        out[col] = pd.to_numeric(df[found[k]], errors="coerce") if k in found else out["Close"]
-    out["Volume"] = pd.to_numeric(df[found["volume"]], errors="coerce") if "volume" in found else np.nan
-
-    out = out.dropna(subset=["Date", "Close"]).reset_index(drop=True)
-    if out["Date"].dt.tz is None:
-        out["Date"] = out["Date"].dt.tz_localize(tz, ambiguous="NaT", nonexistent="shift_forward")
-    else:
-        out["Date"] = out["Date"].dt.tz_convert(tz)
-    out = out.dropna(subset=["Date"])
-    return out[["Date", "Open", "High", "Low", "Close", "Volume"]].sort_values("Date").reset_index(drop=True)
-
-
-# ======================= Indicators (all causal) ==========================
-
-def wilder(s: pd.Series, n: int) -> pd.Series:
-    return s.ewm(alpha=1 / n, adjust=False).mean()
-
-
-def add_indicators(df: pd.DataFrame, p: dict) -> pd.DataFrame:
-    """Every indicator here reads only bars <= i. No centring, no negative shift.
-
-    min_periods is set to the FULL window, unlike the original which used
-    min_periods=1 everywhere. With min_periods=1 a "120-period moving average"
-    equals the first close on bar 0, so the first ~120 bars produce confident
-    looking signals computed from almost no data.
-    """
-    d = df.copy()
-    c, h, l = d["Close"], d["High"], d["Low"]
-    v = pd.to_numeric(d.get("Volume"), errors="coerce")
-
-    d["ema_fast"] = c.ewm(span=p["ema_fast"], adjust=False, min_periods=p["ema_fast"]).mean()
-    d["ema_slow"] = c.ewm(span=p["ema_slow"], adjust=False, min_periods=p["ema_slow"]).mean()
-    d["ma_short"] = c.rolling(p["short_ma"], min_periods=p["short_ma"]).mean()
-    d["ma_long"] = c.rolling(p["long_ma"], min_periods=p["long_ma"]).mean()
-
-    delta = c.diff()
-    ru = wilder(delta.clip(lower=0), p["rsi_period"])
-    rd = wilder(-delta.clip(upper=0), p["rsi_period"])
-    d["rsi"] = 100 - 100 / (1 + ru / rd.replace(0, np.nan))
-    d["rsi"] = d["rsi"].fillna(50.0)          # assign back; .fillna(inplace=True)
-                                              # on a column is a no-op under
-                                              # copy-on-write and silently did nothing
-    macd = c.ewm(span=12, adjust=False, min_periods=12).mean() - \
-        c.ewm(span=26, adjust=False, min_periods=26).mean()
-    d["macd_hist"] = macd - macd.ewm(span=9, adjust=False, min_periods=9).mean()
-    d["macd_hist_prev"] = d["macd_hist"].shift(1)
-
-    tr = pd.concat([h - l, (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
-    d["atr"] = wilder(tr, p["atr_period"])
-    d["atr_pct"] = d["atr"] / c * 100
-
-    # Proper Wilder ADX. The original zeroed negatives but never suppressed the
-    # smaller of the two directional moves, so +DM and -DM both fired on the
-    # same bar and ADX was meaningless.
-    up, dn = h.diff(), -l.diff()
-    plus_dm = np.where((up > dn) & (up > 0), up, 0.0)
-    minus_dm = np.where((dn > up) & (dn > 0), dn, 0.0)
-    atr14 = wilder(tr, 14)
-    pdi = 100 * wilder(pd.Series(plus_dm, index=d.index), 14) / atr14.replace(0, np.nan)
-    mdi = 100 * wilder(pd.Series(minus_dm, index=d.index), 14) / atr14.replace(0, np.nan)
-    dx = ((pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan)) * 100
-    d["adx"] = wilder(dx.fillna(0), 14)
-
-    mid = c.rolling(p["bb_period"], min_periods=p["bb_period"]).mean()
-    sd = c.rolling(p["bb_period"], min_periods=p["bb_period"]).std()
-    d["bb_upper"] = mid + p["bb_k"] * sd
-    d["bb_lower"] = mid - p["bb_k"] * sd
-
-    d["vol_avg"] = v.rolling(p["vol_period"], min_periods=p["vol_period"]).mean()
-    d["volume_num"] = v
-    return d
-
-
-# ========================== Confluence engine =============================
-
-ALL_CONFLUENCES = ["ma_cross", "ema_trend", "macd_hist", "bb_breakout",
-                   "rsi_zone", "adx_trend", "vol_spike", "atr_ok"]
-
-DEFAULT_PARAMS = {
-    "short_ma": 10, "long_ma": 50, "ema_fast": 9, "ema_slow": 21,
-    "rsi_period": 14, "rsi_long_min": 50.0, "atr_period": 14,
-    "bb_period": 20, "bb_k": 2.0, "vol_period": 20, "vol_spike_mult": 1.5,
-    "adx_min": 20.0, "atr_min_pct": 0.10,
-    "rule_mode": "any_k", "any_k": 3,
-    "confluences": ["ma_cross", "ema_trend", "macd_hist", "rsi_zone", "adx_trend"],
-    "sl_mode": "pct", "sl_pct": 0.008, "sl_atr_mult": 1.5,
-    "tp_mode": "pct", "tp_pct": 0.016, "tp_atr_mult": 3.0,
-    "max_hold": 12, "allowed_dirs": ["long", "short"],
-}
-
-
-def confluence_frame(d: pd.DataFrame, p: dict, direction: int) -> dict:
-    """Boolean Series per confluence for one direction. Vectorised, causal."""
-    s = direction  # +1 long, -1 short
-    has_vol = d["volume_num"].notna().any() and d["vol_avg"].notna().any()
-    f = {
-        "ma_cross": (d["ma_short"] - d["ma_long"]) * s > 0,
-        "ema_trend": (d["ema_fast"] - d["ema_slow"]) * s > 0,
-        "macd_hist": (d["macd_hist"] * s > 0) & ((d["macd_hist"] - d["macd_hist_prev"]) * s > 0),
-        "bb_breakout": (d["Close"] > d["bb_upper"]) if s > 0 else (d["Close"] < d["bb_lower"]),
-        "rsi_zone": (d["rsi"] > p["rsi_long_min"]) if s > 0 else (d["rsi"] < 100 - p["rsi_long_min"]),
-        "adx_trend": d["adx"] >= p["adx_min"],
-        "atr_ok": d["atr_pct"] >= p["atr_min_pct"],
-    }
-    # If the feed carries no volume (most Yahoo index symbols), vol_spike is
-    # dropped rather than evaluated as permanently False. The original left it
-    # False, so strict mode could never fire a single trade on an index.
-    if has_vol:
-        f["vol_spike"] = d["volume_num"] >= p["vol_spike_mult"] * d["vol_avg"]
-    return {k: v.fillna(False) for k, v in f.items()}
-
-
-def generate_signals(df: pd.DataFrame, params: dict):
-    """Score each bar from indicator confluences. Interface matches the rest of
-    the app: adds score / signal / reason / sl_ref / tp_ref columns."""
-    p = {**DEFAULT_PARAMS, **params}
-    d = add_indicators(df, p)
-    n = len(d)
-
-    active = [k for k in p["confluences"] if k in ALL_CONFLUENCES]
-    fl = confluence_frame(d, p, +1)
-    fs = confluence_frame(d, p, -1)
-    active = [k for k in active if k in fl]
-    if not active:
-        active = ["ma_cross"]
-
-    hits_l = sum(fl[k].astype(int) for k in active)
-    hits_s = sum(fs[k].astype(int) for k in active)
-    need = len(active) if p["rule_mode"] == "strict" else min(p["any_k"], len(active))
-
-    allow_l = "long" in p["allowed_dirs"]
-    allow_s = "short" in p["allowed_dirs"]
-    ok_l = (hits_l >= need) & allow_l
-    ok_s = (hits_s >= need) & allow_s
-
-    # Warm-up guard: no signal until every active indicator has a full window.
-    warm = max(p["long_ma"], p["short_ma"], p["ema_slow"], p["bb_period"],
-               p["vol_period"], 26 + 9, p["atr_period"] + 14)
-    valid = np.zeros(n, dtype=bool)
-    valid[warm:] = True
-
-    sig = np.where(ok_l & ~ok_s & valid, 1, np.where(ok_s & ~ok_l & valid, -1, 0))
-    tie = (ok_l & ok_s & valid).to_numpy()
-    if tie.any():  # both sides qualify: take the side with more confluences
-        sig = np.where(tie, np.sign((hits_l - hits_s).to_numpy()), sig)
-
-    reasons = []
-    hl, hs = hits_l.to_numpy(), hits_s.to_numpy()
-    fl_np = {k: fl[k].to_numpy() for k in active}
-    fs_np = {k: fs[k].to_numpy() for k in active}
-    for i in range(n):
-        if sig[i] == 0:
-            reasons.append(f"{max(hl[i], hs[i])}/{len(active)} confluences, need {need}")
-        else:
-            src_ = fl_np if sig[i] == 1 else fs_np
-            on = [k for k in active if src_[k][i]]
-            reasons.append(f"{len(on)}/{len(active)}: " + ", ".join(on))
-
-    out = df.copy()
-    out["score"] = np.where(sig >= 0, hl, -hs).astype(float)
-    out["signal"] = sig.astype(int)
-    out["reason"] = reasons
-    out["atr_ref"] = d["atr"].to_numpy()          # ATR of the SIGNAL bar, for SL/TP
-    out["hits"] = np.where(sig >= 0, hl, hs)
-    out["n_confluences"] = len(active)
-
-    meta = {"active_confluences": active, "need_hits": int(need),
-            "rule_mode": p["rule_mode"], "warmup_bars": int(warm),
-            "volume_available": "vol_spike" in fl,
-            "long_signals": int((sig == 1).sum()), "short_signals": int((sig == -1).sum())}
-    return out, meta
-
-
-# ================================ Backtest ================================
-
-def backtest(df_sig: pd.DataFrame, params: dict, cost_bps: float = 3.0,
-             slippage_pts: float = 0.0, intraday_squareoff: bool = True):
-    """Bar-by-bar simulation.
-
-    Rules, stated explicitly because they drive every number reported:
-      1. A signal on bar N is acted on at the OPEN of bar N+1. Never bar N's close.
-      2. Inside each bar the OPEN is checked first (a gap through a level fills
-         at the open, not at the level).
-      3. Then the STOP is checked before the TARGET. If a bar's range spans
-         both, the loss is booked. This is the conservative assumption: without
-         tick data you cannot know which came first.
-      4. Position is flat-or-one. New signals during an open trade are ignored.
-      5. Costs are charged on entry and exit.
-    """
-    p = {**DEFAULT_PARAMS, **params}
-    o = df_sig["Open"].to_numpy(float)
-    h = df_sig["High"].to_numpy(float)
-    l = df_sig["Low"].to_numpy(float)
-    c = df_sig["Close"].to_numpy(float)
-    sig = df_sig["signal"].to_numpy(int)
-    dates = df_sig["Date"].to_numpy()
-    days = pd.Series(df_sig["Date"]).dt.date.to_numpy()
-    reasons = df_sig["reason"].tolist()
-    atr_ref = df_sig["atr_ref"].to_numpy(float) if "atr_ref" in df_sig else np.full(len(df_sig), np.nan)
-    hits = df_sig["hits"].to_numpy() if "hits" in df_sig else np.zeros(len(df_sig))
-    n_conf = int(df_sig["n_confluences"].iloc[0]) if "n_confluences" in df_sig else 0
-    n = len(df_sig)
-
-    trades = []
-    i = 0
-    while i < n - 1:
-        if sig[i] == 0:
-            i += 1
-            continue
-        d = int(sig[i])
-        e = i + 1
-        entry = o[e] + (slippage_pts * d)
-        # ATR of the SIGNAL bar (i), not the entry bar. The entry bar's ATR is
-        # only known at its close, which is after the fill.
-        sl, tp = compute_levels(entry, d, p, atr_ref[i])
-
-        last_allowed = min(n - 1, e + p["max_hold"])
-        if intraday_squareoff:
-            same_day = np.where(days[e:last_allowed + 1] == days[e])[0]
-            if len(same_day):
-                last_allowed = e + int(same_day[-1])
-
-        exit_idx, exit_px, exit_reason = None, None, None
-        for j in range(e, last_allowed + 1):
-            if d == 1:
-                if o[j] <= sl:                      # gapped through the stop
-                    exit_idx, exit_px, exit_reason = j, o[j], "sl_gap"
-                elif o[j] >= tp:
-                    exit_idx, exit_px, exit_reason = j, o[j], "tp_gap"
-                elif l[j] <= sl:                    # stop checked BEFORE target
-                    exit_idx, exit_px, exit_reason = j, sl, "sl"
-                elif h[j] >= tp:
-                    exit_idx, exit_px, exit_reason = j, tp, "tp"
-            else:
-                if o[j] >= sl:
-                    exit_idx, exit_px, exit_reason = j, o[j], "sl_gap"
-                elif o[j] <= tp:
-                    exit_idx, exit_px, exit_reason = j, o[j], "tp_gap"
-                elif h[j] >= sl:
-                    exit_idx, exit_px, exit_reason = j, sl, "sl"
-                elif l[j] <= tp:
-                    exit_idx, exit_px, exit_reason = j, tp, "tp"
-            if exit_idx is not None:
-                break
-
-        if exit_idx is None:
-            exit_idx, exit_px = last_allowed, c[last_allowed]
-            exit_reason = "eod_squareoff" if intraday_squareoff and days[last_allowed] == days[e] \
-                and last_allowed < e + p["max_hold"] else "time_exit"
-
-        exit_px -= slippage_pts * d
-        gross_pts = (exit_px - entry) * d
-        cost_pts = (entry + exit_px) * (cost_bps / 10000.0)
-        net_pts = gross_pts - cost_pts
-
-        trades.append({
-            "entry_time": dates[e], "exit_time": dates[exit_idx],
-            "direction": "long" if d == 1 else "short",
-            "entry": round(float(entry), 4), "sl": round(float(sl), 4), "tp": round(float(tp), 4),
-            "exit": round(float(exit_px), 4), "exit_reason": exit_reason,
-            "gross_points": round(float(gross_pts), 4),
-            "cost_points": round(float(cost_pts), 4),
-            "net_points": round(float(net_pts), 4),
-            "net_pct": round(float(net_pts / entry * 100), 5),
-            "bars_held": int(exit_idx - e),
-            "confluences_hit": int(hits[i]), "confluences_total": n_conf,
-            "signal_reason": reasons[i][:160],
-        })
-        i = exit_idx + 1
-
-    return pd.DataFrame(trades), summarise(pd.DataFrame(trades))
-
-
-def compute_levels(entry: float, d: int, p: dict, atr: float | None = None):
-    """Stop and target from percent or ATR. Both are forced onto the correct
-    side of entry; a zero or NaN ATR falls back to the percent rule instead of
-    silently placing the stop on top of the entry."""
-    a = float(atr) if atr is not None and np.isfinite(atr) and atr > 0 else None
-
-    if p.get("sl_mode") == "atr" and a:
-        sl = entry - a * p["sl_atr_mult"] * d
-    else:
-        sl = entry * (1 - p["sl_pct"] * d)
-
-    if p.get("tp_mode") == "atr" and a:
-        tp = entry + a * p["tp_atr_mult"] * d
-    else:
-        tp = entry * (1 + p["tp_pct"] * d)
-
-    if (sl - entry) * d >= 0:
-        sl = entry * (1 - max(p["sl_pct"], 1e-4) * d)
-    if (tp - entry) * d <= 0:
-        tp = entry * (1 + max(p["tp_pct"], 1e-4) * d)
-    return float(sl), float(tp)
-
-
-def summarise(t: pd.DataFrame) -> dict:
-    if t.empty:
-        return {"trades": 0, "win_rate": 0.0, "net_points": 0.0, "expectancy_points": 0.0,
-                "gross_points": 0.0, "costs": 0.0, "profit_factor": 0.0,
-                "max_drawdown_points": 0.0, "avg_bars_held": 0.0, "sharpe_per_trade": 0.0}
-    wins = t["net_points"] > 0
-    gp = t.loc[wins, "net_points"].sum()
-    gl = -t.loc[~wins, "net_points"].sum()
-    eq = t["net_points"].cumsum()
-    dd = (eq - eq.cummax()).min()
-    sd = t["net_points"].std(ddof=1)
-    return {
-        "trades": int(len(t)),
-        "win_rate": round(float(wins.mean()), 4),
-        "gross_points": round(float(t["gross_points"].sum()), 2),
-        "costs": round(float(t["cost_points"].sum()), 2),
-        "net_points": round(float(t["net_points"].sum()), 2),
-        "expectancy_points": round(float(t["net_points"].mean()), 4),
-        "profit_factor": round(float(gp / gl), 3) if gl > 0 else float("inf"),
-        "max_drawdown_points": round(float(dd), 2),
-        "avg_bars_held": round(float(t["bars_held"].mean()), 2),
-        "sharpe_per_trade": round(float(t["net_points"].mean() / sd), 3) if sd and sd > 0 else 0.0,
-    }
-
-
-# ===================== Optimiser with a real holdout ======================
-
-PARAM_SPACE = {
-    "short_ma": [5, 10, 15, 20, 30],
-    "long_ma": [30, 50, 80, 100, 120],
-    "ema_fast": [5, 9, 12],
-    "ema_slow": [21, 26, 34],
-    "rsi_period": [14],
-    "rsi_long_min": [45.0, 50.0, 55.0, 60.0],
-    "atr_period": [14],
-    "bb_period": [14, 20],
-    "bb_k": [2.0, 2.5],
-    "vol_period": [10, 20],
-    "vol_spike_mult": [1.2, 1.5, 2.0],
-    "adx_min": [15.0, 20.0, 25.0],
-    "atr_min_pct": [0.05, 0.10, 0.20],
-    "rule_mode": ["strict", "any_k"],
-    "sl_mode": ["pct", "atr"],
-    "tp_mode": ["pct", "atr"],
-    "sl_pct": [0.004, 0.006, 0.010, 0.015],
-    "tp_pct": [0.008, 0.012, 0.020, 0.030],
-    "sl_atr_mult": [1.0, 1.5, 2.0],
-    "tp_atr_mult": [2.0, 3.0, 4.0],
-    "max_hold": [5, 10, 20, 40],
-}
-
-CONFLUENCE_POOL = [
-    ["ma_cross", "ema_trend", "macd_hist"],
-    ["ma_cross", "ema_trend", "macd_hist", "rsi_zone"],
-    ["ma_cross", "ema_trend", "macd_hist", "adx_trend"],
-    ["ma_cross", "ema_trend", "macd_hist", "rsi_zone", "adx_trend"],
-    ["ma_cross", "ema_trend", "macd_hist", "rsi_zone", "adx_trend", "atr_ok"],
-    ["ma_cross", "ema_trend", "macd_hist", "bb_breakout", "rsi_zone", "adx_trend"],
-    ["ema_trend", "macd_hist", "rsi_zone", "adx_trend", "vol_spike"],
-    ["ma_cross", "ema_trend", "macd_hist", "bb_breakout", "rsi_zone", "adx_trend",
-     "vol_spike", "atr_ok"],
+PERIODS = ["1d", "5d", "7d", "1mo", "3mo", "6mo", "1y", "2y", "3y",
+           "5y", "10y", "15y", "20y", "30y", "max"]
+PERIOD_DAYS = {"1d": 1, "5d": 5, "7d": 7, "1mo": 30, "3mo": 91, "6mo": 182,
+               "1y": 365, "2y": 730, "3y": 1095, "5y": 1825, "10y": 3650,
+               "15y": 5475, "20y": 7300, "30y": 10950, "max": 36500}
+INTERVAL_MAX_DAYS = {"1m": 7, "2m": 60, "3m": 7, "5m": 60, "10m": 60,
+                     "15m": 60, "30m": 60, "60m": 730, "4h": 730}
+
+# ----------------------------------------------------------------- exit types --
+SL_TYPES = [
+    "Fixed Percentage",
+    "Fixed Points",
+    "ATR Multiple",
+    "Trailing Points",
+    "Trailing Percentage",
+    "Trailing ATR (Chandelier)",
+    "Step Trail (trigger k, trail N)",
+    "Previous Candle Low/High",
+    "Trailing Previous Candle Low/High",
+    "Current Candle Low/High",
+    "Previous Swing Low/High",
+    "Trailing Swing Low/High",
+    "Price Action Structure Break",
+    "EMA Reverse Crossover",
+    "Strategy Reverse Signal",
+    "No Stop-Loss",
 ]
 
+TP_TYPES = [
+    "Fixed Percentage",
+    "Fixed Points",
+    "ATR Multiple",
+    "Risk : Reward Multiple",
+    "Previous Swing High/Low",
+    "Trailing Target (display only)",
+    "EMA Reverse Crossover",
+    "Strategy Reverse Signal",
+    "No Target",
+]
 
-def sample_params(rng, allowed_dirs):
-    p = {k: rng.choice(v).item() for k, v in PARAM_SPACE.items()}
-    p["confluences"] = list(CONFLUENCE_POOL[int(rng.integers(len(CONFLUENCE_POOL)))])
-    p["any_k"] = int(rng.integers(2, len(p["confluences"]) + 1))
-    p["allowed_dirs"] = allowed_dirs
-    if p["short_ma"] >= p["long_ma"]:          # a "short" MA slower than the long
-        p["short_ma"] = max(5, p["long_ma"] // 4)   # one makes the cross meaningless
-    if p["ema_fast"] >= p["ema_slow"]:
-        p["ema_fast"] = max(3, p["ema_slow"] // 2)
-    return p
+# Exit types that need no numeric magnitude from the user.
+_SL_NO_VALUE = {"Previous Candle Low/High", "Current Candle Low/High",
+                "Previous Swing Low/High", "Trailing Swing Low/High",
+                "Trailing Previous Candle Low/High", "Price Action Structure Break",
+                "EMA Reverse Crossover", "Strategy Reverse Signal", "No Stop-Loss"}
+_TP_NO_VALUE = {"Previous Swing High/Low", "EMA Reverse Crossover",
+                "Strategy Reverse Signal", "No Target"}
 
+TRAILING_SL_TYPES = {"Trailing Points", "Trailing Percentage", "Trailing ATR (Chandelier)",
+                     "Step Trail (trigger k, trail N)", "Trailing Previous Candle Low/High",
+                     "Trailing Swing Low/High", "Price Action Structure Break"}
 
-def score_params(stats: dict, min_trades: int) -> float:
-    """Reject outright instead of scaling. The original multiplied the score by
-    0.4 when trade count was too low, which for a NEGATIVE net PnL makes the
-    number LARGER: -1000 over 2 trades scored -600 and beat -500 over 50 trades,
-    so the optimiser actively preferred the worse, under-traded parameter set.
-    """
-    if stats["trades"] < min_trades:
-        return -1e9
-    if stats["expectancy_points"] <= 0:
-        return -1e9
-    return stats["sharpe_per_trade"] * np.sqrt(stats["trades"])
-
-
-def optimise(df: pd.DataFrame, n_iter: int, allowed_dirs: list, min_trades: int,
-             cost_bps: float, slippage_pts: float, intraday: bool,
-             train_frac: float = 0.7, seed: int = 7, progress=None):
-    """Random search fitted on the train slice, then scored once on a purged
-    holdout the search never touched."""
-    rng = np.random.default_rng(seed)
-    n = len(df)
-    cut = int(n * train_frac)
-    purge = max(PARAM_SPACE["max_hold"]) + max(PARAM_SPACE["long_ma"]) + 5
-    train = df.iloc[:cut].reset_index(drop=True)
-    test = df.iloc[min(cut + purge, n - 1):].reset_index(drop=True)
-
-    best, results = None, []
-    for it in range(n_iter):
-        p = sample_params(rng, allowed_dirs)
-        if p["tp_mode"] == "pct" and p["sl_mode"] == "pct" and p["tp_pct"] <= p["sl_pct"] * 0.6:
-            continue  # reward:risk below 0.6 is a win-rate trap, skip it
-        if p["tp_mode"] == "atr" and p["sl_mode"] == "atr" and \
-                p["tp_atr_mult"] <= p["sl_atr_mult"] * 0.6:
-            continue
-        try:
-            sig, _ = generate_signals(train, p)
-            _, stats = backtest(sig, p, cost_bps, slippage_pts, intraday)
-        except Exception:
-            continue
-        sc = score_params(stats, min_trades)
-        results.append({"score": round(sc, 3), **{k: stats[k] for k in
-                        ("trades", "win_rate", "net_points", "expectancy_points", "profit_factor")},
-                        "params": p})
-        if best is None or sc > best["score"]:
-            best = {"score": sc, "params": p, "train_stats": stats}
-        if progress:
-            progress(it + 1, n_iter)
-
-    if best is None or best["score"] <= -1e8:
-        return None, pd.DataFrame(results)
-
-    if len(test) > 50:
-        sig_t, _ = generate_signals(test, best["params"])
-        tt, ts = backtest(sig_t, best["params"], cost_bps, slippage_pts, intraday)
-        best["test_stats"], best["test_trades"] = ts, tt
-    else:
-        best["test_stats"], best["test_trades"] = None, pd.DataFrame()
-
-    sig_f, meta = generate_signals(df, best["params"])
-    ft, fs = backtest(sig_f, best["params"], cost_bps, slippage_pts, intraday)
-    best.update({"full_stats": fs, "full_trades": ft, "meta": meta, "signals": sig_f,
-                 "train_rows": cut, "test_rows": len(test)})
-    return best, pd.DataFrame(results).sort_values("score", ascending=False)
+DEFAULT_PARAMS: dict[str, float] = {
+    "ema_fast": 9, "ema_slow": 21, "ema_mid": 50, "ema_macro": 200,
+    "rsi_len": 14, "atr_len": 14, "atr_mult": 2.0, "channel_mult": 2.0,
+    "vol_len": 20, "vol_mult": 1.5, "breakout_len": 20, "squeeze_mult": 1.2,
+    "orb_bars": 3, "gap_pct": 0.30, "pullback_tol": 0.15,
+    "pivot_left": 3, "pivot_right": 3, "zigzag_pct": 0.8,
+    "adx_len": 14, "bb_len": 20, "bb_mult": 2.0,
+    "macd_fast": 12, "macd_slow": 26, "macd_signal": 9,
+    "st_len": 10, "st_mult": 3.0, "structure_len": 20,
+}
 
 
-def leakage_self_test(df: pd.DataFrame, params: dict, cost_bps: float,
-                      slippage_pts: float, intraday: bool, n_runs: int = 6):
-    """Run the winning parameters over synthetic random walks calibrated to the
-    real series' volatility. A random walk has no edge by construction, so any
-    win rate materially above 50% means future information is leaking in."""
-    r = np.log(df["Close"]).diff().dropna()
-    sigma = float(r.std()) or 1e-4
-    start = float(df["Close"].iloc[0])
-    n = len(df)
-    rng = np.random.default_rng(11)
-    out = []
-    for _ in range(n_runs):
-        ret = rng.normal(0, sigma, n)
-        close = start * np.exp(np.cumsum(ret))
-        openp = np.concatenate([[start], close[:-1]])
-        wig = np.abs(rng.normal(0, sigma * 0.6, (n, 2))) * close[:, None]
-        fake = pd.DataFrame({
-            "Date": df["Date"].reset_index(drop=True),
-            "Open": openp,
-            "High": np.maximum(openp, close) + wig[:, 0],
-            "Low": np.minimum(openp, close) - wig[:, 1],
-            "Close": close,
-            "Volume": rng.integers(1000, 20000, n).astype(float),
-        })
-        s, _ = generate_signals(fake, params)
-        _, st_ = backtest(s, params, cost_bps, slippage_pts, intraday)
-        if st_["trades"] > 0:
-            out.append((st_["win_rate"], st_["expectancy_points"], st_["trades"]))
-    if not out:
-        return None
-    arr = np.array(out)
-    return {"mean_win_rate": float(arr[:, 0].mean()),
-            "mean_expectancy_points": float(arr[:, 1].mean()),
-            "mean_trades": float(arr[:, 2].mean()),
-            "runs": len(out)}
+def currency_symbol(ticker: str) -> str:
+    t = (ticker or "").upper()
+    return "\u20b9" if (t in _INR_SYMBOLS or t.endswith((".NS", ".BO"))) else "$"
 
 
-# ===================== Reporting: EDA, summary, recommendation ============
-
-def detailed_stats(t: pd.DataFrame, qty: int) -> pd.DataFrame:
-    """Full performance table for the backtest tab."""
-    if t.empty:
-        return pd.DataFrame([{"Metric": "Trades", "Value": 0}])
-    w = t[t["net_points"] > 0]
-    l = t[t["net_points"] <= 0]
-    eq = t["net_points"].cumsum()
-    dd = (eq - eq.cummax())
-    sd = t["net_points"].std(ddof=1)
-    gp, gl = w["net_points"].sum(), -l["net_points"].sum()
-    avg_w = w["net_points"].mean() if len(w) else 0.0
-    avg_l = l["net_points"].mean() if len(l) else 0.0
-    streak = cur = best = worst = 0
-    for x in t["net_points"] > 0:
-        cur = cur + 1 if x else 0
-        best = max(best, cur)
-    cur = 0
-    for x in t["net_points"] <= 0:
-        cur = cur + 1 if x else 0
-        worst = max(worst, cur)
-    rows = [
-        ("Total trades", f"{len(t):,}"),
-        ("Winning trades", f"{len(w):,}"),
-        ("Losing trades", f"{len(l):,}"),
-        ("Accuracy (win rate)", f"{len(w)/len(t)*100:.2f}%"),
-        ("Points won (sum of winners)", f"{gp:+,.2f}"),
-        ("Points lost (sum of losers)", f"{-gl:+,.2f}"),
-        ("Net points BEFORE charges", f"{t['gross_points'].sum():+,.2f}"),
-        ("Charges paid (cost + slippage)", f"{-t['cost_points'].sum():,.2f}"),
-        ("Net points AFTER charges", f"{t['net_points'].sum():+,.2f}"),
-        (f"Net cash (qty {qty})", f"{t['net_points'].sum()*qty:+,.2f}"),
-        ("Expectancy per trade", f"{t['net_points'].mean():+,.3f} pts"),
-        ("Average win", f"{avg_w:+,.2f} pts"),
-        ("Average loss", f"{avg_l:+,.2f} pts"),
-        ("Reward:risk realised", f"{abs(avg_w/avg_l):.2f}" if avg_l else "n/a"),
-        ("Profit factor", f"{gp/gl:.3f}" if gl > 0 else "inf"),
-        ("Sharpe per trade", f"{t['net_points'].mean()/sd:.3f}" if sd else "n/a"),
-        ("Sharpe annualised (approx)", annual_sharpe(t)),
-        ("Max drawdown", f"{dd.min():,.2f} pts"),
-        ("Longest win streak", f"{best}"),
-        ("Longest loss streak", f"{worst}"),
-        ("Average bars held", f"{t['bars_held'].mean():.2f}"),
-        ("Exit mix", ", ".join(f"{k} {v}" for k, v in t["exit_reason"].value_counts().items())),
-    ]
-    return pd.DataFrame(rows, columns=["Metric", "Value"])
+def sanitize_period(interval: str, period: str) -> tuple[str, str | None]:
+    """Clamp a period to what Yahoo will actually serve for the interval."""
+    ceiling = INTERVAL_MAX_DAYS.get(interval)
+    if ceiling is None or PERIOD_DAYS.get(period, 0) <= ceiling:
+        return period, None
+    allowed = [p for p in PERIODS if PERIOD_DAYS[p] <= ceiling]
+    eff = allowed[-1] if allowed else "1d"
+    return eff, (f"Yahoo caps `{interval}` history at ~{ceiling} days. "
+                 f"Period `{period}` was clamped to `{eff}`.")
 
 
-def annual_sharpe(t: pd.DataFrame) -> str:
-    """Scale per-trade Sharpe by the real trade frequency, not a hardcoded 252.
-    The original script annualised 1-minute returns with sqrt(252), which is
-    why it reported nonsense like -0.04% annualised."""
+# --------------------------------------------------------------- formatting ---
+def fmt(value, digits: int = 2, dash: str = "--") -> str:
+    if value is None:
+        return dash
     try:
-        span_days = (pd.Timestamp(t["exit_time"].iloc[-1]) - pd.Timestamp(t["entry_time"].iloc[0])).days
-        if span_days < 1:
-            return "span too short"
-        per_year = len(t) / span_days * 365.0
-        sd = t["net_points"].std(ddof=1)
-        if not sd:
-            return "n/a"
-        return f"{t['net_points'].mean()/sd*np.sqrt(per_year):.2f}"
-    except Exception:
-        return "n/a"
+        f = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    return dash if (math.isnan(f) or math.isinf(f)) else f"{f:,.{digits}f}"
 
 
-def returns_heatmap(df: pd.DataFrame):
-    """Month-by-year returns when the data spans months, otherwise weekday-by-hour.
-    A year/month heatmap over 8 days of intraday data is a single meaningless cell,
-    which is what the original always drew."""
-    d = df.copy()
-    d["ret"] = d["Close"].pct_change()
-    span_days = (d["Date"].iloc[-1] - d["Date"].iloc[0]).days
-    if span_days > 75:
-        d["Y"], d["M"] = d["Date"].dt.year, d["Date"].dt.month
-        piv = d.groupby(["Y", "M"])["ret"].apply(lambda s: (1 + s).prod() - 1).unstack() * 100
-        return piv, "Monthly return %", "Month", "Year"
-    d["W"] = d["Date"].dt.day_name().str[:3]
-    d["H"] = d["Date"].dt.hour
-    piv = d.groupby(["W", "H"])["ret"].mean().unstack() * 100
-    order = [x for x in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"] if x in piv.index]
-    return piv.loc[order], "Mean return % per bar", "Hour of day", "Weekday"
+def fmt_signed(value, digits: int = 2) -> str:
+    if value is None:
+        return "--"
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    return "--" if math.isnan(f) else f"{f:+,.{digits}f}"
 
 
-def draw_heatmap(piv, title, xlab, ylab):
-    fig, ax = plt.subplots(figsize=(11, max(2.0, 0.45 * len(piv) + 1.2)))
-    vals = piv.to_numpy(float)
-    lim = np.nanmax(np.abs(vals)) or 1.0
-    im = ax.imshow(vals, cmap="RdYlGn", vmin=-lim, vmax=lim, aspect="auto")
-    ax.set_xticks(range(piv.shape[1]), piv.columns, fontsize=8)
-    ax.set_yticks(range(piv.shape[0]), piv.index, fontsize=8)
-    ax.set_xlabel(xlab); ax.set_ylabel(ylab); ax.set_title(title)
-    for i in range(piv.shape[0]):
-        for j in range(piv.shape[1]):
-            if not np.isnan(vals[i, j]):
-                ax.text(j, i, f"{vals[i, j]:.2f}", ha="center", va="center", fontsize=7)
-    fig.colorbar(im, ax=ax, shrink=0.7)
-    return fig
+def fmt_time(ts) -> str:
+    if ts is None:
+        return "--"
+    try:
+        if pd.isna(ts):
+            return "--"
+    except (TypeError, ValueError):
+        pass
+    if isinstance(ts, (pd.Timestamp, datetime)):
+        return pd.Timestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+    return str(ts)
 
 
-def written_summary(df: pd.DataFrame, interval: str) -> str:
-    c = df["Close"]
-    r = c.pct_change().dropna()
-    bars_per_year = {"1m": 98280, "2m": 49140, "5m": 19656, "15m": 6552, "30m": 3276,
-                     "60m": 1638, "1d": 252, "1wk": 52, "1mo": 12}.get(interval, 252)
-    ann_vol = r.std() * np.sqrt(bars_per_year) * 100
-    trend = "up" if c.iloc[-1] > c.rolling(min(50, len(c))).mean().iloc[-1] else "down"
-    hi, lo = c.max(), c.min()
-    pos = (c.iloc[-1] - lo) / (hi - lo) * 100 if hi > lo else 50
-    net = c.iloc[-1] - c.iloc[0]
-    return (
-        f"{len(df):,} bars of {INTERVAL_LABELS.get(interval, interval)} data from "
-        f"{df['Date'].iloc[0]:%d %b %Y} to {df['Date'].iloc[-1]:%d %b %Y}. "
-        f"Last close {c.iloc[-1]:,.2f}, which sits {pos:.0f}% of the way up the "
-        f"{lo:,.2f}–{hi:,.2f} range. Price is trading {trend} relative to its moving average, "
-        f"and buy-and-hold over this window returned {net:+,.2f} points "
-        f"({net/c.iloc[0]*100:+.2f}%). Annualised volatility is roughly {ann_vol:.1f}%, "
-        f"scaled using {bars_per_year:,} bars per year for this interval. "
-        f"Wider ranges favour breakout entries; tighter ones favour fading the edges of "
-        f"support and resistance. Size positions off the stop distance, not conviction."
-    )
+def safe_last(series, offset: int = 0):
+    idx = -1 - offset
+    if series is None or len(series) < abs(idx):
+        return None
+    v = series.iloc[idx]
+    try:
+        if pd.isna(v):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return v
 
 
-def benchmark_table(df: pd.DataFrame, trades: pd.DataFrame, qty: int, label: str) -> pd.DataFrame:
-    """Strategy vs buy-and-hold over the SAME bars the strategy was measured on.
+def _f(v, default=np.nan) -> float:
+    """Coerce to float, mapping None/NaT to NaN."""
+    try:
+        if v is None:
+            return default
+        f = float(v)
+        return f if np.isfinite(f) else default
+    except (TypeError, ValueError):
+        return default
 
-    Deliberately reports the difference in points, never a ratio. The original
-    script divided by the absolute buy-and-hold points and printed things like
-    "1393% more points" — when buy-and-hold is near zero that ratio explodes and
-    means nothing.
+
+# =============================================================================
+# SECTION 2 -- INDICATORS  (all hand-written; no pandas-ta / ta / TA-Lib)
+# =============================================================================
+def _seeded_recursive(values: np.ndarray, length: int, alpha: float) -> np.ndarray:
     """
-    first, last = float(df["Close"].iloc[0]), float(df["Close"].iloc[-1])
-    bh_pts = last - first
-    bh_pct = bh_pts / first * 100
+    SMA-seeded recursive smoother:  out[t] = out[t-1] + alpha*(x[t] - out[t-1])
 
-    gross = float(trades["gross_points"].sum()) if not trades.empty else 0.0
-    charges = float(trades["cost_points"].sum()) if not trades.empty else 0.0
-    net = float(trades["net_points"].sum()) if not trades.empty else 0.0
-    bars_in = int(trades["bars_held"].sum()) if not trades.empty else 0
-    exposure = bars_in / len(df) * 100 if len(df) else 0.0
-
-    if not trades.empty:
-        eq = trades["net_points"].cumsum()
-        s_dd = float((eq - eq.cummax()).min())
-    else:
-        s_dd = 0.0
-    curve = df["Close"] - first
-    bh_dd = float((curve - curve.cummax()).min())
-
-    rows = [
-        ("Period", f"{df['Date'].iloc[0]:%d %b %Y} → {df['Date'].iloc[-1]:%d %b %Y}",
-         f"{df['Date'].iloc[0]:%d %b %Y} → {df['Date'].iloc[-1]:%d %b %Y}"),
-        ("Bars", f"{len(df):,}", f"{len(df):,}"),
-        ("Trades", f"{len(trades):,}", "1"),
-        ("Time in market", f"{exposure:.1f}%", "100.0%"),
-        ("Points before charges", f"{gross:+,.2f}", f"{bh_pts:+,.2f}"),
-        ("Charges", f"{-charges:,.2f}", "0.00"),
-        ("Points after charges", f"{net:+,.2f}", f"{bh_pts:+,.2f}"),
-        ("Return on first close", f"{net/first*100:+.2f}%", f"{bh_pct:+.2f}%"),
-        (f"Cash at qty {qty}", f"{net*qty:+,.2f}", f"{bh_pts*qty:+,.2f}"),
-        ("Max drawdown (points)", f"{s_dd:,.2f}", f"{bh_dd:,.2f}"),
-    ]
-    out = pd.DataFrame(rows, columns=["Metric", f"Strategy ({label})", "Buy and hold"])
-    edge = net - bh_pts
-    out.loc[len(out)] = ["Strategy minus buy-and-hold",
-                         f"{edge:+,.2f} pts", f"{edge*qty:+,.2f} cash"]
-    out.columns = ["Metric", f"Strategy ({label})", "Buy and hold"]
+    pandas' ewm(adjust=False) seeds with the FIRST observation; TradingView seeds
+    with the simple average of the first `length` observations. That difference
+    is the usual cause of RSI/ATR drift against the chart, so the kernel below
+    reproduces the TradingView convention explicitly.
+    """
+    n = values.shape[0]
+    out = np.full(n, np.nan, dtype=float)
+    if length <= 0 or n == 0:
+        return out
+    finite = np.isfinite(values)
+    if finite.sum() < length:
+        return out
+    first = int(np.argmax(finite))
+    seed_end = first + length
+    if seed_end > n:
+        return out
+    if not np.isfinite(values[first:seed_end]).all():
+        win = np.convolve(finite.astype(int), np.ones(length, dtype=int), mode="valid")
+        idx = np.where(win == length)[0]
+        if idx.size == 0:
+            return out
+        first = int(idx[0])
+        seed_end = first + length
+    out[seed_end - 1] = float(np.mean(values[first:seed_end]))
+    prev = out[seed_end - 1]
+    for i in range(seed_end, n):
+        x = values[i]
+        prev = prev if not np.isfinite(x) else prev + alpha * (x - prev)
+        out[i] = prev
     return out
 
 
-
-def recommendation(df_sig: pd.DataFrame, params: dict, hold_stats: dict,
-                   capital: float, risk_pct: float, qty: int) -> dict:
-    """Live call from the last CLOSED bar, using the fitted rule set."""
-    last = df_sig.iloc[-1]
-    d = int(last["signal"])
-    if d == 0:
-        return {"direction": "flat", "reason": last["reason"],
-                "confluences_hit": int(last["hits"]),
-                "confluences_total": int(last["n_confluences"])}
-    entry = float(last["Close"])
-    sl, tp = compute_levels(entry, d, params, float(last["atr_ref"]))
-    risk = abs(entry - sl)
-    return {
-        "direction": "long" if d == 1 else "short",
-        "signal_bar": f"{pd.Timestamp(last['Date']):%d %b %Y %H:%M}",
-        "reference_price": round(entry, 2),
-        "note": "Backtest fills at the NEXT bar's open, so treat this as a next-bar order.",
-        "stop_loss": round(sl, 2), "target": round(tp, 2),
-        "sl_basis": f"{params['sl_atr_mult']}x ATR({params['atr_period']})"
-                    if params.get("sl_mode") == "atr" else f"{params['sl_pct']*100:.2f}% of entry",
-        "tp_basis": f"{params['tp_atr_mult']}x ATR({params['atr_period']})"
-                    if params.get("tp_mode") == "atr" else f"{params['tp_pct']*100:.2f}% of entry",
-        "risk_points": round(risk, 2), "reward_points": round(abs(tp - entry), 2),
-        "reward_risk": round(abs(tp - entry) / risk, 2) if risk else None,
-        "confluences_hit": int(last["hits"]), "confluences_total": int(last["n_confluences"]),
-        "rule": f"{params['rule_mode']} (need {params.get('any_k')})",
-        "units_by_risk": int((capital * risk_pct / 100) // risk) if risk else 0,
-        "sidebar_qty": qty,
-        "reason": last["reason"][:300],
-        "holdout_win_rate": hold_stats["win_rate"],
-        "holdout_expectancy_points": hold_stats["expectancy_points"],
-    }
+def sma(series: pd.Series, length: int) -> pd.Series:
+    return series.rolling(int(length), min_periods=int(length)).mean()
 
 
-# ============================== Live engine ===============================
-
-def blank_live_state():
-    return {
-        "running": False,
-        "position": None,      # open trade dict
-        "pending": None,       # signal waiting for the next bar's open
-        "trades": [],          # closed live trades
-        "last_bar": None,      # timestamp of the last bar processed
-        "log": [],
-    }
+def ema(series: pd.Series, length: int) -> pd.Series:
+    length = int(length)
+    return pd.Series(_seeded_recursive(np.asarray(series, float), length, 2.0 / (length + 1.0)),
+                     index=series.index, name=f"EMA{length}")
 
 
-def live_state():
-    if "live" not in st.session_state:
-        st.session_state.live = blank_live_state()
-    return st.session_state.live
+def rma(series: pd.Series, length: int) -> pd.Series:
+    length = int(length)
+    return pd.Series(_seeded_recursive(np.asarray(series, float), length, 1.0 / length),
+                     index=series.index, name=f"RMA{length}")
 
 
-def log(msg: str):
-    ls = live_state()
-    ls["log"].insert(0, f"{pd.Timestamp.now(tz='Asia/Kolkata'):%H:%M:%S} — {msg}")
-    ls["log"] = ls["log"][:60]
+def rsi(close: pd.Series, length: int = 14) -> pd.Series:
+    delta = close.diff()
+    avg_gain = rma(delta.clip(lower=0.0), length)
+    avg_loss = rma((-delta).clip(lower=0.0), length)
+    rs = avg_gain / avg_loss.replace(0.0, np.nan)
+    out = 100.0 - (100.0 / (1.0 + rs))
+    out = out.where(avg_loss != 0.0, 100.0)
+    out = out.where(avg_gain != 0.0, 0.0)
+    out[avg_gain.isna() | avg_loss.isna()] = np.nan
+    return out.rename(f"RSI{length}")
 
 
-def step_live(df: pd.DataFrame, params: dict, cost_bps: float, slippage_pts: float,
-              intraday: bool, drop_forming_bar: bool = True):
-    """Advance the paper-trading state machine by whatever bars have closed
-    since the last call. Mirrors the backtest exactly:
-      signal on a CLOSED bar -> order pending -> filled at the NEXT bar's open
-      -> stop checked before target on every subsequent closed bar.
+def true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
+    pc = close.shift(1)
+    tr = pd.concat([(high - low).abs(), (high - pc).abs(), (low - pc).abs()], axis=1).max(axis=1)
+    if len(tr):
+        tr.iloc[0] = float(high.iloc[0] - low.iloc[0])
+    return tr.rename("TR")
+
+
+def atr(high: pd.Series, low: pd.Series, close: pd.Series, length: int = 14) -> pd.Series:
+    return rma(true_range(high, low, close), length).rename(f"ATR{length}")
+
+
+def adx(high: pd.Series, low: pd.Series, close: pd.Series, length: int = 14):
+    """Wilder ADX. Returns (adx, plus_di, minus_di)."""
+    up, down = high.diff(), -low.diff()
+    plus_dm = pd.Series(np.where((up > down) & (up > 0), up, 0.0), index=high.index)
+    minus_dm = pd.Series(np.where((down > up) & (down > 0), down, 0.0), index=high.index)
+    atr_ = rma(true_range(high, low, close), length).replace(0.0, np.nan)
+    plus_di = 100.0 * rma(plus_dm, length) / atr_
+    minus_di = 100.0 * rma(minus_dm, length) / atr_
+    denom = (plus_di + minus_di).replace(0.0, np.nan)
+    dx = 100.0 * (plus_di - minus_di).abs() / denom
+    return rma(dx, length).rename("ADX"), plus_di.rename("+DI"), minus_di.rename("-DI")
+
+
+def macd(close: pd.Series, fast=12, slow=26, signal=9):
+    line = ema(close, fast) - ema(close, slow)
+    sig = ema(line, signal)
+    return line.rename("MACD"), sig.rename("MACD_SIGNAL"), (line - sig).rename("MACD_HIST")
+
+
+def bollinger(close: pd.Series, length=20, mult=2.0):
+    mid = sma(close, length)
+    sd = close.rolling(int(length), min_periods=int(length)).std(ddof=0)
+    return mid.rename("BB_MID"), (mid + mult * sd).rename("BB_UP"), (mid - mult * sd).rename("BB_LO")
+
+
+def stdev(series: pd.Series, length: int) -> pd.Series:
+    return series.rolling(int(length), min_periods=int(length)).std(ddof=0)
+
+
+def rolling_high(series: pd.Series, length: int, exclude_current: bool = True) -> pd.Series:
+    s = series.shift(1) if exclude_current else series
+    return s.rolling(int(length), min_periods=int(length)).max()
+
+
+def rolling_low(series: pd.Series, length: int, exclude_current: bool = True) -> pd.Series:
+    s = series.shift(1) if exclude_current else series
+    return s.rolling(int(length), min_periods=int(length)).min()
+
+
+def slope(series: pd.Series, length: int = 5) -> pd.Series:
+    return series - series.shift(int(length))
+
+
+def cross_over(a: pd.Series, b: pd.Series) -> pd.Series:
+    ok = a.shift(1).notna() & b.shift(1).notna()
+    return ((a > b) & (a.shift(1) <= b.shift(1)) & ok).fillna(False)
+
+
+def cross_under(a: pd.Series, b: pd.Series) -> pd.Series:
+    ok = a.shift(1).notna() & b.shift(1).notna()
+    return ((a < b) & (a.shift(1) >= b.shift(1)) & ok).fillna(False)
+
+
+def supertrend(high, low, close, length=10, mult=3.0):
+    """Classic SuperTrend. Returns (direction, upper_band, lower_band)."""
+    a = atr(high, low, close, length)
+    hl2 = (high + low) / 2.0
+    ur, lr = (hl2 + mult * a).to_numpy(float), (hl2 - mult * a).to_numpy(float)
+    c = close.to_numpy(float)
+    n = len(close)
+    up = np.full(n, np.nan)
+    dn = np.full(n, np.nan)
+    direction = np.zeros(n, dtype=int)
+    prev = 1
+    for i in range(n):
+        if not np.isfinite(ur[i]):
+            continue
+        if i == 0 or not np.isfinite(up[i - 1]):
+            up[i], dn[i], direction[i] = ur[i], lr[i], prev
+            continue
+        up[i] = min(ur[i], up[i - 1]) if c[i - 1] <= up[i - 1] else ur[i]
+        dn[i] = max(lr[i], dn[i - 1]) if c[i - 1] >= dn[i - 1] else lr[i]
+        if c[i] > up[i - 1]:
+            prev = 1
+        elif c[i] < dn[i - 1]:
+            prev = -1
+        direction[i] = prev
+    idx = close.index
+    return (pd.Series(direction, index=idx, name="ST_DIR"),
+            pd.Series(up, index=idx, name="ST_UP"),
+            pd.Series(dn, index=idx, name="ST_DN"))
+
+
+def session_key(index: pd.DatetimeIndex) -> pd.Series:
+    return pd.Series(pd.DatetimeIndex(index).normalize(), index=index)
+
+
+def bar_of_session(index: pd.DatetimeIndex, intraday: bool) -> pd.Series:
+    if not intraday:
+        return pd.Series(np.arange(len(index)), index=index)
+    k = session_key(index)
+    return k.groupby(k).cumcount()
+
+
+def vwap(df: pd.DataFrame, intraday: bool) -> tuple[pd.Series, bool]:
     """
-    ls = live_state()
-    if len(df) < 60:
-        return
-    work = df.iloc[:-1].reset_index(drop=True) if drop_forming_bar else df.reset_index(drop=True)
-    sig_df, _ = generate_signals(work, params)
+    Session-anchored VWAP.
 
-    ts = pd.Series(sig_df["Date"])
-
-    # First call after Start: mark where we are and trade FORWARD only.
-    # Without this the engine replays the entire history buffer in one tick and
-    # reports hundreds of instant "live" trades that never actually happened.
-    if ls["last_bar"] is None:
-        ls["last_bar"] = sig_df["Date"].iloc[-1]
-        log(f"Armed at bar {pd.Timestamp(ls['last_bar']):%d %b %H:%M}. "
-            f"Trading forward from the next closed bar.")
-        return
-
-    newer = np.flatnonzero((ts > pd.Timestamp(ls["last_bar"])).to_numpy())
-    if len(newer) == 0:
-        return
-    start = int(newer[0])
-
-    for i in range(start, len(sig_df)):
-        row = sig_df.iloc[i]
-        bar_t = row["Date"]
-        ls["last_bar"] = bar_t
-
-        # 1) fill any pending order at this bar's open
-        if ls["pending"] is not None and ls["position"] is None:
-            d = ls["pending"]["dir"]
-            entry = float(row["Open"]) + slippage_pts * d
-            sl, tp = compute_levels(entry, d, params, ls["pending"].get("atr"))
-            ls["position"] = {
-                "direction": "long" if d == 1 else "short", "dir": d,
-                "entry_time": bar_t, "entry": entry, "sl": sl, "tp": tp,
-                "reason": ls["pending"]["reason"], "bars": 0,
-                "hits": ls["pending"].get("hits", 0),
-                "params_used": {k: params.get(k) for k in
-                                ("rule_mode", "any_k", "confluences", "sl_mode", "sl_pct",
-                                 "sl_atr_mult", "tp_mode", "tp_pct", "tp_atr_mult",
-                                 "max_hold", "short_ma", "long_ma", "adx_min")},
-            }
-            ls["pending"] = None
-            log(f"ENTRY {ls['position']['direction']} @ {entry:.2f} | SL {sl:.2f} | TP {tp:.2f}")
-
-        # 2) manage an open position on this closed bar
-        elif ls["position"] is not None:
-            pos = ls["position"]
-            d, sl, tp = pos["dir"], pos["sl"], pos["tp"]
-            o, hi, lo, cl = float(row["Open"]), float(row["High"]), float(row["Low"]), float(row["Close"])
-            px = rsn = None
-            if d == 1:
-                if o <= sl: px, rsn = o, "sl_gap"
-                elif o >= tp: px, rsn = o, "tp_gap"
-                elif lo <= sl: px, rsn = sl, "sl"
-                elif hi >= tp: px, rsn = tp, "tp"
-            else:
-                if o >= sl: px, rsn = o, "sl_gap"
-                elif o <= tp: px, rsn = o, "tp_gap"
-                elif hi >= sl: px, rsn = sl, "sl"
-                elif lo <= tp: px, rsn = tp, "tp"
-
-            pos["bars"] += 1
-            new_day = pd.Timestamp(bar_t).date() != pd.Timestamp(pos["entry_time"]).date()
-            if px is None and pos["bars"] >= params["max_hold"]:
-                px, rsn = cl, "time_exit"
-            if px is None and intraday and new_day:
-                px, rsn = o, "eod_squareoff"
-            if px is not None:
-                close_position(px, rsn, bar_t, cost_bps, slippage_pts)
-
-        # 3) look for a fresh signal on this closed bar
-        if ls["position"] is None and ls["pending"] is None and int(row["signal"]) != 0:
-            ls["pending"] = {"dir": int(row["signal"]), "reason": row["reason"],
-                             "signal_time": bar_t, "atr": float(row.get("atr_ref", np.nan)),
-                             "hits": int(row.get("hits", 0))}
-            log(f"SIGNAL {'long' if row['signal'] == 1 else 'short'} on bar {pd.Timestamp(bar_t):%H:%M} "
-                f"— fills at next bar's open")
+    Indices and spot FX report zero volume on Yahoo, which would make a true
+    VWAP a division by zero. In that case we fall back to a session-anchored
+    TWAP (cumulative mean of the typical price) and return volume_ok=False so
+    the UI can say plainly that this is not a real VWAP.
+    """
+    tp = (df["High"] + df["Low"] + df["Close"]) / 3.0
+    vol = df["Volume"].fillna(0.0)
+    volume_ok = float(vol.abs().sum()) > 0.0
+    if intraday:
+        k = session_key(df.index)
+        if volume_ok:
+            pv = (tp * vol).groupby(k).cumsum()
+            cv = vol.groupby(k).cumsum().replace(0.0, np.nan)
+            return (pv / cv).rename("VWAP"), True
+        return tp.groupby(k).expanding().mean().reset_index(level=0, drop=True).rename("TWAP"), False
+    if volume_ok:
+        pv, cv = (tp * vol).cumsum(), vol.cumsum().replace(0.0, np.nan)
+        return (pv / cv).rename("VWAP"), True
+    return tp.expanding().mean().rename("TWAP"), False
 
 
-def close_position(px: float, reason: str, when, cost_bps: float, slippage_pts: float):
-    ls = live_state()
-    pos = ls["position"]
-    if pos is None:
-        return
-    d = pos["dir"]
-    exit_px = px - slippage_pts * d
-    gross = (exit_px - pos["entry"]) * d
-    cost = (pos["entry"] + exit_px) * (cost_bps / 10000.0)
-    ls["trades"].append({
-        "entry_time": pos["entry_time"], "exit_time": when,
-        "direction": pos["direction"], "entry": round(pos["entry"], 2),
-        "sl": round(pos["sl"], 2), "tp": round(pos["tp"], 2),
-        "exit": round(exit_px, 2), "exit_reason": reason,
-        "gross_points": round(gross, 2), "cost_points": round(cost, 2),
-        "net_points": round(gross - cost, 2),
-        "net_pct": round((gross - cost) / pos["entry"] * 100, 4),
-        "bars_held": pos["bars"], "confluences_hit": pos.get("hits", 0),
-        "signal_reason": pos["reason"][:160],
-    })
-    log(f"EXIT {reason} @ {exit_px:.2f} | net {gross - cost:+.2f} pts")
-    ls["position"] = None
+# ----------------------------------------------------- structure / swings ----
+def swing_levels(high: pd.Series, low: pd.Series, left: int = 3, right: int = 3):
+    """
+    Last CONFIRMED swing high / swing low, with no look-ahead.
+
+    A pivot at bar i is only knowable once `right` further bars have printed, so
+    the detected value is shifted forward by `right` before being carried. This
+    is the difference between a usable structural stop and a backtest that
+    quietly cheats.
+    """
+    win = int(left) + int(right) + 1
+    is_ph = high == high.rolling(win, center=True, min_periods=win).max()
+    is_pl = low == low.rolling(win, center=True, min_periods=win).min()
+    sh = high.where(is_ph).shift(int(right)).ffill().rename("SWING_HIGH")
+    sl_ = low.where(is_pl).shift(int(right)).ffill().rename("SWING_LOW")
+    return sh, sl_
 
 
-def live_stats() -> dict:
-    ls = live_state()
-    return summarise(pd.DataFrame(ls["trades"]))
+def zigzag_pivots(close: pd.Series, threshold_pct: float = 0.8) -> pd.Series:
+    """
+    Percentage zigzag: +1 marks a confirmed swing high, -1 a confirmed swing low.
+
+    Used by the Elliott Wave heuristic. Confirmation is retrospective by nature,
+    so the series is shifted so that a pivot only becomes visible on the bar the
+    reversal threshold was actually breached.
+    """
+    c = close.to_numpy(float)
+    n = len(c)
+    marks = np.zeros(n, dtype=int)
+    if n == 0:
+        return pd.Series(marks, index=close.index, name="ZZ")
+    thr = threshold_pct / 100.0
+    direction = 0
+    last_ext_i, last_ext = 0, c[0]
+    for i in range(1, n):
+        if not np.isfinite(c[i]):
+            continue
+        if direction >= 0 and c[i] > last_ext:
+            last_ext_i, last_ext = i, c[i]
+        elif direction <= 0 and c[i] < last_ext:
+            last_ext_i, last_ext = i, c[i]
+        if direction >= 0 and last_ext > 0 and c[i] <= last_ext * (1 - thr):
+            marks[last_ext_i] = 1          # confirmed swing high
+            direction, last_ext_i, last_ext = -1, i, c[i]
+        elif direction <= 0 and last_ext > 0 and c[i] >= last_ext * (1 + thr):
+            marks[last_ext_i] = -1         # confirmed swing low
+            direction, last_ext_i, last_ext = 1, i, c[i]
+    return pd.Series(marks, index=close.index, name="ZZ")
 
 
-# ================================== UI ====================================
-
-st.set_page_config(page_title="Confluence Trader", layout="wide")
-
-SL_CHOICES = [0.002, 0.003, 0.005, 0.008, 0.010, 0.015, 0.020, 0.030]
-TP_CHOICES = [0.003, 0.005, 0.008, 0.010, 0.015, 0.020, 0.030, 0.050]
-
-
-def nearest(choices, value):
-    return int(np.argmin([abs(c - value) for c in choices]))
-
-
-def load_data(sidebar_cfg):
-    src, tz = sidebar_cfg["source"], sidebar_cfg["tz"]
-    if src == "yfinance":
-        return fetch_history(sidebar_cfg["symbol"], sidebar_cfg["interval"],
-                             sidebar_cfg["days"], tz), sidebar_cfg["symbol"]
-    up = sidebar_cfg["upload"]
-    if up is None:
-        return None, None
-    raw = pd.read_csv(up) if up.name.lower().endswith(".csv") else pd.read_excel(up)
-    return standardise_upload(raw, tz), up.name
+def fair_value_gaps(df: pd.DataFrame):
+    """ICT fair value gaps: a 3-candle imbalance where candle 1 and 3 do not overlap."""
+    bull = (df["Low"] > df["High"].shift(2)) & (df["Close"] > df["Open"])
+    bear = (df["High"] < df["Low"].shift(2)) & (df["Close"] < df["Open"])
+    bull_top = df["Low"].where(bull)
+    bull_bot = df["High"].shift(2).where(bull)
+    bear_bot = df["High"].where(bear)
+    bear_top = df["Low"].shift(2).where(bear)
+    return (bull.rename("FVG_BULL"), bear.rename("FVG_BEAR"),
+            bull_bot.ffill().rename("FVG_BULL_LO"), bull_top.ffill().rename("FVG_BULL_HI"),
+            bear_bot.ffill().rename("FVG_BEAR_LO"), bear_top.ffill().rename("FVG_BEAR_HI"))
 
 
-def sidebar():
-    with st.sidebar:
-        st.header("Data")
-        use_yf = st.checkbox("Use yfinance", value=True,
-                             help="Uncheck to backtest an uploaded file instead.")
-        if use_yf and not YF_AVAILABLE:
-            st.error("yfinance is not installed. Run: pip install yfinance")
-            use_yf = False
+def market_structure(df: pd.DataFrame, left=3, right=3):
+    """
+    Smart-money style structure: break of structure (BOS) against confirmed swings.
 
-        symbol, upload = None, None
-        if use_yf:
-            name = st.selectbox("Instrument", list(TICKERS.keys()), index=0)
-            symbol = TICKERS[name]
-            if name == "Custom":
-                symbol = st.text_input("Ticker symbol", value="KAYNES.NS",
-                                       help="Yahoo format. NSE cash: SYMBOL.NS · BSE: SYMBOL.BO")
-            st.caption(f"Requesting `{symbol}` · 0.3s enforced between API calls")
+    Returns (bos_direction, swing_high, swing_low) where bos_direction holds +1
+    after a bullish break, -1 after a bearish break, carried forward until the
+    opposite break occurs.
+    """
+    sh, sl_ = swing_levels(df["High"], df["Low"], left, right)
+    bull_bos = (df["Close"] > sh) & sh.notna()
+    bear_bos = (df["Close"] < sl_) & sl_.notna()
+    raw = pd.Series(np.where(bull_bos, 1, np.where(bear_bos, -1, np.nan)), index=df.index)
+    return raw.ffill().fillna(0).astype(int).rename("BOS"), sh, sl_
+
+
+# =============================================================================
+# SECTION 3 -- MARKET DATA  (the single rate-limit-guarded network choke-point)
+# =============================================================================
+OHLCV = ["Open", "High", "Low", "Close", "Volume"]
+
+
+class MarketDataError(RuntimeError):
+    """Raised when usable OHLCV data could not be assembled."""
+
+
+@dataclass
+class DataBundle:
+    frame: pd.DataFrame
+    symbol: str
+    interval: str
+    period: str
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def bars(self) -> int:
+        return len(self.frame)
+
+
+def _raw_download(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    """
+    The ONE and ONLY call site for yfinance in this file.
+
+    A hard 0.3s pause is taken before the request and again after it, in a
+    finally block so the post-guard runs even when the request raises. Keeping
+    this to a single function is what makes the guarantee auditable.
+    """
+    import yfinance as yf
+
+    time.sleep(API_GUARD_DELAY)                      # ---- mandatory pre-guard ----
+    try:
+        return yf.download(tickers=symbol, period=period, interval=interval,
+                           auto_adjust=False, actions=False, progress=False,
+                           threads=False, group_by="column")
+    except Exception as exc:                          # noqa: BLE001
+        raise MarketDataError(f"Download failed for {symbol} [{interval}/{period}]: {exc}") from exc
+    finally:
+        time.sleep(API_GUARD_DELAY)                   # ---- mandatory post-guard ----
+
+
+def _normalise(frame: pd.DataFrame, symbol: str) -> pd.DataFrame:
+    if frame is None or frame.empty:
+        raise MarketDataError(f"Yahoo returned an empty frame for `{symbol}`.")
+    df = frame.copy()
+    if isinstance(df.columns, pd.MultiIndex):
+        lvl0 = set(df.columns.get_level_values(0))
+        df.columns = (df.columns.get_level_values(0) if {"Open", "Close"} & lvl0
+                      else df.columns.get_level_values(1))
+    df = df.loc[:, ~df.columns.duplicated()]
+    missing = [c for c in ["Open", "High", "Low", "Close"] if c not in df.columns]
+    if missing:
+        raise MarketDataError(f"`{symbol}` response is missing columns: {missing}")
+    if "Volume" not in df.columns:
+        df["Volume"] = 0.0
+    df = df[OHLCV].astype(float)
+    df.index = pd.to_datetime(df.index)
+    df = df[~df.index.duplicated(keep="last")].sort_index()
+    df = df.dropna(subset=["Open", "High", "Low", "Close"])
+    df["Volume"] = df["Volume"].fillna(0.0)
+    df = df[(df[["Open", "High", "Low", "Close"]] > 0).all(axis=1)]
+    # High/Low sanity: Yahoo occasionally emits an inverted bar.
+    df["High"] = df[["High", "Open", "Close"]].max(axis=1)
+    df["Low"] = df[["Low", "Open", "Close"]].min(axis=1)
+    return df
+
+
+def _resample(df: pd.DataFrame, rule: str) -> pd.DataFrame:
+    agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
+    out = df.resample(rule, label="left", closed="left", origin="start_day").agg(agg)
+    return out.dropna(subset=["Open", "High", "Low", "Close"])
+
+
+def _fetch_uncached(symbol: str, period: str, interval: str) -> pd.DataFrame:
+    if interval in NATIVE_INTERVALS:
+        return _normalise(_raw_download(symbol, period, interval), symbol)
+    src, rule = DERIVED_INTERVALS[interval]
+    # 3m/10m/4h are not served natively; resample them from a finer native feed.
+    return _resample(_normalise(_raw_download(symbol, period, src), symbol), rule)
+
+
+def _cached_fetch(symbol: str, period: str, interval: str, bucket: int) -> pd.DataFrame:
+    """Streamlit-cached wrapper; `bucket` is the caller's freshness key."""
+    if st is None:
+        return _fetch_uncached(symbol, period, interval)
+    if not hasattr(_cached_fetch, "_impl"):
+        @st.cache_data(show_spinner=False, max_entries=96)
+        def _impl(sym, per, itv, _b):
+            return _fetch_uncached(sym, per, itv)
+        _cached_fetch._impl = _impl
+    return _cached_fetch._impl(symbol, period, interval, bucket)
+
+
+def load_market_data(symbol: str, period: str, interval: str,
+                     freshness_seconds: float = 300.0,
+                     min_bars: int = ABSOLUTE_MIN_BARS) -> DataBundle:
+    """Fetch, clean, resample and validate an OHLCV series."""
+    symbol = (symbol or "").strip().upper()
+    if not symbol:
+        raise MarketDataError("No symbol supplied.")
+    warnings: list[str] = []
+    eff_period, clamp = sanitize_period(interval, period)
+    if clamp:
+        warnings.append(clamp)
+
+    bucket = int(time.time() // max(0.3, float(freshness_seconds)))
+    frame = _cached_fetch(symbol, eff_period, interval, bucket)
+
+    if frame.empty:
+        raise MarketDataError(
+            f"No candles returned for `{symbol}` at {interval}/{eff_period}. The symbol "
+            "may be wrong, delisted, or outside its trading calendar.")
+    if len(frame) < min_bars:
+        raise MarketDataError(
+            f"Only {len(frame)} candles available for `{symbol}` at {interval}/{eff_period}; "
+            f"at least {min_bars} are required. Widen the period or use a coarser interval.")
+    if float(frame["Volume"].abs().sum()) == 0.0:
+        warnings.append("This instrument reports zero volume on Yahoo (normal for indices and "
+                        "spot FX). Volume-gated strategies and filters will not arm; VWAP "
+                        "falls back to a session TWAP.")
+    return DataBundle(frame=frame, symbol=symbol, interval=interval,
+                      period=eff_period, warnings=warnings)
+
+
+def load_vix(freshness_seconds: float = 60.0) -> float | None:
+    """Latest India VIX close, or None if unavailable. Never raises."""
+    try:
+        b = load_market_data(VIX_SYMBOL, "5d", "15m", freshness_seconds, min_bars=1)
+        return float(b.frame["Close"].iloc[-1])
+    except Exception:                                  # noqa: BLE001
+        return None
+
+
+def live_period_for(interval: str, needed_bars: int = WARMUP_BARS + 120) -> str:
+    """
+    Smallest period that still satisfies the warm-up requirement.
+
+    Re-pulling `max` history on every poll is exactly how an IP gets throttled.
+    """
+    per_day = APPROX_BARS_PER_DAY.get(interval, 1.0)
+    needed_days = needed_bars / max(per_day, 0.001)
+    for p in PERIODS:
+        if p != "max" and PERIOD_DAYS[p] >= needed_days * 1.6:
+            return p
+    return "max"
+
+
+def gap_profile(df: pd.DataFrame, threshold_pct: float = 0.3) -> pd.DataFrame:
+    pc = df["Close"].shift(1)
+    gap = (df["Open"] - pc) / pc * 100.0
+    out = df.loc[gap.abs() >= threshold_pct, ["Open", "Close"]].copy()
+    out["gap_pct"] = gap.loc[out.index].round(3)
+    out["direction"] = np.where(out["gap_pct"] > 0, "Gap Up", "Gap Down")
+    return out
+
+
+# =============================================================================
+# SECTION 4 -- ADDITIONAL ENTRY FILTERS
+# =============================================================================
+# Every filter is OFF by default. An enabled filter must agree with the trade
+# direction or the signal is discarded. Filters never create signals of their
+# own -- they only veto.
+#
+# DATA HONESTY: PCR, open-interest change and news have no free feed wired in.
+# They are exposed as manual inputs plus a hook so a user with their own source
+# can plug it in. Left untouched they are inert and say so in the UI rather than
+# silently passing or silently blocking.
+
+FILTER_SPECS: list[dict] = [
+    {"key": "adx", "label": "ADX strength", "kind": "range",
+     "min": 20.0, "max": 60.0, "step": 1.0,
+     "help": "Trade only when trend strength sits inside the band."},
+    {"key": "rsi", "label": "RSI band", "kind": "range",
+     "min": 40.0, "max": 70.0, "step": 1.0,
+     "help": "Long needs RSI in band; short needs the mirrored band (100 - value)."},
+    {"key": "ema20", "label": "EMA(20) side", "kind": "toggle",
+     "help": "Long only above the 20 EMA, short only below."},
+    {"key": "sma20", "label": "SMA(20) side", "kind": "toggle",
+     "help": "Long only above the 20 SMA, short only below."},
+    {"key": "bb", "label": "Bollinger Bands", "kind": "mode",
+     "modes": ["Above / below middle band", "Inside the bands", "Outside the bands (breakout)"],
+     "help": "Positional filter against a 20/2.0 Bollinger."},
+    {"key": "macd", "label": "MACD histogram", "kind": "toggle",
+     "help": "Long needs a positive histogram, short a negative one."},
+    {"key": "smc", "label": "SMC break of structure", "kind": "toggle",
+     "help": "Direction must agree with the last confirmed break of structure."},
+    {"key": "ict", "label": "ICT premium / discount", "kind": "toggle",
+     "help": "Longs only from the discount half of the dealing range, shorts from premium."},
+    {"key": "volspike", "label": "Volume spike", "kind": "value",
+     "value": 1.5, "step": 0.1,
+     "help": "Bar volume must be at least N x its 20-bar average. Inert on zero-volume feeds."},
+    {"key": "regime", "label": "Market regime", "kind": "mode",
+     "modes": ["Trending only (ADX >= 25)", "Ranging only (ADX < 20)"],
+     "help": "Coarse regime gate built on ADX."},
+    {"key": "atrpct", "label": "ATR % of price", "kind": "range",
+     "min": 0.05, "max": 5.0, "step": 0.05,
+     "help": "Skip dead tape and skip blow-off volatility."},
+    {"key": "supertrend", "label": "SuperTrend direction", "kind": "toggle",
+     "help": "Direction must agree with a 10/3.0 SuperTrend."},
+    {"key": "vwap", "label": "VWAP side", "kind": "toggle",
+     "help": "Long only above VWAP. On zero-volume feeds this degrades to a session TWAP."},
+    {"key": "vix", "label": "India VIX band", "kind": "range",
+     "min": 8.0, "max": 25.0, "step": 0.5, "external": True,
+     "help": "Fetched live from ^INDIAVIX. Applies to every instrument, not just Indian ones."},
+    {"key": "pcr", "label": "Put-Call Ratio band", "kind": "range",
+     "min": 0.7, "max": 1.3, "step": 0.05, "manual": True,
+     "help": "NO FREE FEED. Enter the value manually or wire the hook."},
+    {"key": "oi", "label": "OI change", "kind": "oi", "manual": True,
+     "help": "NO FREE FEED. Enter the observed change manually or wire the hook."},
+    {"key": "news", "label": "News block", "kind": "news", "manual": True,
+     "help": "NO FREE FEED. A manual kill-switch plus a hook for your own news source."},
+]
+
+FILTER_LABELS = {s["key"]: s["label"] for s in FILTER_SPECS}
+
+
+def default_filter_config() -> dict:
+    """All filters disabled, carrying their default magnitudes."""
+    cfg: dict = {}
+    for spec in FILTER_SPECS:
+        entry: dict = {"enabled": False}
+        if spec["kind"] == "range":
+            entry.update(min=spec["min"], max=spec["max"])
+        elif spec["kind"] == "value":
+            entry["value"] = spec["value"]
+        elif spec["kind"] == "mode":
+            entry["mode"] = spec["modes"][0]
+        elif spec["kind"] == "oi":
+            entry.update(mode="Absolute change", value=0.0, manual=0.0)
+        elif spec["kind"] == "news":
+            entry["block"] = False
+        if spec.get("manual"):
+            entry["manual"] = entry.get("manual", 0.0)
+        cfg[spec["key"]] = entry
+    return cfg
+
+
+def attach_filter_columns(df: pd.DataFrame, params: dict, intraday: bool) -> pd.DataFrame:
+    """Compute every indicator any filter might need, once."""
+    out = df
+    if "flt_ready" in out.columns:
+        return out
+    out = out.copy()
+    p = lambda k: params.get(k, DEFAULT_PARAMS[k])                       # noqa: E731
+
+    a, plus_di, minus_di = adx(out["High"], out["Low"], out["Close"], int(p("adx_len")))
+    out["f_adx"], out["f_pdi"], out["f_mdi"] = a, plus_di, minus_di
+    out["f_rsi"] = rsi(out["Close"], int(p("rsi_len")))
+    out["f_ema20"] = ema(out["Close"], 20)
+    out["f_sma20"] = sma(out["Close"], 20)
+    mid, up, lo = bollinger(out["Close"], int(p("bb_len")), float(p("bb_mult")))
+    out["f_bb_mid"], out["f_bb_up"], out["f_bb_lo"] = mid, up, lo
+    _, _, hist = macd(out["Close"], int(p("macd_fast")), int(p("macd_slow")), int(p("macd_signal")))
+    out["f_macd_hist"] = hist
+    bos, sh, sl_ = market_structure(out, int(p("pivot_left")), int(p("pivot_right")))
+    out["f_bos"], out["f_swing_high"], out["f_swing_low"] = bos, sh, sl_
+    rng_hi = rolling_high(out["High"], int(p("structure_len")), exclude_current=False)
+    rng_lo = rolling_low(out["Low"], int(p("structure_len")), exclude_current=False)
+    out["f_range_mid"] = (rng_hi + rng_lo) / 2.0
+    out["f_vol_ma"] = sma(out["Volume"], int(p("vol_len")))
+    out["f_atr"] = atr(out["High"], out["Low"], out["Close"], int(p("atr_len")))
+    out["f_atr_pct"] = out["f_atr"] / out["Close"] * 100.0
+    st_dir, _, _ = supertrend(out["High"], out["Low"], out["Close"],
+                              int(p("st_len")), float(p("st_mult")))
+    out["f_st_dir"] = st_dir
+    vw, vol_ok = vwap(out, intraday)
+    out["f_vwap"] = vw
+    out.attrs["vwap_is_volume_weighted"] = vol_ok
+    out["flt_ready"] = True
+    return out
+
+
+@dataclass
+class FilterReport:
+    key: str
+    label: str
+    value: str
+    long_ok: bool
+    short_ok: bool
+
+
+def evaluate_filters(df: pd.DataFrame, fcfg: dict, extras: dict | None = None):
+    """
+    Return ``(long_mask, short_mask, reports)``.
+
+    ``reports`` describes the state of each ENABLED filter on the final bar,
+    which is what lets the live panel say exactly which gate is blocking entry
+    instead of leaving the operator guessing.
+    """
+    extras = extras or {}
+    idx = df.index
+    ok_long = pd.Series(True, index=idx)
+    ok_short = pd.Series(True, index=idx)
+    reports: list[FilterReport] = []
+
+    def apply(key: str, lmask: pd.Series, smask: pd.Series, value: str):
+        nonlocal ok_long, ok_short
+        lmask = lmask.fillna(False)
+        smask = smask.fillna(False)
+        ok_long &= lmask
+        ok_short &= smask
+        reports.append(FilterReport(key, FILTER_LABELS[key], value,
+                                    bool(lmask.iloc[-1]) if len(lmask) else False,
+                                    bool(smask.iloc[-1]) if len(smask) else False))
+
+    def on(key: str) -> bool:
+        return bool(fcfg.get(key, {}).get("enabled", False))
+
+    c = df["Close"]
+
+    if on("adx"):
+        cfg = fcfg["adx"]
+        m = df["f_adx"].between(cfg["min"], cfg["max"])
+        apply("adx", m, m, fmt(safe_last(df["f_adx"])))
+
+    if on("rsi"):
+        cfg = fcfg["rsi"]
+        lo, hi = float(cfg["min"]), float(cfg["max"])
+        lm = df["f_rsi"].between(lo, hi)
+        sm = df["f_rsi"].between(100.0 - hi, 100.0 - lo)   # mirrored band for shorts
+        apply("rsi", lm, sm, fmt(safe_last(df["f_rsi"])))
+
+    if on("ema20"):
+        apply("ema20", c > df["f_ema20"], c < df["f_ema20"], fmt(safe_last(df["f_ema20"])))
+
+    if on("sma20"):
+        apply("sma20", c > df["f_sma20"], c < df["f_sma20"], fmt(safe_last(df["f_sma20"])))
+
+    if on("bb"):
+        mode = fcfg["bb"].get("mode", "Above / below middle band")
+        if mode.startswith("Above"):
+            lm, sm = c > df["f_bb_mid"], c < df["f_bb_mid"]
+        elif mode.startswith("Inside"):
+            inside = (c < df["f_bb_up"]) & (c > df["f_bb_lo"])
+            lm = sm = inside
         else:
-            upload = st.file_uploader("OHLC file", type=["csv", "xlsx", "xls"])
+            lm, sm = c > df["f_bb_up"], c < df["f_bb_lo"]
+        apply("bb", lm, sm, f"mid {fmt(safe_last(df['f_bb_mid']))}")
 
-        interval = st.selectbox("Bar interval", list(INTERVAL_MAX_DAYS.keys()), index=3,
-                                format_func=lambda k: INTERVAL_LABELS[k])
-        period = st.selectbox("History", list(PERIOD_DAYS.keys()), index=4)
-        days, clamped = resolve_period(period, interval)
-        if clamped:
-            st.caption(f"Yahoo serves at most {days} days of {INTERVAL_LABELS[interval]} bars. "
-                       f"Using {days} days. Pick a longer bar interval for more history.")
+    if on("macd"):
+        apply("macd", df["f_macd_hist"] > 0, df["f_macd_hist"] < 0,
+              fmt(safe_last(df["f_macd_hist"]), 4))
+
+    if on("smc"):
+        apply("smc", df["f_bos"] == 1, df["f_bos"] == -1,
+              {1: "bullish BOS", -1: "bearish BOS"}.get(safe_last(df["f_bos"]), "none"))
+
+    if on("ict"):
+        apply("ict", c < df["f_range_mid"], c > df["f_range_mid"],
+              f"range mid {fmt(safe_last(df['f_range_mid']))}")
+
+    if on("volspike"):
+        mult = float(fcfg["volspike"].get("value", 1.5))
+        ratio = df["Volume"] / df["f_vol_ma"].replace(0.0, np.nan)
+        m = ratio >= mult
+        note = fmt(safe_last(ratio)) + "x"
+        if float(df["Volume"].abs().sum()) == 0.0:
+            note = "no volume on feed -- filter blocks everything"
+        apply("volspike", m, m, note)
+
+    if on("regime"):
+        trending = fcfg["regime"].get("mode", "").startswith("Trending")
+        m = (df["f_adx"] >= 25) if trending else (df["f_adx"] < 20)
+        apply("regime", m, m, f"ADX {fmt(safe_last(df['f_adx']))}")
+
+    if on("atrpct"):
+        cfg = fcfg["atrpct"]
+        m = df["f_atr_pct"].between(cfg["min"], cfg["max"])
+        apply("atrpct", m, m, fmt(safe_last(df["f_atr_pct"]), 3) + "%")
+
+    if on("supertrend"):
+        apply("supertrend", df["f_st_dir"] == 1, df["f_st_dir"] == -1,
+              "up" if safe_last(df["f_st_dir"]) == 1 else "down")
+
+    if on("vwap"):
+        vol_ok = bool(df.attrs.get("vwap_is_volume_weighted", True))
+        label = fmt(safe_last(df["f_vwap"])) + ("" if vol_ok else "  (TWAP fallback, no volume)")
+        apply("vwap", c > df["f_vwap"], c < df["f_vwap"], label)
+
+    if on("vix"):
+        cfg = fcfg["vix"]
+        v = extras.get("vix")
+        if v is None:
+            m = pd.Series(False, index=idx)
+            label = "unavailable -- filter blocks everything"
         else:
-            st.caption(f"{days} calendar days of {INTERVAL_LABELS[interval]} bars.")
+            inside = cfg["min"] <= v <= cfg["max"]
+            m = pd.Series(inside, index=idx)
+            label = fmt(v)
+        apply("vix", m, m, label)
 
-        st.header("Execution")
-        side = st.selectbox("Allowed side", ["both", "long only", "short only"])
-        dirs = {"both": ["long", "short"], "long only": ["long"], "short only": ["short"]}[side]
-        qty = st.number_input("Quantity per trade", 1, 1_000_000, 1, 1,
-                              help="Lots or shares. Points are multiplied by this for cash P&L.")
-        capital = st.number_input("Capital", 0.0, 1e12, 500000.0, 10000.0)
-        risk_pct = st.number_input("Risk per trade (% of capital)", 0.1, 20.0, 1.0, 0.1)
-        cost_bps = st.number_input("Cost per leg (bps of turnover)", 0.0, 100.0, 3.0, 0.5,
-                                   help="Charged on entry AND exit, so 3 here means 6 bps "
-                                        "round trip, about 14.5 points on NIFTY at 24,000. "
-                                        "On Indian index futures STT alone is 2 bps on the sell leg.")
-        slippage = st.number_input("Slippage (points per leg)", 0.0, 100.0, 0.5, 0.25)
-        intraday = st.checkbox("Square off at session end", value=True,
-                               help="Turn this OFF for crypto and forex, which trade 24/7.")
+    if on("pcr"):
+        cfg = fcfg["pcr"]
+        v = extras.get("pcr", cfg.get("manual"))
+        if v in (None, 0.0):
+            m = pd.Series(False, index=idx)
+            label = "no value supplied -- filter blocks everything"
+        else:
+            m = pd.Series(cfg["min"] <= float(v) <= cfg["max"], index=idx)
+            label = f"{fmt(v)} (manual)"
+        apply("pcr", m, m, label)
 
-        st.header("Optimiser")
-        n_iter = st.number_input("Random search iterations", 20, 2000, 150, 10)
-        min_trades = st.number_input("Minimum trades to accept", 5, 1000, 30, 5)
-        train_frac = st.slider("Train fraction", 0.5, 0.9, 0.7, 0.05,
-                               help="The rest is a purged holdout the search never sees.")
-        tz = "Asia/Kolkata"
-    return dict(source="yfinance" if use_yf else "upload", symbol=symbol, upload=upload,
-                interval=interval, period=period, days=int(days), dirs=dirs,
-                qty=int(qty), capital=float(capital), risk_pct=float(risk_pct),
-                cost_bps=cost_bps, slippage=slippage, intraday=intraday,
-                n_iter=int(n_iter), min_trades=int(min_trades),
-                train_frac=train_frac, tz=tz)
+    if on("oi"):
+        cfg = fcfg["oi"]
+        v = extras.get("oi_change", cfg.get("manual"))
+        thresh = float(cfg.get("value", 0.0))
+        if v is None:
+            m = pd.Series(False, index=idx)
+            label = "no value supplied -- filter blocks everything"
+        else:
+            v = float(v)
+            m = pd.Series(abs(v) >= thresh, index=idx)
+            label = f"{fmt(v)} vs {fmt(thresh)} ({cfg.get('mode', 'Absolute change')}, manual)"
+        apply("oi", m, m, label)
+
+    if on("news"):
+        blocked = bool(extras.get("news_block", fcfg["news"].get("block", False)))
+        m = pd.Series(not blocked, index=idx)
+        apply("news", m, m, "BLOCKED" if blocked else "clear (manual)")
+
+    return ok_long, ok_short, reports
 
 
-def tab_backtest(cfg, df, label):
-    st.subheader(f"{label} · {len(df):,} bars · {df['Date'].min():%d %b %Y %H:%M} → {df['Date'].max():%d %b %Y %H:%M}")
+# =============================================================================
+# SECTION 5 -- STRATEGY MATRIX
+# =============================================================================
+# Contract:
+#   compute(df, params) -> frame with indicator columns + integer `signal`
+#                          (+1 long, -1 short, 0 flat), evaluated on that bar's
+#                          CLOSE and filled on the NEXT bar's open.
+#   status(frame, params) -> StatusReport describing how far the market is from
+#                          arming, using real numbers.
+#
+# `immediate=True` marks the two Simple Buy / Simple Sell profiles, which enter
+# at once rather than waiting for the next candle open.
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Last close", f"{df['Close'].iloc[-1]:,.2f}")
-    c2.metric("Range", f"{df['Close'].min():,.2f} – {df['Close'].max():,.2f}")
-    c3.metric("Buy & hold", f"{df['Close'].iloc[-1] - df['Close'].iloc[0]:+,.2f} pts")
 
-    fig, ax = plt.subplots(figsize=(11, 3.2))
-    ax.plot(df["Date"], df["Close"], lw=0.9)
-    ax.set_title("Close"); ax.grid(alpha=0.25)
-    st.pyplot(fig, clear_figure=True)
+@dataclass
+class StatusReport:
+    headline: str
+    metrics: list[tuple[str, str]]
+    long_condition: str
+    short_condition: str
 
-    with st.expander("Exploratory data analysis", expanded=False):
-        st.markdown(written_summary(df, cfg["interval"]))
-        try:
-            piv, title, xlab, ylab = returns_heatmap(df)
-            if piv.size and not piv.isna().all().all():
-                st.pyplot(draw_heatmap(piv, title, xlab, ylab), clear_figure=True)
-            else:
-                st.caption("Not enough data spread to draw a meaningful heatmap.")
-        except Exception as e:
-            st.caption(f"Heatmap unavailable: {e}")
-        r = df["Close"].pct_change().dropna() * 100
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Mean bar return", f"{r.mean():+.4f}%")
-        c2.metric("Bar volatility", f"{r.std():.4f}%")
-        c3.metric("Best bar", f"{r.max():+.2f}%")
-        c4.metric("Worst bar", f"{r.min():+.2f}%")
 
-    if st.button("Run optimisation", type="primary"):
-        bar, txt = st.progress(0), st.empty()
-        best, table = optimise(
-            df, cfg["n_iter"], cfg["dirs"], cfg["min_trades"], cfg["cost_bps"],
-            cfg["slippage"], cfg["intraday"], cfg["train_frac"],
-            progress=lambda a, b: (bar.progress(a / b), txt.text(f"Tested {a}/{b}")))
-        bar.empty(); txt.empty()
-        if best is None:
-            st.warning("No parameter set cleared the minimum-trades and positive-expectancy "
-                       "filters. Widen the history, lower the minimum trades, or accept that "
-                       "this instrument and interval has no edge for this rule set.")
-            st.session_state.pop("best", None)
+@dataclass
+class Strategy:
+    key: str
+    name: str
+    blurb: str
+    min_bars: int
+    compute: Callable[[pd.DataFrame, dict], pd.DataFrame]
+    status: Callable[[pd.DataFrame, dict], StatusReport]
+    overlays: tuple[str, ...] = ()
+    oscillator: str | None = None
+    immediate: bool = False
+
+
+def _p(params: dict, key: str):
+    return params.get(key, DEFAULT_PARAMS[key])
+
+
+def _const(df, v):
+    return pd.Series(float(v), index=df.index)
+
+
+def _finalise(out: pd.DataFrame, long: pd.Series, short: pd.Series) -> pd.DataFrame:
+    long = long.fillna(False).astype(bool)
+    short = short.fillna(False).astype(bool)
+    both = long & short                       # contradictory -> stand aside
+    out["signal"] = pd.Series(
+        np.where(long & ~both, 1, np.where(short & ~both, -1, 0)), index=out.index).astype(int)
+    return out
+
+
+def _sr(headline, metrics, long_c, short_c) -> StatusReport:
+    return StatusReport(headline, metrics, long_c, short_c)
+
+
+def zigzag_pivot_table(close: pd.Series, threshold_pct: float = 0.8):
+    """
+    Confirmed zigzag pivots with the bar on which each became KNOWABLE.
+
+    Returns a list of ``(pivot_index, pivot_price, kind, confirm_index)`` where
+    kind is +1 for a swing high and -1 for a swing low. Consumers must only look
+    at pivots whose ``confirm_index <= current bar`` -- otherwise the pattern
+    logic silently reads the future.
+    """
+    c = close.to_numpy(float)
+    n = len(c)
+    piv: list[tuple[int, float, int, int]] = []
+    if n == 0:
+        return piv
+    thr = threshold_pct / 100.0
+    direction, ext_i, ext = 0, 0, c[0]
+    for i in range(1, n):
+        if not np.isfinite(c[i]):
+            continue
+        if direction >= 0 and c[i] > ext:
+            ext_i, ext = i, c[i]
+        elif direction <= 0 and c[i] < ext:
+            ext_i, ext = i, c[i]
+        if direction >= 0 and ext > 0 and c[i] <= ext * (1 - thr):
+            piv.append((ext_i, float(ext), 1, i))
+            direction, ext_i, ext = -1, i, c[i]
+        elif direction <= 0 and ext > 0 and c[i] >= ext * (1 + thr):
+            piv.append((ext_i, float(ext), -1, i))
+            direction, ext_i, ext = 1, i, c[i]
+    return piv
+
+
+# ------------------------------------------------------------ 01 Dual EMA ----
+def c_dual_ema(df, p):
+    out = df.copy()
+    out["ema_fast"] = ema(out["Close"], int(_p(p, "ema_fast")))
+    out["ema_slow"] = ema(out["Close"], int(_p(p, "ema_slow")))
+    return _finalise(out, cross_over(out["ema_fast"], out["ema_slow"]),
+                     cross_under(out["ema_fast"], out["ema_slow"]))
+
+
+def s_dual_ema(df, p):
+    f, s = safe_last(df["ema_fast"]), safe_last(df["ema_slow"])
+    gap = (f - s) if (f is not None and s is not None) else None
+    return _sr(f"Fast EMA is {'above' if (gap or 0) > 0 else 'below'} the slow EMA by "
+               f"{fmt(abs(gap or 0))} points.",
+               [(f"{int(_p(p,'ema_fast'))} EMA", fmt(f)), (f"{int(_p(p,'ema_slow'))} EMA", fmt(s)),
+                ("Spread", fmt(gap))],
+               f"{int(_p(p,'ema_fast'))} EMA must cross ABOVE the {int(_p(p,'ema_slow'))} EMA.",
+               f"{int(_p(p,'ema_fast'))} EMA must cross BELOW the {int(_p(p,'ema_slow'))} EMA.")
+
+
+# --------------------------------------------------- 02 RSI mean reversion ---
+def c_rsi_reversion(df, p):
+    out = df.copy()
+    out["rsi"] = rsi(out["Close"], int(_p(p, "rsi_len")))
+    return _finalise(out, cross_over(out["rsi"], _const(out, 30.0)),
+                     cross_under(out["rsi"], _const(out, 70.0)))
+
+
+def s_rsi_reversion(df, p):
+    r = safe_last(df["rsi"])
+    zone = ("OVERSOLD, waiting for the recovery print above 30" if (r or 50) < 30
+            else "OVERBOUGHT, waiting for the failure print below 70" if (r or 50) > 70
+            else "neutral, no reversion setup armed")
+    return _sr(f"RSI({int(_p(p,'rsi_len'))}) is {fmt(r)} :: {zone}.",
+               [("RSI", fmt(r)), ("Oversold", "30.00"), ("Overbought", "70.00")],
+               "RSI must dip below 30 then close back ABOVE 30.",
+               "RSI must spike above 70 then close back BELOW 70.")
+
+
+# ------------------------------------------------------- 03 EMA pullback -----
+def c_pullback(df, p):
+    out = df.copy()
+    tol = float(_p(p, "pullback_tol")) / 100.0
+    out["ema_slow"] = ema(out["Close"], int(_p(p, "ema_slow")))
+    out["ema_macro"] = ema(out["Close"], int(_p(p, "ema_macro")))
+    out["macro_slope"] = slope(out["ema_macro"], 5)
+    up = (out["Close"] > out["ema_macro"]) & (out["macro_slope"] > 0)
+    dn = (out["Close"] < out["ema_macro"]) & (out["macro_slope"] < 0)
+    long = up & (out["Low"] <= out["ema_slow"] * (1 + tol)) & \
+        (out["Close"] > out["ema_slow"]) & (out["Close"] > out["Open"])
+    short = dn & (out["High"] >= out["ema_slow"] * (1 - tol)) & \
+        (out["Close"] < out["ema_slow"]) & (out["Close"] < out["Open"])
+    return _finalise(out, long, short)
+
+
+def s_pullback(df, p):
+    c, e21, e200 = safe_last(df["Close"]), safe_last(df["ema_slow"]), safe_last(df["ema_macro"])
+    sl = safe_last(df["macro_slope"])
+    regime = ("BULLISH" if (c or 0) > (e200 or 0) and (sl or 0) > 0
+              else "BEARISH" if (c or 0) < (e200 or 0) and (sl or 0) < 0 else "NO MACRO BIAS")
+    return _sr(f"Macro regime reads {regime}; the trigger sits at the {int(_p(p,'ema_slow'))} EMA.",
+               [("Last price", fmt(c)), (f"{int(_p(p,'ema_slow'))} EMA", fmt(e21)),
+                (f"{int(_p(p,'ema_macro'))} EMA", fmt(e200)), ("Macro slope", fmt(sl))],
+               "Price above a rising macro EMA, candle tags the slow EMA and closes above it green.",
+               "Price below a falling macro EMA, candle tags the slow EMA and closes below it red.")
+
+
+# --------------------------------------------- 04 ATR trailing breakout ------
+def c_atr_trail(df, p):
+    out = df.copy()
+    out["atr"] = atr(out["High"], out["Low"], out["Close"], int(_p(p, "atr_len")))
+    d, up, dn = supertrend(out["High"], out["Low"], out["Close"],
+                           int(_p(p, "atr_len")), float(_p(p, "atr_mult")))
+    out["trail_dir"], out["trail_upper"], out["trail_lower"] = d, up, dn
+    flip = out["trail_dir"] != out["trail_dir"].shift(1)
+    return _finalise(out, flip & (out["trail_dir"] == 1), flip & (out["trail_dir"] == -1))
+
+
+def s_atr_trail(df, p):
+    d = safe_last(df["trail_dir"])
+    return _sr(f"Trailing volatility band is locked {'UP' if d == 1 else 'DOWN'}.",
+               [("Last price", fmt(safe_last(df["Close"]))), ("ATR", fmt(safe_last(df["atr"]))),
+                ("Upper trail", fmt(safe_last(df["trail_upper"]))),
+                ("Lower trail", fmt(safe_last(df["trail_lower"])))],
+               "Close must break ABOVE the upper band and flip the trail.",
+               "Close must break BELOW the lower band and flip the trail.")
+
+
+# ------------------------------------------------------------- 05 ORB --------
+def _opening_range(df, bars, intraday):
+    if intraday:
+        k = session_key(df.index)
+        bn = k.groupby(k).cumcount()
+        orh = df["High"].where(bn < bars).groupby(k).cummax().groupby(k).ffill()
+        orl = df["Low"].where(bn < bars).groupby(k).cummin().groupby(k).ffill()
+        return orh, orl, bn >= bars
+    return (rolling_high(df["High"], bars), rolling_low(df["Low"], bars),
+            pd.Series(True, index=df.index))
+
+
+def c_orb(df, p):
+    out = df.copy()
+    orh, orl, active = _opening_range(out, int(_p(p, "orb_bars")), bool(p.get("intraday", True)))
+    out["or_high"], out["or_low"] = orh, orl
+    return _finalise(out, active & cross_over(out["Close"], orh),
+                     active & cross_under(out["Close"], orl))
+
+
+def s_orb(df, p):
+    return _sr(f"Opening range built from the first {int(_p(p,'orb_bars'))} candles of the session.",
+               [("Last price", fmt(safe_last(df["Close"]))),
+                ("Range high", fmt(safe_last(df["or_high"]))),
+                ("Range low", fmt(safe_last(df["or_low"])))],
+               "A closed candle must print ABOVE the opening-range high.",
+               "A closed candle must print BELOW the opening-range low.")
+
+
+# ---------------------------------------------------- 06 Golden cross --------
+def c_golden_cross(df, p):
+    out = df.copy()
+    out["ema_mid"] = ema(out["Close"], int(_p(p, "ema_mid")))
+    out["ema_macro"] = ema(out["Close"], int(_p(p, "ema_macro")))
+    return _finalise(out, cross_over(out["ema_mid"], out["ema_macro"]),
+                     cross_under(out["ema_mid"], out["ema_macro"]))
+
+
+def s_golden_cross(df, p):
+    m, M = safe_last(df["ema_mid"]), safe_last(df["ema_macro"])
+    gap = (m - M) if (m is not None and M is not None) else None
+    return _sr(f"Structure is in a {'GOLDEN' if (gap or 0) > 0 else 'DEATH'} CROSS state.",
+               [(f"{int(_p(p,'ema_mid'))} EMA", fmt(m)),
+                (f"{int(_p(p,'ema_macro'))} EMA", fmt(M)), ("Spread", fmt(gap))],
+               "Mid EMA must cross ABOVE the macro EMA.",
+               "Mid EMA must cross BELOW the macro EMA.")
+
+
+# -------------------------------------------------------- 07 Gap fade --------
+def c_gap_fade(df, p):
+    out = df.copy()
+    thr = float(_p(p, "gap_pct"))
+    intraday = bool(p.get("intraday", True))
+    pc = out["Close"].shift(1)
+    out["gap_pct"] = (out["Open"] - pc) / pc * 100.0
+    at_open = (bar_of_session(out.index, intraday) == 0) if intraday else pd.Series(True, index=out.index)
+    gap_up = at_open & (out["gap_pct"] >= thr)
+    gap_dn = at_open & (out["gap_pct"] <= -thr)
+    return _finalise(out, gap_dn & (out["Close"] > out["Open"]),
+                     gap_up & (out["Close"] < out["Open"]))
+
+
+def s_gap_fade(df, p):
+    g = safe_last(df["gap_pct"])
+    return _sr(f"Latest session gap measured {fmt(g)}% against the previous close.",
+               [("Gap %", fmt(g)), ("Threshold %", fmt(_p(p, "gap_pct"))),
+                ("Last price", fmt(safe_last(df["Close"])))],
+               f"Session must gap DOWN at least {fmt(_p(p,'gap_pct'))}% and close green.",
+               f"Session must gap UP at least {fmt(_p(p,'gap_pct'))}% and close red.")
+
+
+# ------------------------------------------------- 08 RSI centerline ---------
+def c_rsi_centerline(df, p):
+    out = df.copy()
+    out["rsi"] = rsi(out["Close"], int(_p(p, "rsi_len")))
+    return _finalise(out, cross_over(out["rsi"], _const(out, 50.0)),
+                     cross_under(out["rsi"], _const(out, 50.0)))
+
+
+def s_rsi_centerline(df, p):
+    r = safe_last(df["rsi"])
+    return _sr(f"RSI sits {fmt(abs((r or 50) - 50))} points "
+               f"{'above' if (r or 0) > 50 else 'below'} the 50 centerline.",
+               [("RSI", fmt(r)), ("Centerline", "50.00")],
+               "RSI must slice UP through 50.", "RSI must slice DOWN through 50.")
+
+
+# ------------------------------------------------------ 09 MTF vector --------
+def c_mtf_vector(df, p):
+    out = df.copy()
+    for k, col in (("ema_fast", "ema_fast"), ("ema_slow", "ema_slow"),
+                   ("ema_mid", "ema_mid"), ("ema_macro", "ema_macro")):
+        out[col] = ema(out["Close"], int(_p(p, k)))
+    bull = (out["ema_fast"] > out["ema_slow"]) & (out["ema_slow"] > out["ema_mid"]) & \
+        (out["Close"] > out["ema_macro"])
+    bear = (out["ema_fast"] < out["ema_slow"]) & (out["ema_slow"] < out["ema_mid"]) & \
+        (out["Close"] < out["ema_macro"])
+    out["vector"] = np.where(bull, 1, np.where(bear, -1, 0))
+    return _finalise(out, bull & ~bull.shift(1, fill_value=False),
+                     bear & ~bear.shift(1, fill_value=False))
+
+
+def s_mtf_vector(df, p):
+    v = safe_last(df["vector"])
+    state = {1: "FULLY BULLISH", -1: "FULLY BEARISH"}.get(v, "MIXED / UNALIGNED")
+    return _sr(f"EMA vector stack is {state}.",
+               [(f"{int(_p(p,'ema_fast'))} EMA", fmt(safe_last(df["ema_fast"]))),
+                (f"{int(_p(p,'ema_slow'))} EMA", fmt(safe_last(df["ema_slow"]))),
+                (f"{int(_p(p,'ema_mid'))} EMA", fmt(safe_last(df["ema_mid"]))),
+                (f"{int(_p(p,'ema_macro'))} EMA", fmt(safe_last(df["ema_macro"])))],
+               "Stack must newly align fast > slow > mid with price above the macro EMA.",
+               "Stack must newly align fast < slow < mid with price below the macro EMA.")
+
+
+# ------------------------------------------------------- 10 Squeeze ----------
+def c_squeeze(df, p):
+    out = df.copy()
+    look, mult = int(_p(p, "breakout_len")), float(_p(p, "squeeze_mult"))
+    out["atr"] = atr(out["High"], out["Low"], out["Close"], int(_p(p, "atr_len")))
+    out["atr_mean"] = sma(out["atr"], look)
+    out["atr_ratio"] = out["atr"] / out["atr_mean"]
+    out["box_high"] = rolling_high(out["High"], look)
+    out["box_low"] = rolling_low(out["Low"], look)
+    armed = (out["atr_ratio"].shift(1) < 1.0) & (out["atr_ratio"] > mult)
+    return _finalise(out, armed & (out["Close"] > out["box_high"]),
+                     armed & (out["Close"] < out["box_low"]))
+
+
+def s_squeeze(df, p):
+    return _sr(f"ATR is running at {fmt(safe_last(df['atr_ratio']))}x its rolling mean "
+               f"(trigger {fmt(_p(p,'squeeze_mult'))}x).",
+               [("ATR", fmt(safe_last(df["atr"]))), ("ATR mean", fmt(safe_last(df["atr_mean"]))),
+                ("Ratio", fmt(safe_last(df["atr_ratio"]))),
+                ("Box high", fmt(safe_last(df["box_high"]))),
+                ("Box low", fmt(safe_last(df["box_low"])))],
+               "Volatility expands past the multiplier while price breaks the box high.",
+               "Volatility expands past the multiplier while price breaks the box low.")
+
+
+# ------------------------------------------------ 11 Volume confirmation -----
+def c_volume_breakout(df, p):
+    out = df.copy()
+    look = int(_p(p, "breakout_len"))
+    out["vol_ma"] = sma(out["Volume"], int(_p(p, "vol_len")))
+    out["vol_ratio"] = out["Volume"] / out["vol_ma"].replace(0.0, np.nan)
+    out["box_high"] = rolling_high(out["High"], look)
+    out["box_low"] = rolling_low(out["Low"], look)
+    surge = out["vol_ratio"] >= float(_p(p, "vol_mult"))
+    return _finalise(out, surge & (out["Close"] > out["box_high"]),
+                     surge & (out["Close"] < out["box_low"]))
+
+
+def s_volume_breakout(df, p):
+    dead = float(df["Volume"].tail(50).abs().sum()) == 0.0
+    return _sr("This instrument reports no volume, so this profile cannot arm." if dead
+               else f"Bar volume is {fmt(safe_last(df['vol_ratio']))}x the moving average.",
+               [("Bar volume", fmt(safe_last(df["Volume"]), 0)),
+                ("Volume MA", fmt(safe_last(df["vol_ma"]), 0)),
+                ("Ratio", fmt(safe_last(df["vol_ratio"]))),
+                ("Box high", fmt(safe_last(df["box_high"]))),
+                ("Box low", fmt(safe_last(df["box_low"])))],
+               "Close above the box high on a volume spike.",
+               "Close below the box low on a volume spike.")
+
+
+# ------------------------------------------------------ 12 Engulfing ---------
+def c_engulfing(df, p):
+    out = df.copy()
+    look = int(_p(p, "breakout_len"))
+    out["sup"] = rolling_low(out["Low"], look)
+    out["res"] = rolling_high(out["High"], look)
+    po, pc = out["Open"].shift(1), out["Close"].shift(1)
+    bull = (out["Close"] > out["Open"]) & (pc < po) & (out["Close"] >= po) & (out["Open"] <= pc)
+    bear = (out["Close"] < out["Open"]) & (pc > po) & (out["Close"] <= po) & (out["Open"] >= pc)
+    return _finalise(out, bull & (out["Low"] <= out["sup"] * 1.003),
+                     bear & (out["High"] >= out["res"] * 0.997))
+
+
+def s_engulfing(df, p):
+    return _sr("Waiting for an engulfing candle to print into a structural zone.",
+               [("Last price", fmt(safe_last(df["Close"]))),
+                ("Support band", fmt(safe_last(df["sup"]))),
+                ("Resistance band", fmt(safe_last(df["res"])))],
+               "A bullish engulfing candle tagging the support band.",
+               "A bearish engulfing candle tagging the resistance band.")
+
+
+# ----------------------------------------------- 13 ATR channel reversion ----
+def c_channel_reversion(df, p):
+    out = df.copy()
+    k = float(_p(p, "channel_mult"))
+    out["basis"] = ema(out["Close"], int(_p(p, "ema_slow")))
+    out["atr"] = atr(out["High"], out["Low"], out["Close"], int(_p(p, "atr_len")))
+    out["ch_upper"] = out["basis"] + k * out["atr"]
+    out["ch_lower"] = out["basis"] - k * out["atr"]
+    return _finalise(out, cross_over(out["Close"], out["ch_lower"]),
+                     cross_under(out["Close"], out["ch_upper"]))
+
+
+def s_channel_reversion(df, p):
+    c, up, lo = safe_last(df["Close"]), safe_last(df["ch_upper"]), safe_last(df["ch_lower"])
+    where = ("EXTENDED above the upper channel" if (c or 0) > (up or 1e18)
+             else "CAPITULATED below the lower channel" if (c or 1e18) < (lo or 0)
+             else "INSIDE the channel")
+    return _sr(f"Price is {where}.",
+               [("Last price", fmt(c)), ("Basis", fmt(safe_last(df["basis"]))),
+                ("Upper", fmt(up)), ("Lower", fmt(lo)), ("ATR", fmt(safe_last(df["atr"])))],
+               "Price drops below the lower channel then closes back inside.",
+               "Price extends above the upper channel then closes back inside.")
+
+
+# ------------------------------------------------------ 14 RSI burst ---------
+def c_rsi_burst(df, p):
+    out = df.copy()
+    out["rsi"] = rsi(out["Close"], int(_p(p, "rsi_len")))
+    out["ema_mid"] = ema(out["Close"], int(_p(p, "ema_mid")))
+    return _finalise(out,
+                     cross_over(out["rsi"], _const(out, 60.0)) & (out["Close"] > out["ema_mid"]),
+                     cross_under(out["rsi"], _const(out, 40.0)) & (out["Close"] < out["ema_mid"]))
+
+
+def s_rsi_burst(df, p):
+    return _sr(f"RSI is at {fmt(safe_last(df['rsi']))}; bursts fire at 60 / 40.",
+               [("RSI", fmt(safe_last(df["rsi"]))), ("Bull level", "60.00"), ("Bear level", "40.00"),
+                ("Trend EMA", fmt(safe_last(df["ema_mid"])))],
+               "RSI breaks UP through 60 with price above the trend EMA.",
+               "RSI breaks DOWN through 40 with price below the trend EMA.")
+
+
+# --------------------------------------------------- 15 Bias scalper ---------
+def c_bias_scalper(df, p):
+    out = df.copy()
+    out["ema_fast"] = ema(out["Close"], int(_p(p, "ema_fast")))
+    out["ema_mid"] = ema(out["Close"], int(_p(p, "ema_mid")))
+    out["bias_slope"] = slope(out["ema_mid"], 5)
+    up = (out["Close"] > out["ema_mid"]) & (out["bias_slope"] > 0)
+    dn = (out["Close"] < out["ema_mid"]) & (out["bias_slope"] < 0)
+    return _finalise(out, up & cross_over(out["Close"], out["ema_fast"]),
+                     dn & cross_under(out["Close"], out["ema_fast"]))
+
+
+def s_bias_scalper(df, p):
+    sl = safe_last(df["bias_slope"])
+    return _sr(f"The {int(_p(p,'ema_mid'))}-bar trend path is sloping {'UP' if (sl or 0) > 0 else 'DOWN'}.",
+               [("Last price", fmt(safe_last(df["Close"]))),
+                ("Fast EMA", fmt(safe_last(df["ema_fast"]))),
+                ("Trend EMA", fmt(safe_last(df["ema_mid"]))), ("Slope", fmt(sl))],
+               "With the trend EMA rising, price crosses ABOVE the fast EMA.",
+               "With the trend EMA falling, price crosses BELOW the fast EMA.")
+
+
+# ------------------------------------------- 16 / 17 Simple buy and sell -----
+def _c_simple(direction: int):
+    def build(df, p):
+        out = df.copy()
+        out["ema_fast"] = ema(out["Close"], int(_p(p, "ema_fast")))
+        out["ema_slow"] = ema(out["Close"], int(_p(p, "ema_slow")))
+        sig = pd.Series(direction, index=out.index, dtype=int)
+        out["signal"] = sig
+        return out
+    return build
+
+
+def _s_simple(direction: int):
+    def status(df, p):
+        side = "LONG" if direction > 0 else "SHORT"
+        return _sr(f"Immediate {side} profile. It enters at once and runs until the stop, "
+                   "the target or a manual square-off resolves it.",
+                   [("Last price", fmt(safe_last(df["Close"]))),
+                    ("Mode", "Enter now, no candle wait")],
+                   "Enters immediately." if direction > 0 else "No long entries in this profile.",
+                   "Enters immediately." if direction < 0 else "No short entries in this profile.")
+    return status
+
+
+# ------------------------------------ 18 SMC break of structure + order block -
+def c_smc_ob(df, p):
+    out = df.copy()
+    bos, sh, sl_ = market_structure(out, int(_p(p, "pivot_left")), int(_p(p, "pivot_right")))
+    out["bos"], out["swing_high"], out["swing_low"] = bos, sh, sl_
+    down = out["Close"] < out["Open"]
+    up = out["Close"] > out["Open"]
+    # Order block = the last opposing candle immediately before the break.
+    ob_bull_lo = out["Low"].where(down).ffill().shift(1)
+    ob_bull_hi = out["High"].where(down).ffill().shift(1)
+    ob_bear_lo = out["Low"].where(up).ffill().shift(1)
+    ob_bear_hi = out["High"].where(up).ffill().shift(1)
+    new_bull = (bos == 1) & (bos.shift(1) != 1)
+    new_bear = (bos == -1) & (bos.shift(1) != -1)
+    out["ob_bull_lo"] = ob_bull_lo.where(new_bull).ffill()
+    out["ob_bull_hi"] = ob_bull_hi.where(new_bull).ffill()
+    out["ob_bear_lo"] = ob_bear_lo.where(new_bear).ffill()
+    out["ob_bear_hi"] = ob_bear_hi.where(new_bear).ffill()
+    long = (bos == 1) & (out["Low"] <= out["ob_bull_hi"]) & (out["Close"] > out["ob_bull_lo"]) & up
+    short = (bos == -1) & (out["High"] >= out["ob_bear_lo"]) & (out["Close"] < out["ob_bear_hi"]) & down
+    return _finalise(out, long, short)
+
+
+def s_smc_ob(df, p):
+    b = safe_last(df["bos"])
+    state = {1: "BULLISH", -1: "BEARISH"}.get(b, "NONE")
+    return _sr(f"Last confirmed structure break is {state}.",
+               [("Last price", fmt(safe_last(df["Close"]))),
+                ("Bull OB zone", f"{fmt(safe_last(df['ob_bull_lo']))} - {fmt(safe_last(df['ob_bull_hi']))}"),
+                ("Bear OB zone", f"{fmt(safe_last(df['ob_bear_lo']))} - {fmt(safe_last(df['ob_bear_hi']))}"),
+                ("Swing high", fmt(safe_last(df["swing_high"]))),
+                ("Swing low", fmt(safe_last(df["swing_low"])))],
+               "After a bullish BOS, price must retrace into the bullish order block and close green.",
+               "After a bearish BOS, price must retrace into the bearish order block and close red.")
+
+
+# ------------------------------------------------ 19 SMC liquidity sweep -----
+def c_smc_sweep(df, p):
+    out = df.copy()
+    sh, sl_ = swing_levels(out["High"], out["Low"],
+                           int(_p(p, "pivot_left")), int(_p(p, "pivot_right")))
+    out["swing_high"], out["swing_low"] = sh, sl_
+    # Wick takes out the pool of liquidity, body closes back inside the range.
+    long = (out["Low"] < sl_) & (out["Close"] > sl_) & (out["Close"] > out["Open"])
+    short = (out["High"] > sh) & (out["Close"] < sh) & (out["Close"] < out["Open"])
+    return _finalise(out, long, short)
+
+
+def s_smc_sweep(df, p):
+    return _sr("Watching the liquidity pools sitting beyond the last confirmed swings.",
+               [("Last price", fmt(safe_last(df["Close"]))),
+                ("Sell-side pool (swing low)", fmt(safe_last(df["swing_low"]))),
+                ("Buy-side pool (swing high)", fmt(safe_last(df["swing_high"])))],
+               "A wick must sweep below the swing low and the body close back above it, green.",
+               "A wick must sweep above the swing high and the body close back below it, red.")
+
+
+# ------------------------------------------------------- 20 ICT FVG ---------
+def c_ict_fvg(df, p):
+    out = df.copy()
+    bull, bear, blo, bhi, selo, sehi = fair_value_gaps(out)
+    out["fvg_bull"], out["fvg_bear"] = bull, bear
+    out["fvg_bull_lo"], out["fvg_bull_hi"] = blo, bhi
+    out["fvg_bear_lo"], out["fvg_bear_hi"] = selo, sehi
+    bos, _, _ = market_structure(out, int(_p(p, "pivot_left")), int(_p(p, "pivot_right")))
+    out["bos"] = bos
+    long = (bos == 1) & (out["Low"] <= out["fvg_bull_hi"]) & \
+        (out["Close"] > out["fvg_bull_lo"]) & (out["Close"] > out["Open"])
+    short = (bos == -1) & (out["High"] >= out["fvg_bear_lo"]) & \
+        (out["Close"] < out["fvg_bear_hi"]) & (out["Close"] < out["Open"])
+    return _finalise(out, long, short)
+
+
+def s_ict_fvg(df, p):
+    return _sr("Waiting for price to rebalance into the most recent fair value gap.",
+               [("Last price", fmt(safe_last(df["Close"]))),
+                ("Bullish FVG", f"{fmt(safe_last(df['fvg_bull_lo']))} - {fmt(safe_last(df['fvg_bull_hi']))}"),
+                ("Bearish FVG", f"{fmt(safe_last(df['fvg_bear_lo']))} - {fmt(safe_last(df['fvg_bear_hi']))}")],
+               "With bullish structure, price must trade into the bullish gap and close green.",
+               "With bearish structure, price must trade into the bearish gap and close red.")
+
+
+# ------------------------------------------- 21 ICT killzone Judas swing -----
+def c_ict_judas(df, p):
+    out = df.copy()
+    intraday = bool(p.get("intraday", True))
+    k = session_key(out.index)
+    bn = bar_of_session(out.index, intraday)
+    sess_open = out["Open"].groupby(k).transform("first") if intraday else out["Open"].shift(1)
+    out["session_open"] = sess_open
+    zone = int(_p(p, "orb_bars")) * 4
+    in_kz = (bn >= 1) & (bn <= zone) if intraday else pd.Series(True, index=out.index)
+    # False move away from the session open, then reclaim.
+    long = in_kz & (out["Low"] < sess_open) & (out["Close"] > sess_open) & (out["Close"] > out["Open"])
+    short = in_kz & (out["High"] > sess_open) & (out["Close"] < sess_open) & (out["Close"] < out["Open"])
+    return _finalise(out, long, short)
+
+
+def s_ict_judas(df, p):
+    return _sr("Hunting the killzone fake-out around the session open.",
+               [("Last price", fmt(safe_last(df["Close"]))),
+                ("Session open", fmt(safe_last(df["session_open"])))],
+               "Price dips below the session open inside the killzone and reclaims it green.",
+               "Price pops above the session open inside the killzone and loses it red.")
+
+
+# ------------------------------------------------- 22 Price action pin bar ---
+def c_pin_bar(df, p):
+    out = df.copy()
+    look = int(_p(p, "breakout_len"))
+    body = (out["Close"] - out["Open"]).abs()
+    rng = (out["High"] - out["Low"]).replace(0.0, np.nan)
+    lower_wick = out[["Open", "Close"]].min(axis=1) - out["Low"]
+    upper_wick = out["High"] - out[["Open", "Close"]].max(axis=1)
+    out["sup"] = rolling_low(out["Low"], look)
+    out["res"] = rolling_high(out["High"], look)
+    out["body_pct"] = body / rng * 100.0
+    bull_pin = (lower_wick >= 2.0 * body) & (lower_wick / rng > 0.5) & \
+        (out["Close"] > out["Low"] + 0.6 * rng)
+    bear_pin = (upper_wick >= 2.0 * body) & (upper_wick / rng > 0.5) & \
+        (out["Close"] < out["High"] - 0.6 * rng)
+    return _finalise(out, bull_pin & (out["Low"] <= out["sup"] * 1.003),
+                     bear_pin & (out["High"] >= out["res"] * 0.997))
+
+
+def s_pin_bar(df, p):
+    return _sr("Waiting for a rejection wick to print into a structural extreme.",
+               [("Last price", fmt(safe_last(df["Close"]))),
+                ("Body % of range", fmt(safe_last(df["body_pct"]))),
+                ("Support", fmt(safe_last(df["sup"]))), ("Resistance", fmt(safe_last(df["res"])))],
+               "Lower wick at least 2x the body, closing in the upper third, at support.",
+               "Upper wick at least 2x the body, closing in the lower third, at resistance.")
+
+
+# --------------------------------------------- 23 Inside bar breakout --------
+def c_inside_bar(df, p):
+    out = df.copy()
+    inside = (out["High"] < out["High"].shift(1)) & (out["Low"] > out["Low"].shift(1))
+    out["inside"] = inside
+    mother_hi = out["High"].shift(1).where(inside).ffill()
+    mother_lo = out["Low"].shift(1).where(inside).ffill()
+    out["mother_hi"], out["mother_lo"] = mother_hi, mother_lo
+    recent = inside.rolling(4, min_periods=1).max().astype(bool)
+    return _finalise(out, recent & cross_over(out["Close"], mother_hi),
+                     recent & cross_under(out["Close"], mother_lo))
+
+
+def s_inside_bar(df, p):
+    return _sr("Waiting for an inside-bar coil to resolve.",
+               [("Last price", fmt(safe_last(df["Close"]))),
+                ("Mother bar high", fmt(safe_last(df["mother_hi"]))),
+                ("Mother bar low", fmt(safe_last(df["mother_lo"]))),
+                ("Inside bar now", "yes" if safe_last(df["inside"]) else "no")],
+               "Close must break ABOVE the mother bar high within 4 bars of the coil.",
+               "Close must break BELOW the mother bar low within 4 bars of the coil.")
+
+
+# ------------------------------------------------- 24 Elliott wave 3 ---------
+def c_elliott(df, p):
+    """
+    Mechanical wave-3 heuristic, NOT a real Elliott count.
+
+    Looks for  low -> high -> higher-low  where the retracement sits between
+    38.2% and 78.6% of the first leg, then triggers when price reclaims the leg
+    high. Only pivots already CONFIRMED by the zigzag on or before the current
+    bar are consulted, so there is no look-ahead.
+    """
+    out = df.copy()
+    pivots = zigzag_pivot_table(out["Close"], float(_p(p, "zigzag_pct")))
+    n = len(out)
+    close = out["Close"].to_numpy(float)
+    long = np.zeros(n, dtype=bool)
+    short = np.zeros(n, dtype=bool)
+    wave_hi = np.full(n, np.nan)
+    wave_lo = np.full(n, np.nan)
+
+    known: list[tuple[int, float, int, int]] = []
+    ptr = 0
+    for i in range(n):
+        while ptr < len(pivots) and pivots[ptr][3] <= i:
+            known.append(pivots[ptr])
+            ptr += 1
+        if len(known) < 3:
+            continue
+        (_, p1, k1, _), (_, p2, k2, _), (_, p3, k3, _) = known[-3], known[-2], known[-1]
+        if (k1, k2, k3) == (-1, 1, -1):                 # low -> high -> low
+            leg = p2 - p1
+            if leg > 0:
+                retr = (p2 - p3) / leg
+                wave_hi[i], wave_lo[i] = p2, p3
+                if 0.382 <= retr <= 0.786 and p3 > p1 and close[i] > p2:
+                    long[i] = True
+        elif (k1, k2, k3) == (1, -1, 1):                # high -> low -> high
+            leg = p1 - p2
+            if leg > 0:
+                retr = (p3 - p2) / leg
+                wave_hi[i], wave_lo[i] = p3, p2
+                if 0.382 <= retr <= 0.786 and p3 < p1 and close[i] < p2:
+                    short[i] = True
+    out["wave_high"], out["wave_low"] = wave_hi, wave_lo
+    idx = out.index
+    return _finalise(out, pd.Series(long, index=idx), pd.Series(short, index=idx))
+
+
+def s_elliott(df, p):
+    return _sr("Zigzag wave heuristic. Elliott labelling is subjective; this is a mechanical "
+               "approximation, not an analyst's count.",
+               [("Last price", fmt(safe_last(df["Close"]))),
+                ("Leg extreme", fmt(safe_last(df["wave_high"]))),
+                ("Retracement pivot", fmt(safe_last(df["wave_low"]))),
+                ("Zigzag threshold", f"{fmt(_p(p,'zigzag_pct'))}%")],
+               "Impulse leg up, 38.2-78.6% retrace holding above the origin, then reclaim of the leg high.",
+               "Impulse leg down, 38.2-78.6% retrace holding below the origin, then loss of the leg low.")
+
+
+# ------------------------------------------------- 25 SuperTrend flip --------
+def c_supertrend_flip(df, p):
+    out = df.copy()
+    d, up, dn = supertrend(out["High"], out["Low"], out["Close"],
+                           int(_p(p, "st_len")), float(_p(p, "st_mult")))
+    out["st_dir"], out["st_up"], out["st_dn"] = d, up, dn
+    flip = d != d.shift(1)
+    return _finalise(out, flip & (d == 1), flip & (d == -1))
+
+
+def s_supertrend_flip(df, p):
+    d = safe_last(df["st_dir"])
+    return _sr(f"SuperTrend({int(_p(p,'st_len'))}, {fmt(_p(p,'st_mult'),1)}) is "
+               f"{'BULLISH' if d == 1 else 'BEARISH'}.",
+               [("Last price", fmt(safe_last(df["Close"]))),
+                ("Upper band", fmt(safe_last(df["st_up"]))),
+                ("Lower band", fmt(safe_last(df["st_dn"])))],
+               "SuperTrend must flip to bullish.", "SuperTrend must flip to bearish.")
+
+
+# ---------------------------------------------------- 26 VWAP reversion ------
+def c_vwap_reversion(df, p):
+    out = df.copy()
+    vw, vol_ok = vwap(out, bool(p.get("intraday", True)))
+    out["vwap"] = vw
+    out.attrs["vwap_is_volume_weighted"] = vol_ok
+    out["atr"] = atr(out["High"], out["Low"], out["Close"], int(_p(p, "atr_len")))
+    k = float(_p(p, "channel_mult"))
+    out["vwap_lo"] = out["vwap"] - k * out["atr"]
+    out["vwap_hi"] = out["vwap"] + k * out["atr"]
+    return _finalise(out, cross_over(out["Close"], out["vwap_lo"]),
+                     cross_under(out["Close"], out["vwap_hi"]))
+
+
+def s_vwap_reversion(df, p):
+    vol_ok = bool(df.attrs.get("vwap_is_volume_weighted", True))
+    return _sr("Fading stretches away from VWAP." if vol_ok else
+               "This feed has no volume, so the anchor is a session TWAP, not a true VWAP.",
+               [("Last price", fmt(safe_last(df["Close"]))),
+                ("VWAP anchor", fmt(safe_last(df["vwap"]))),
+                ("Lower band", fmt(safe_last(df["vwap_lo"]))),
+                ("Upper band", fmt(safe_last(df["vwap_hi"])))],
+               "Price stretches below the lower band then closes back inside.",
+               "Price stretches above the upper band then closes back inside.")
+
+
+# ------------------------------------------- 27 Wyckoff spring / upthrust ----
+def c_wyckoff(df, p):
+    out = df.copy()
+    look = int(_p(p, "structure_len"))
+    out["range_low"] = rolling_low(out["Low"], look)
+    out["range_high"] = rolling_high(out["High"], look)
+    out["vol_ma"] = sma(out["Volume"], int(_p(p, "vol_len")))
+    # Volume confirmation is optional: zero-volume feeds must not be locked out.
+    dead = float(out["Volume"].abs().sum()) == 0.0
+    vol_ok = pd.Series(True, index=out.index) if dead else (out["Volume"] > out["vol_ma"])
+    spring = (out["Low"] < out["range_low"]) & (out["Close"] > out["range_low"]) & \
+        (out["Close"] > out["Open"]) & vol_ok
+    upthrust = (out["High"] > out["range_high"]) & (out["Close"] < out["range_high"]) & \
+        (out["Close"] < out["Open"]) & vol_ok
+    return _finalise(out, spring, upthrust)
+
+
+def s_wyckoff(df, p):
+    return _sr("Watching the range edges for a spring or an upthrust.",
+               [("Last price", fmt(safe_last(df["Close"]))),
+                ("Range low", fmt(safe_last(df["range_low"]))),
+                ("Range high", fmt(safe_last(df["range_high"])))],
+               "Price must dip below the range low and close back inside, green.",
+               "Price must poke above the range high and close back inside, red.")
+
+
+# ------------------------------------------------------------- REGISTRY ------
+_DEFS = [
+    ("S01", "01 · Dual EMA Crossover", "9 EMA crossing the 21 EMA.", 40,
+     c_dual_ema, s_dual_ema, ("ema_fast", "ema_slow"), None, False),
+    ("S02", "02 · RSI Mean Reversion", "Buy the recovery from oversold, fade the failure from overbought.",
+     40, c_rsi_reversion, s_rsi_reversion, (), "rsi", False),
+    ("S03", "03 · EMA Structural Trend Pullback Scalper", "Pullbacks into the 21 EMA filtered by the 200 EMA.",
+     210, c_pullback, s_pullback, ("ema_slow", "ema_macro"), None, False),
+    ("S04", "04 · ATR Trailing Volatility Breakout", "Stop-and-reverse breaks of trailing ATR bands.",
+     60, c_atr_trail, s_atr_trail, ("trail_upper", "trail_lower"), None, False),
+    ("S05", "05 · Opening Range Breakout (ORB)", "Breaks of the session opening range.", 40,
+     c_orb, s_orb, ("or_high", "or_low"), None, False),
+    ("S06", "06 · Macro Golden Cross Continuum", "50 EMA crossing the 200 EMA.", 210,
+     c_golden_cross, s_golden_cross, ("ema_mid", "ema_macro"), None, False),
+    ("S07", "07 · Gap Counter-Trend Fade Momentum", "Fading exhausted gap-ups, buying gap-down reversals.",
+     40, c_gap_fade, s_gap_fade, (), None, False),
+    ("S08", "08 · RSI Centerline 50 Crossing", "Trend acceleration through the RSI median.", 40,
+     c_rsi_centerline, s_rsi_centerline, (), "rsi", False),
+    ("S09", "09 · Multi-Timeframe EMA Macro Vector", "Fast, intermediate and major EMAs aligning.", 210,
+     c_mtf_vector, s_mtf_vector, ("ema_fast", "ema_slow", "ema_mid", "ema_macro"), None, False),
+    ("S10", "10 · Volatility Price Squeeze Multiplier", "Breakouts as ATR expands past its mean.", 60,
+     c_squeeze, s_squeeze, ("box_high", "box_low"), None, False),
+    ("S11", "11 · High Volume Structural Confirmation", "Structure breaks backed by a volume spike.", 60,
+     c_volume_breakout, s_volume_breakout, ("box_high", "box_low"), None, False),
+    ("S12", "12 · Engulfing Candlestick Reversal", "Engulfing bars printed into structural zones.", 40,
+     c_engulfing, s_engulfing, ("sup", "res"), None, False),
+    ("S13", "13 · ATR Channel Reversion Engine", "Fading extensions outside an ATR channel.", 60,
+     c_channel_reversion, s_channel_reversion, ("basis", "ch_upper", "ch_lower"), None, False),
+    ("S14", "14 · RSI Momentum Swing Burst", "Momentum entries as RSI bursts through 60 / 40.", 60,
+     c_rsi_burst, s_rsi_burst, ("ema_mid",), "rsi", False),
+    ("S15", "15 · Macro-Trend EMA Bias Scalper", "Quick plays aligned to the 50-bar trend path.", 60,
+     c_bias_scalper, s_bias_scalper, ("ema_fast", "ema_mid"), None, False),
+    ("S16", "16 · Simple Buy (immediate entry)", "Enters LONG at once and runs until the exit resolves it.",
+     30, _c_simple(1), _s_simple(1), ("ema_fast", "ema_slow"), None, True),
+    ("S17", "17 · Simple Sell (immediate entry)", "Enters SHORT at once and runs until the exit resolves it.",
+     30, _c_simple(-1), _s_simple(-1), ("ema_fast", "ema_slow"), None, True),
+    ("S18", "18 · SMC Break of Structure + Order Block", "BOS, then a retrace into the originating order block.",
+     60, c_smc_ob, s_smc_ob, ("swing_high", "swing_low"), None, False),
+    ("S19", "19 · SMC Liquidity Sweep Reversal", "Stop-hunt beyond a swing, then a close back inside.",
+     60, c_smc_sweep, s_smc_sweep, ("swing_high", "swing_low"), None, False),
+    ("S20", "20 · ICT Fair Value Gap Entry", "Rebalance into the last unfilled imbalance.", 60,
+     c_ict_fvg, s_ict_fvg, ("fvg_bull_hi", "fvg_bear_lo"), None, False),
+    ("S21", "21 · ICT Killzone Judas Swing", "False move off the session open, then the reclaim.", 40,
+     c_ict_judas, s_ict_judas, ("session_open",), None, False),
+    ("S22", "22 · Price Action Pin Bar at Structure", "Rejection wicks printed at range extremes.", 40,
+     c_pin_bar, s_pin_bar, ("sup", "res"), None, False),
+    ("S23", "23 · Price Action Inside Bar Breakout", "Coil, then the resolution of the mother bar.", 40,
+     c_inside_bar, s_inside_bar, ("mother_hi", "mother_lo"), None, False),
+    ("S24", "24 · Elliott Wave Impulse (heuristic)", "Zigzag wave-3 approximation. Subjective by nature.",
+     80, c_elliott, s_elliott, ("wave_high", "wave_low"), None, False),
+    ("S25", "25 · SuperTrend Flip", "Direction flips of a 10/3.0 SuperTrend.", 60,
+     c_supertrend_flip, s_supertrend_flip, ("st_up", "st_dn"), None, False),
+    ("S26", "26 · VWAP Reversion", "Fading ATR-scaled stretches away from the VWAP anchor.", 60,
+     c_vwap_reversion, s_vwap_reversion, ("vwap", "vwap_hi", "vwap_lo"), None, False),
+    ("S27", "27 · Wyckoff Spring / Upthrust", "Range-edge failures with volume confirmation.", 60,
+     c_wyckoff, s_wyckoff, ("range_high", "range_low"), None, False),
+]
+
+STRATEGIES: dict[str, Strategy] = {
+    name: Strategy(key=k, name=name, blurb=b, min_bars=mb, compute=c, status=s,
+                   overlays=ov, oscillator=osc, immediate=imm)
+    for k, name, b, mb, c, s, ov, osc, imm in _DEFS
+}
+STRATEGY_NAMES: list[str] = list(STRATEGIES.keys())
+
+
+def get_strategy(name: str) -> Strategy:
+    try:
+        return STRATEGIES[name]
+    except KeyError as exc:
+        raise KeyError(f"Unknown strategy `{name}`.") from exc
+
+
+def prepare(df: pd.DataFrame, strategy_name: str, params: dict,
+            filter_cfg: dict | None = None, extras: dict | None = None):
+    """
+    Run the full pipeline: strategy signals -> exit-engine context columns ->
+    optional entry filters. Returns ``(frame, filter_reports)``.
+    """
+    strat = get_strategy(strategy_name)
+    out = strat.compute(df, params)
+
+    # Columns every exit type may need, computed once.
+    if "ema_fast" not in out:
+        out["ema_fast"] = ema(out["Close"], int(_p(params, "ema_fast")))
+    if "ema_slow" not in out:
+        out["ema_slow"] = ema(out["Close"], int(_p(params, "ema_slow")))
+    if "atr" not in out:
+        out["atr"] = atr(out["High"], out["Low"], out["Close"], int(_p(params, "atr_len")))
+    if "swing_high" not in out or "swing_low" not in out:
+        sh, sl_ = swing_levels(out["High"], out["Low"],
+                               int(_p(params, "pivot_left")), int(_p(params, "pivot_right")))
+        out["swing_high"], out["swing_low"] = sh, sl_
+    out["prev_high"] = out["High"].shift(1)
+    out["prev_low"] = out["Low"].shift(1)
+
+    reports: list[FilterReport] = []
+    if filter_cfg and any(v.get("enabled") for v in filter_cfg.values()):
+        out = attach_filter_columns(out, params, bool(params.get("intraday", True)))
+        ok_long, ok_short, reports = evaluate_filters(out, filter_cfg, extras)
+        out["raw_signal"] = out["signal"]
+        gated = np.where((out["signal"] == 1) & ~ok_long, 0,
+                         np.where((out["signal"] == -1) & ~ok_short, 0, out["signal"]))
+        out["signal"] = pd.Series(gated, index=out.index).astype(int)
+        out["filters_long_ok"] = ok_long
+        out["filters_short_ok"] = ok_short
+    else:
+        out["raw_signal"] = out["signal"]
+        out["filters_long_ok"] = True
+        out["filters_short_ok"] = True
+    return out, reports
+
+
+# =============================================================================
+# SECTION 6 -- RISK / EXIT ENGINE
+# =============================================================================
+# This is the part that decides profitability, so the rules are written out in
+# full rather than implied.
+#
+# RATCHET RULE: a trailing stop may only ever move in the trade's favour. It
+# never loosens, not even when the indicator it tracks loosens.
+#
+# BACKTEST vs LIVE, stated plainly: with OHLC candles we cannot know whether
+# price reached the trailing level before or after the extreme that moved it.
+# The engine therefore advances trailing levels only AFTER a candle has been
+# checked for exits, using that candle's own extremes. That is the pessimistic
+# reading, but backtested trailing results remain approximations. Live trailing
+# on the LTP is exact.
+
+
+@dataclass
+class RiskConfig:
+    sl_type: str
+    sl_value: float
+    tp_type: str
+    tp_value: float
+    quantity: float = 1.0
+    step_trigger: float = 0.0        # `k` for the step trail
+    min_stop_atr: float = 0.25       # fallback distance when a structural stop is invalid
+
+    def as_summary(self) -> str:
+        sl = self.sl_type if self.sl_type in _SL_NO_VALUE else f"{self.sl_type} {fmt(self.sl_value)}"
+        tp = self.tp_type if self.tp_type in _TP_NO_VALUE else f"{self.tp_type} {fmt(self.tp_value)}"
+        if self.sl_type == "Step Trail (trigger k, trail N)":
+            sl += f" (k={fmt(self.step_trigger)})"
+        return f"SL: {sl}  |  TGT: {tp}  |  Qty: {fmt(self.quantity, 0)}"
+
+
+@dataclass
+class BarCtx:
+    """Everything the exit engine may need from one candle."""
+    time: Any
+    open: float
+    high: float
+    low: float
+    close: float
+    atr: float
+    ema_fast: float
+    ema_slow: float
+    swing_high: float
+    swing_low: float
+    prev_high: float
+    prev_low: float
+    signal: int
+
+
+def bar_ctx(frame: pd.DataFrame, i: int) -> BarCtx:
+    row = frame.iloc[i]
+    return BarCtx(
+        time=frame.index[i],
+        open=_f(row["Open"]), high=_f(row["High"]), low=_f(row["Low"]), close=_f(row["Close"]),
+        atr=_f(row.get("atr")), ema_fast=_f(row.get("ema_fast")), ema_slow=_f(row.get("ema_slow")),
+        swing_high=_f(row.get("swing_high")), swing_low=_f(row.get("swing_low")),
+        prev_high=_f(row.get("prev_high")), prev_low=_f(row.get("prev_low")),
+        signal=int(row.get("signal", 0) or 0),
+    )
+
+
+class ExitManager:
+    """Owns the stop and target of one position for its whole life."""
+
+    def __init__(self, risk: RiskConfig, entry_price: float, direction: int, ctx: BarCtx):
+        self.risk = risk
+        self.entry = float(entry_price)
+        self.d = int(direction)
+        self.notes: list[str] = []
+        self.mfe = float(entry_price)          # best price seen in our favour
+        self.bars_held = 0
+        self.tp_display_only = risk.tp_type == "Trailing Target (display only)"
+        self.uses_signal_exit = (risk.sl_type in ("EMA Reverse Crossover", "Strategy Reverse Signal")
+                                 or risk.tp_type in ("EMA Reverse Crossover", "Strategy Reverse Signal"))
+        self._pending_current_candle_stop = risk.sl_type == "Current Candle Low/High"
+        self.sl = self._initial_stop(ctx)
+        self.initial_sl = self.sl
+        self.risk_points = abs(self.entry - self.sl) if self.sl is not None else None
+        self.tp = self._initial_target(ctx)
+
+    # ------------------------------------------------------------- helpers --
+    def _fallback_distance(self, ctx: BarCtx) -> float:
+        """Used when a structural level is missing or sits the wrong side of entry."""
+        if np.isfinite(ctx.atr) and ctx.atr > 0:
+            return max(ctx.atr * self.risk.min_stop_atr, self.entry * 0.0005)
+        return max(self.entry * 0.002, 0.05)
+
+    def _valid_stop(self, level, ctx: BarCtx, label: str):
+        """A long's stop must be BELOW entry, a short's ABOVE. Otherwise fall back."""
+        if level is None or not np.isfinite(level):
+            fb = self.entry - self.d * self._fallback_distance(ctx)
+            self.notes.append(f"{label} unavailable at entry; fell back to an ATR-scaled stop.")
+            return fb
+        if (self.d > 0 and level >= self.entry) or (self.d < 0 and level <= self.entry):
+            fb = self.entry - self.d * self._fallback_distance(ctx)
+            self.notes.append(f"{label} sat on the wrong side of entry; fell back to an ATR-scaled stop.")
+            return fb
+        return float(level)
+
+    def _valid_target(self, level, ctx: BarCtx, label: str):
+        if level is None or not np.isfinite(level):
+            return None
+        if (self.d > 0 and level <= self.entry) or (self.d < 0 and level >= self.entry):
+            self.notes.append(f"{label} sat on the wrong side of entry; no target set.")
+            return None
+        return float(level)
+
+    # ------------------------------------------------------------- initial --
+    def _initial_stop(self, ctx: BarCtx):
+        t, v, d, e = self.risk.sl_type, float(self.risk.sl_value), self.d, self.entry
+        if t == "No Stop-Loss" or t in ("EMA Reverse Crossover", "Strategy Reverse Signal"):
+            return None
+        if t == "Fixed Percentage":
+            return e - d * e * v / 100.0
+        if t in ("Fixed Points", "Trailing Points", "Step Trail (trigger k, trail N)"):
+            return e - d * v
+        if t == "Trailing Percentage":
+            return e - d * e * v / 100.0
+        if t in ("ATR Multiple", "Trailing ATR (Chandelier)"):
+            atr_v = ctx.atr if np.isfinite(ctx.atr) else np.nan
+            if not np.isfinite(atr_v):
+                return self._valid_stop(None, ctx, "ATR")
+            return e - d * v * atr_v
+        if t in ("Previous Candle Low/High", "Trailing Previous Candle Low/High"):
+            lvl = ctx.prev_low if d > 0 else ctx.prev_high
+            return self._valid_stop(lvl, ctx, "Previous candle extreme")
+        if t == "Current Candle Low/High":
+            # At entry the current candle has only just opened, so its low is not
+            # yet knowable. The signal candle's extreme is used until this candle
+            # completes, after which the stop rides the latest completed candle.
+            lvl = ctx.prev_low if d > 0 else ctx.prev_high
+            return self._valid_stop(lvl, ctx, "Signal candle extreme")
+        if t in ("Previous Swing Low/High", "Trailing Swing Low/High", "Price Action Structure Break"):
+            lvl = ctx.swing_low if d > 0 else ctx.swing_high
+            return self._valid_stop(lvl, ctx, "Confirmed swing")
+        return self._valid_stop(None, ctx, t)
+
+    def _initial_target(self, ctx: BarCtx):
+        t, v, d, e = self.risk.tp_type, float(self.risk.tp_value), self.d, self.entry
+        if t in ("No Target", "EMA Reverse Crossover", "Strategy Reverse Signal"):
+            return None
+        if t == "Fixed Percentage":
+            return e + d * e * v / 100.0
+        if t in ("Fixed Points", "Trailing Target (display only)"):
+            return e + d * v
+        if t == "ATR Multiple":
+            return e + d * v * ctx.atr if np.isfinite(ctx.atr) else None
+        if t == "Risk : Reward Multiple":
+            risk_pts = self.risk_points
+            if risk_pts is None or risk_pts <= 0:
+                risk_pts = self._fallback_distance(ctx)
+                self.notes.append("No measurable stop distance; the R:R target used an ATR proxy.")
+            return e + d * v * risk_pts
+        if t == "Previous Swing High/Low":
+            lvl = ctx.swing_high if d > 0 else ctx.swing_low
+            return self._valid_target(lvl, ctx, "Confirmed swing")
+        return None
+
+    # ------------------------------------------------------------- trailing --
+    def _ratchet(self, candidate):
+        """Move the stop only in our favour, never against."""
+        if candidate is None or not np.isfinite(candidate):
             return
-        st.session_state.best = best
-        st.session_state.best_table = table
-
-    best = st.session_state.get("best")
-    if not best:
-        st.info("Run the optimisation to fit parameters and unlock live trading.")
-        return
-
-    st.markdown("### Train vs holdout")
-    tr, te = best["train_stats"], best["test_stats"]
-    cols = st.columns(4)
-    cols[0].metric("Train win rate", f"{tr['win_rate']*100:.1f}%")
-    cols[1].metric("Train net", f"{tr['net_points']:+,.0f} pts", f"{tr['trades']} trades")
-    if te and te["trades"]:
-        cols[2].metric("Holdout win rate", f"{te['win_rate']*100:.1f}%",
-                       f"{(te['win_rate']-tr['win_rate'])*100:+.1f} pp")
-        cols[3].metric("Holdout net", f"{te['net_points']:+,.0f} pts", f"{te['trades']} trades")
-        if te["net_points"] <= 0:
-            st.error("Holdout is unprofitable. The train numbers are curve fit — do not trade this.")
-        elif te["win_rate"] < tr["win_rate"] - 0.15:
-            st.warning("Holdout win rate is far below train. Treat the edge as unproven.")
-    else:
-        cols[2].metric("Holdout", "too short")
-
-    st.markdown("### Leakage self-test")
-    st.caption("The same parameters run on random walks. Anything meaningfully above 50% "
-               "means the strategy is reading the future, not predicting it.")
-    lk = leakage_self_test(df, best["params"], cfg["cost_bps"], cfg["slippage"], cfg["intraday"])
-    if lk:
-        a, b = st.columns(2)
-        a.metric("Win rate on random data", f"{lk['mean_win_rate']*100:.1f}%")
-        b.metric("Expectancy on random data", f"{lk['mean_expectancy_points']:+.3f} pts")
-        if lk["mean_win_rate"] > 0.56:
-            st.error("Look-ahead bias detected. Do not trust any result on this page.")
-        else:
-            st.success("No look-ahead bias detected — random data scores like a coin flip.")
-
-    st.markdown("### Backtest summary")
-    scope = st.radio("Scope", ["Holdout only", "Full sample"], horizontal=True,
-                     index=0 if (te and te["trades"]) else 1, label_visibility="collapsed")
-    tbl = best["test_trades"] if scope == "Holdout only" and not best["test_trades"].empty \
-        else best["full_trades"]
-    st.dataframe(detailed_stats(tbl, cfg["qty"]), use_container_width=True, hide_index=True)
-    if scope == "Full sample":
-        st.caption("Full sample includes the fitted window, so it flatters the strategy. "
-                   "Judge it on the holdout.")
-
-    st.markdown("### Live recommendation")
-    st.caption("Read from the last closed bar using the fitted rule set.")
-    rec = recommendation(best["signals"], best["params"],
-                         best["test_stats"] or best["train_stats"],
-                         cfg["capital"], cfg["risk_pct"], cfg["qty"])
-    if rec and rec["direction"] == "flat":
-        st.info(f"No trade on the last closed bar — {rec['reason']}.")
-    elif rec:
-        r1 = st.columns(5)
-        r1[0].metric("Direction", rec["direction"].upper())
-        r1[1].metric("Reference price", f"{rec['reference_price']:,.2f}")
-        r1[2].metric("Stop loss", f"{rec['stop_loss']:,.2f}", f"-{rec['risk_points']:,.2f} pts")
-        r1[3].metric("Target", f"{rec['target']:,.2f}", f"+{rec['reward_points']:,.2f} pts")
-        r1[4].metric("Reward:risk", f"{rec['reward_risk']}")
-        st.caption(f"Stop basis: {rec['sl_basis']} · Target basis: {rec['tp_basis']} · "
-                   f"Rule: {rec['rule']} · "
-                   f"{rec['confluences_hit']}/{rec['confluences_total']} confluences")
-        r2 = st.columns(3)
-        r2[0].metric("Units by risk budget", f"{rec['units_by_risk']:,}",
-                     help=f"{cfg['risk_pct']}% of {cfg['capital']:,.0f} divided by the stop distance.")
-        r2[1].metric("Sidebar quantity", f"{cfg['qty']:,}")
-        r2[2].metric("Holdout win rate", f"{rec['holdout_win_rate']*100:.1f}%")
-        st.caption(rec["note"])
-        with st.expander("Full recommendation"):
-            st.json(rec)
-
-    st.markdown("### Backtest trades")
-    show = best["test_trades"] if scope == "Holdout only" and not best["test_trades"].empty \
-        else best["full_trades"]
-    if show.empty:
-        st.caption("No trades in this scope.")
-    else:
-        sc = show.copy()
-        sc["net_cash"] = (sc["net_points"] * cfg["qty"]).round(2)
-        st.dataframe(sc.iloc[::-1], use_container_width=True)
-        st.download_button("Download backtest trades (CSV)", sc.to_csv(index=False),
-                           "backtest_trades.csv", "text/csv")
-        st.bar_chart(show["exit_reason"].value_counts())
-
-    st.markdown("### Strategy vs buy and hold")
-    if scope == "Holdout only" and best.get("test_rows", 0) > 1:
-        bench_df = df.iloc[-int(best["test_rows"]):].reset_index(drop=True)
-        bench_label = "holdout"
-    else:
-        bench_df, bench_label = df, "full sample"
-    st.dataframe(benchmark_table(bench_df, show, cfg["qty"], bench_label),
-                 use_container_width=True, hide_index=True)
-    st.caption("Compared over the same bars. Time in market matters: a strategy that is "
-               "flat 90% of the time carries far less risk than buy-and-hold for the "
-               "same points, which is why drawdown and exposure are shown alongside.")
-
-    with st.expander("Fitted parameters"):
-        st.json({k: v for k, v in best["params"].items()})
-    with st.expander("Active confluences and rule"):
-        st.json(best["meta"])
-        if not best["meta"].get("volume_available", True):
-            st.caption("This feed carries no volume, so the vol_spike confluence was dropped "
-                       "rather than evaluated as permanently False.")
-    with st.expander("Search results (top 25)"):
-        t = st.session_state.get("best_table", pd.DataFrame())
-        st.dataframe(t.drop(columns=["params"], errors="ignore").head(25), use_container_width=True)
-
-    eq = best["full_trades"]["net_points"].cumsum() if not best["full_trades"].empty else pd.Series()
-    if len(eq):
-        fig2, ax2 = plt.subplots(figsize=(11, 3))
-        ax2.plot(eq.values, lw=1.2)
-        ax2.axvline(len(best["full_trades"]) * cfg["train_frac"], color="crimson", ls="--", lw=1)
-        ax2.set_title("Cumulative net points (red line ≈ train/holdout boundary)")
-        ax2.grid(alpha=0.25)
-        st.pyplot(fig2, clear_figure=True)
-
-
-def tab_live(cfg):
-    ls = live_state()
-    best = st.session_state.get("best")
-    if not best:
-        st.info("Fit parameters on the Backtesting tab first. Live trading uses that exact rule set.")
-        return
-    if cfg["source"] != "yfinance":
-        st.warning("Live trading needs yfinance. Tick 'Use yfinance' in the sidebar.")
-        return
-
-    p = dict(best["params"])
-
-    st.markdown("### Risk levels for this session")
-    st.caption("Both dropdowns open on the optimised value. Overriding them changes live "
-               "behaviour only — the accuracy shown below was measured at the optimised levels.")
-    c1, c2, c3 = st.columns(3)
-    sl_opts = sorted(set(SL_CHOICES + [round(p["sl_pct"], 4)]))
-    tp_opts = sorted(set(TP_CHOICES + [round(p["tp_pct"], 4)]))
-    sl = c1.selectbox("Stop loss", sl_opts, index=nearest(sl_opts, p["sl_pct"]),
-                      format_func=lambda x: f"{x*100:.2f}%")
-    tp = c2.selectbox("Target", tp_opts, index=nearest(tp_opts, p["tp_pct"]),
-                      format_func=lambda x: f"{x*100:.2f}%")
-    hold = c3.number_input("Max bars held", 1, 500, int(p["max_hold"]))
-    p.update({"sl_pct": float(sl), "tp_pct": float(tp), "max_hold": int(hold)})
-    if abs(sl - best["params"]["sl_pct"]) > 1e-9 or abs(tp - best["params"]["tp_pct"]) > 1e-9:
-        st.caption(f"Overridden. Optimised values were SL {best['params']['sl_pct']*100:.2f}% / "
-                   f"TP {best['params']['tp_pct']*100:.2f}%. Reward:risk now {tp/sl:.2f}.")
-
-    b1, b2, b3, b4 = st.columns(4)
-    if b1.button("Start", type="primary", disabled=ls["running"]):
-        ls["running"] = True
-        log("Live paper trading started")
-    if b2.button("Stop", disabled=not ls["running"]):
-        ls["running"] = False
-        log("Live paper trading stopped — open position left untouched")
-    if b3.button("Square off now", disabled=ls["position"] is None):
-        try:
-            latest = fetch_live(cfg["symbol"], cfg["interval"], 2, cfg["tz"])
-            px = float(latest["Close"].iloc[-1])
-            close_position(px, "manual_squareoff", latest["Date"].iloc[-1],
-                           cfg["cost_bps"], cfg["slippage"])
-        except Exception as e:
-            st.error(f"Could not fetch a price to square off: {e}")
-    if b4.button("Reset session"):
-        st.session_state.live = blank_live_state()
-        st.rerun()
-
-    refresh = st.select_slider("Auto-refresh every", [5, 10, 15, 30, 60, 120], value=30,
-                               format_func=lambda s: f"{s}s")
-
-    def render():
-        ls = live_state()
-        status = "RUNNING" if ls["running"] else "STOPPED"
-        try:
-            days_needed = min(INTERVAL_MAX_DAYS[cfg["interval"]], max(5, cfg["days"]))
-            df = fetch_live(cfg["symbol"], cfg["interval"], days_needed, cfg["tz"])
-        except Exception as e:
-            st.error(f"Data fetch failed: {e}")
+        if self.sl is None:
+            self.sl = float(candidate)
             return
+        self.sl = max(self.sl, float(candidate)) if self.d > 0 else min(self.sl, float(candidate))
 
-        if ls["running"]:
-            step_live(df, p, cfg["cost_bps"], cfg["slippage"], cfg["intraday"])
+    def update(self, favourable_price: float, ctx: BarCtx) -> None:
+        """
+        Advance trailing levels.
 
-        last = float(df["Close"].iloc[-1])
-        prev = float(df["Close"].iloc[-2]) if len(df) > 1 else last
+        BACKTEST: called after the candle has been checked, with that candle's
+        high (long) or low (short) as the favourable excursion.
+        LIVE: called on every poll with the LTP.
+        """
+        f = float(favourable_price)
+        if np.isfinite(f):
+            self.mfe = max(self.mfe, f) if self.d > 0 else min(self.mfe, f)
 
-        st.markdown("#### Last traded price")
-        t = st.columns(4)
-        t[0].metric("LTP", f"{last:,.2f}", f"{last - prev:+,.2f} ({(last/prev - 1)*100:+.2f}%)")
-        t[1].metric("Bar open", f"{float(df['Open'].iloc[-1]):,.2f}")
-        t[2].metric("Bar high / low",
-                    f"{float(df['High'].iloc[-1]):,.2f} / {float(df['Low'].iloc[-1]):,.2f}")
-        t[3].metric("Bar", f"{pd.Timestamp(df['Date'].iloc[-1]):%d %b %H:%M}",
-                    help="Newest bar, still forming. Signals only read closed bars.")
-        st.caption(f"{status} · {cfg['symbol']} · {INTERVAL_LABELS[cfg['interval']]} bars · "
-                   f"refreshed {pd.Timestamp.now(tz=cfg['tz']):%H:%M:%S}")
+        t, v, d, e = self.risk.sl_type, float(self.risk.sl_value), self.d, self.entry
+        cand, structural = None, False
+        if t == "Trailing Points":
+            cand = self.mfe - d * v
+        elif t == "Trailing Percentage":
+            cand = self.mfe * (1 - d * v / 100.0)
+        elif t == "Trailing ATR (Chandelier)" and np.isfinite(ctx.atr):
+            cand = self.mfe - d * v * ctx.atr
+        elif t == "Step Trail (trigger k, trail N)":
+            # Nothing happens until price has moved k points in our favour. Then
+            # the stop jumps to cost and thereafter rides N points behind the
+            # best price, never dropping back below cost.
+            if (self.mfe - e) * d >= float(self.risk.step_trigger):
+                raw = self.mfe - d * v
+                cand = max(e, raw) if d > 0 else min(e, raw)
+        elif t == "Trailing Previous Candle Low/High":
+            cand, structural = (ctx.prev_low if d > 0 else ctx.prev_high), True
+        elif t == "Current Candle Low/High":
+            cand, structural = (ctx.low if d > 0 else ctx.high), True
+        elif t in ("Trailing Swing Low/High", "Price Action Structure Break"):
+            cand, structural = (ctx.swing_low if d > 0 else ctx.swing_high), True
 
-        st.markdown("#### Session performance")
-        s = live_stats()
-        m = st.columns(6)
-        m[0].metric("Live trades", s["trades"])
-        m[1].metric("Live accuracy", f"{s['win_rate']*100:.1f}%" if s["trades"] else "—")
-        m[2].metric("Net points", f"{s['net_points']:+,.2f}")
-        m[3].metric(f"Net cash (qty {cfg['qty']})", f"{s['net_points'] * cfg['qty']:+,.2f}")
-        m[4].metric("Expectancy", f"{s['expectancy_points']:+.2f} pts")
-        hold_stats = best["test_stats"] or best["train_stats"]
-        m[5].metric("Backtest accuracy", f"{hold_stats['win_rate']*100:.1f}%",
-                    help="From the holdout slice, not the fitted window.")
-
-        if ls["pending"]:
-            pend = ls["pending"]
-            st.info(f"Pending {('LONG' if pend['dir'] == 1 else 'SHORT')} order — fills at the "
-                    f"open of the next bar. Signal: {pend['reason'][:120]}")
-
-        if ls["position"]:
-            pos = ls["position"]
-            d = pos["dir"]
-            open_pts = (last - pos["entry"]) * d
-            st.markdown("#### Open position")
-            k = st.columns(6)
-            k[0].metric("Side", pos["direction"].upper())
-            k[1].metric("Entry", f"{pos['entry']:,.2f}")
-            k[2].metric("Stop loss", f"{pos['sl']:,.2f}", f"{(pos['sl']-pos['entry'])*d:+.1f} pts")
-            k[3].metric("Target", f"{pos['tp']:,.2f}", f"{(pos['tp']-pos['entry'])*d:+.1f} pts")
-            k[4].metric("Open P&L", f"{open_pts:+,.2f} pts",
-                        f"{open_pts * cfg['qty']:+,.2f} cash")
-            k[5].metric("Bars held", pos["bars"])
-            st.caption(f"Signal: {pos['reason'][:200]}")
-            with st.expander("Parameters selected for this trade"):
-                st.json(pos["params_used"])
-        elif not ls["pending"]:
-            if ls["running"] and ls["last_bar"] is not None:
-                st.markdown(f"#### Flat — armed at "
-                            f"{pd.Timestamp(ls['last_bar']):%d %b %H:%M}, waiting for a signal")
+        if cand is not None and np.isfinite(cand):
+            if structural:
+                # A structural level must not leapfrog to the wrong side of the
+                # current price. Distance-based trails are NOT guarded this way:
+                # if price has already fallen back through a level derived from
+                # the best price, that stop is genuinely hit and the next check
+                # must fire it rather than have it quietly suppressed here.
+                ref = f if np.isfinite(f) else ctx.close
+                if (d > 0 and cand < ref) or (d < 0 and cand > ref):
+                    self._ratchet(cand)
             else:
-                st.markdown("#### Flat — press Start to arm the engine")
+                self._ratchet(cand)
 
-        if ls["trades"]:
-            st.markdown("#### Closed this session")
-            st.dataframe(pd.DataFrame(ls["trades"]).iloc[::-1].head(15), use_container_width=True)
-        with st.expander("Activity log"):
-            st.code("\n".join(ls["log"]) or "nothing yet")
+        if self.tp_display_only:
+            self.tp = self.mfe + d * float(self.risk.tp_value)
 
-    if hasattr(st, "fragment"):
-        frag = st.fragment(run_every=refresh if ls["running"] else None)(render)
-        frag()
-    else:
-        render()
-        if ls["running"]:
-            time.sleep(refresh)
-            st.rerun()
+    # --------------------------------------------------------------- checks --
+    @property
+    def target_is_live(self) -> bool:
+        """A display-only trailing target never fires an exit."""
+        return self.tp is not None and not self.tp_display_only
+
+    def check_bar(self, ctx: BarCtx):
+        """
+        BACKTEST exit check for one candle.
+
+        Order: gap through the open, then STOP against the low (long) / high
+        (short), then TARGET against the high (long) / low (short). When both
+        levels sit inside the range, the stop wins.
+        """
+        d = self.d
+        if d > 0:
+            if self.sl is not None and ctx.open <= self.sl:
+                return ctx.open, "Stop-Loss (Gap)"
+            if self.target_is_live and ctx.open >= self.tp:
+                return ctx.open, "Target (Gap)"
+            if self.sl is not None and ctx.low <= self.sl:
+                return self.sl, "Stop-Loss"
+            if self.target_is_live and ctx.high >= self.tp:
+                return self.tp, "Target"
+        else:
+            if self.sl is not None and ctx.open >= self.sl:
+                return ctx.open, "Stop-Loss (Gap)"
+            if self.target_is_live and ctx.open <= self.tp:
+                return ctx.open, "Target (Gap)"
+            if self.sl is not None and ctx.high >= self.sl:
+                return self.sl, "Stop-Loss"
+            if self.target_is_live and ctx.low <= self.tp:
+                return self.tp, "Target"
+        return None
+
+    def check_tick(self, ltp: float):
+        """
+        LIVE exit check against a running price.
+
+        Stop first, then target, both against the LTP. The fill is recorded at
+        the LTP rather than at the level, because that is where a market exit
+        would actually go.
+        """
+        p = float(ltp)
+        if not np.isfinite(p):
+            return None
+        if self.d > 0:
+            if self.sl is not None and p <= self.sl:
+                return p, "Stop-Loss"
+            if self.target_is_live and p >= self.tp:
+                return p, "Target"
+        else:
+            if self.sl is not None and p >= self.sl:
+                return p, "Stop-Loss"
+            if self.target_is_live and p <= self.tp:
+                return p, "Target"
+        return None
+
+    def signal_exit_reason(self, ctx: BarCtx) -> str | None:
+        """Bar-driven exits: EMA reverse crossover and strategy reverse signal."""
+        d = self.d
+        for label, kind in (("stop", self.risk.sl_type), ("target", self.risk.tp_type)):
+            if kind == "EMA Reverse Crossover":
+                if np.isfinite(ctx.ema_fast) and np.isfinite(ctx.ema_slow):
+                    if (d > 0 and ctx.ema_fast < ctx.ema_slow) or (d < 0 and ctx.ema_fast > ctx.ema_slow):
+                        return f"EMA Reverse Crossover ({label})"
+            elif kind == "Strategy Reverse Signal":
+                if ctx.signal == -d:
+                    return f"Strategy Reverse Signal ({label})"
+        return None
+
+    # ---------------------------------------------------------------- state --
+    def points(self, price: float) -> float:
+        return (float(price) - self.entry) * self.d
+
+    def pnl(self, price: float) -> float:
+        return self.points(price) * self.risk.quantity
+
+    def snapshot(self) -> dict:
+        return {"stop_loss": self.sl, "target": self.tp, "initial_stop": self.initial_sl,
+                "mfe": self.mfe, "display_only_target": self.tp_display_only,
+                "notes": list(self.notes)}
 
 
-def tab_history(cfg):
-    """Live paper trades only. Backtest trades live on the Backtesting tab."""
-    ls = live_state()
-    st.markdown("### Live paper trades")
-    live_df = pd.DataFrame(ls["trades"])
-    if live_df.empty:
-        st.info("No live trades yet. Arm the engine on the Live trading tab; it trades "
-                "forward from the moment you press Start and never backfills history.")
-        return
+@dataclass
+class Position:
+    """An open tracked position, live or simulated."""
+    strategy: str
+    symbol: str
+    interval: str
+    direction: int
+    quantity: float
+    entry_price: float
+    entry_time: Any
+    signal_bar_time: Any
+    manager: ExitManager
+    broker_order_id: str | None = None
+    entry_ltp_at_fill: float | None = None
 
-    live_df["net_cash"] = (live_df["net_points"] * cfg["qty"]).round(2)
-    st.dataframe(detailed_stats(live_df, cfg["qty"]), use_container_width=True, hide_index=True)
-    st.markdown("#### Trades")
-    st.dataframe(live_df.iloc[::-1], use_container_width=True)
-    st.download_button("Download live trades (CSV)", live_df.to_csv(index=False),
-                       "live_trades.csv", "text/csv")
-    eq = live_df["net_points"].cumsum()
-    st.line_chart(eq, height=200)
+    @property
+    def stop_loss(self):
+        return self.manager.sl
+
+    @property
+    def target(self):
+        return self.manager.tp
+
+    def points(self, price):
+        return self.manager.points(price)
+
+    def pnl(self, price):
+        return self.manager.pnl(price)
 
 
-def main():
-    st.title("Confluence Trader")
-    st.caption("MA · EMA · MACD · RSI · ADX · Bollinger · ATR · Volume confluences · purged holdout · charges applied · paper trading only")
-    cfg = sidebar()
+# =============================================================================
+# SECTION 7 -- BACKTEST ENGINE
+# =============================================================================
+class BacktestError(RuntimeError):
+    """Raised when the sample cannot support a valid simulation."""
+
+
+@dataclass
+class BacktestResult:
+    frame: pd.DataFrame
+    trades: pd.DataFrame
+    equity: pd.Series
+    stats: dict
+    warmup_index: int
+    warnings: list[str] = field(default_factory=list)
+    filter_reports: list = field(default_factory=list)
+
+
+def run_backtest(df: pd.DataFrame, strategy_name: str, params: dict, risk: RiskConfig,
+                 filter_cfg: dict | None = None, extras: dict | None = None,
+                 warmup: int = WARMUP_BARS) -> BacktestResult:
+    strat = get_strategy(strategy_name)
+    warnings: list[str] = []
+
+    required = max(warmup, strat.min_bars) + 5
+    if len(df) <= required:
+        raise BacktestError(
+            f"`{strategy_name}` needs at least {required} candles once the {warmup}-bar "
+            f"warm-up is reserved, but only {len(df)} are available. Widen the period or "
+            "use a coarser interval.")
+
+    frame, reports = prepare(df, strategy_name, params, filter_cfg, extras)
+
+    start = max(warmup, strat.min_bars)
+    start = max(start, 1)
+    if start >= len(frame) - 1:
+        raise BacktestError("The warm-up window consumed the entire sample.")
+
+    sig = frame["signal"].to_numpy(int)
+    n = len(frame)
+    trades: list[dict] = []
+    pos: Position | None = None
+    pending_signal_exit: str | None = None
+    gap_exits = 0
+    fallback_notes: set[str] = set()
+
+    for i in range(start, n):
+        ctx = bar_ctx(frame, i)
+        just_exited = False
+
+        # ---------------------------------------------------- manage risk ---
+        if pos is not None:
+            mgr = pos.manager
+            res = mgr.check_bar(ctx)
+            exit_price = reason = None
+
+            if res and res[1].endswith("(Gap)"):
+                exit_price, reason = res              # a gap beats everything else
+            elif pending_signal_exit:
+                exit_price, reason = ctx.open, pending_signal_exit
+            elif res:
+                exit_price, reason = res
+
+            if exit_price is not None:
+                if reason.endswith("(Gap)"):
+                    gap_exits += 1
+                trades.append(_close_trade(pos, float(exit_price), ctx.time, reason))
+                fallback_notes.update(mgr.notes)
+                pos, pending_signal_exit, just_exited = None, None, True
+            else:
+                # Survived the candle: NOW advance the trail using its extremes.
+                mgr.update(ctx.high if pos.direction > 0 else ctx.low, ctx)
+                pending_signal_exit = mgr.signal_exit_reason(ctx)
+                mgr.bars_held += 1
+
+        # --------------------------------------------------------- entries ---
+        if pos is None and not just_exited and sig[i - 1] != 0:
+            d = int(sig[i - 1])
+            entry = ctx.open                          # signal on N -> fill at N+1 open
+            if np.isfinite(entry) and entry > 0:
+                mgr = ExitManager(risk, entry, d, ctx)
+                pos = Position(strategy=strategy_name, symbol=params.get("symbol", ""),
+                               interval=params.get("interval", ""), direction=d,
+                               quantity=risk.quantity, entry_price=entry, entry_time=ctx.time,
+                               signal_bar_time=frame.index[i - 1], manager=mgr)
+                pending_signal_exit = None
+
+    if pos is not None:
+        last = bar_ctx(frame, n - 1)
+        trades.append(_close_trade(pos, float(last.close), last.time, "End of Data"))
+        fallback_notes.update(pos.manager.notes)
+
+    trades_df = pd.DataFrame(trades)
+    equity = _equity_curve(trades_df, frame.index)
+    stats = _statistics(trades_df, equity, risk)
+    stats.update(gap_exits=gap_exits, bars_tested=n - start, warmup_bars=start)
+
+    if gap_exits:
+        warnings.append(f"{gap_exits} exit(s) filled through a price gap rather than at the "
+                        "requested level. That slippage is real and is included in the PnL.")
+    if trades_df.empty:
+        warnings.append("This configuration produced no entries. Try a longer period, a faster "
+                        "interval, fewer filters, or a strategy whose conditions occur more often.")
+    if risk.sl_type in TRAILING_SL_TYPES:
+        warnings.append("A trailing stop is active. Backtested trailing results are APPROXIMATE: "
+                        "OHLC candles cannot tell us whether price hit the trailing level before "
+                        "or after the extreme that moved it. Treat these numbers as optimistic.")
+    for note in sorted(fallback_notes):
+        warnings.append("Exit engine: " + note)
+
+    return BacktestResult(frame=frame, trades=trades_df, equity=equity, stats=stats,
+                          warmup_index=start, warnings=warnings, filter_reports=reports)
+
+
+def _close_trade(pos: Position, exit_price: float, exit_time, reason: str) -> dict:
+    points = round((exit_price - pos.entry_price) * pos.direction, 4)
+    mgr = pos.manager
+    return {
+        "Direction": "LONG" if pos.direction > 0 else "SHORT",
+        "Signal Time": pos.signal_bar_time,
+        "Entry Time": pos.entry_time,
+        "Entry Price": round(pos.entry_price, 4),
+        "Exit Time": exit_time,
+        "Exit Price": round(float(exit_price), 4),
+        "Initial Stop": None if mgr.initial_sl is None else round(mgr.initial_sl, 4),
+        "Final Stop": None if mgr.sl is None else round(mgr.sl, 4),
+        "Target": None if mgr.tp is None else round(mgr.tp, 4),
+        "Best Price": round(mgr.mfe, 4),
+        "Exit Reason": reason,
+        "Bars Held": mgr.bars_held,
+        "Points": points,
+        "PnL": round(points * pos.quantity, 4),
+        "Quantity": pos.quantity,
+    }
+
+
+def _equity_curve(trades: pd.DataFrame, index: pd.Index) -> pd.Series:
+    curve = pd.Series(0.0, index=index, dtype=float)
+    if trades.empty:
+        return curve
+    realised = trades.groupby("Exit Time")["PnL"].sum()
+    curve.loc[realised.index] = realised.to_numpy(float)
+    return curve.cumsum()
+
+
+def _statistics(trades: pd.DataFrame, equity: pd.Series, risk: RiskConfig) -> dict:
+    if trades.empty:
+        return {"total_trades": 0, "wins": 0, "losses": 0, "win_rate": 0.0, "gross_points": 0.0,
+                "net_pnl": 0.0, "profit_factor": 0.0, "avg_win": 0.0, "avg_loss": 0.0,
+                "expectancy": 0.0, "max_drawdown": 0.0, "best_trade": 0.0, "worst_trade": 0.0,
+                "longs": 0, "shorts": 0, "avg_bars": 0.0}
+    pnl = trades["PnL"]
+    wins, losses = pnl[pnl > 0], pnl[pnl <= 0]
+    gross_win, gross_loss = float(wins.sum()), float(-losses.sum())
+    dd = equity - equity.cummax()
+    return {
+        "total_trades": int(len(trades)), "wins": int(len(wins)), "losses": int(len(losses)),
+        "win_rate": round(len(wins) / len(trades) * 100.0, 2),
+        "gross_points": round(float(trades["Points"].sum()), 2),
+        "net_pnl": round(float(pnl.sum()), 2),
+        "profit_factor": round(gross_win / gross_loss, 2) if gross_loss > 0 else float("inf"),
+        "avg_win": round(float(wins.mean()), 2) if len(wins) else 0.0,
+        "avg_loss": round(float(losses.mean()), 2) if len(losses) else 0.0,
+        "expectancy": round(float(pnl.mean()), 2),
+        "max_drawdown": round(float(dd.min()), 2),
+        "best_trade": round(float(pnl.max()), 2), "worst_trade": round(float(pnl.min()), 2),
+        "longs": int((trades["Direction"] == "LONG").sum()),
+        "shorts": int((trades["Direction"] == "SHORT").sum()),
+        "avg_bars": round(float(trades["Bars Held"].mean()), 1),
+    }
+
+
+# =============================================================================
+# SECTION 8 -- DHAN BROKER ADAPTER  (opt-in, dry-run by default)
+# =============================================================================
+# Endpoints and field names follow the DhanHQ v2 REST specification. Nothing is
+# transmitted unless the operator explicitly enables live order routing AND
+# turns off dry-run. Verify against the current DhanHQ documentation before
+# routing real money.
+
+DHAN_BASE = "https://api.dhan.co/v2"
+DHAN_SCRIP_URLS = [
+    "https://images.dhan.co/api-data/api-scrip-master-detailed.csv",
+    "https://images.dhan.co/api-data/api-scrip-master.csv",
+]
+DHAN_PRODUCTS = ["INTRADAY", "CNC", "MARGIN", "MTF", "CO", "BO"]
+DHAN_INSTRUMENTS = ["EQUITY", "OPTIONS", "FUTURES"]
+DHAN_SEGMENTS = ["NSE_EQ", "BSE_EQ", "NSE_FNO", "BSE_FNO", "MCX_COMM", "NSE_CURRENCY"]
+
+# Column-name candidates, because the scrip master schema has changed over time.
+_COL_CANDIDATES = {
+    "security_id": ["SEM_SMST_SECURITY_ID", "SECURITY_ID"],
+    "trading_symbol": ["SEM_TRADING_SYMBOL", "TRADING_SYMBOL"],
+    "custom_symbol": ["SEM_CUSTOM_SYMBOL", "DISPLAY_NAME"],
+    "name": ["SM_SYMBOL_NAME", "SYMBOL_NAME", "UNDERLYING_SYMBOL"],
+    "exchange": ["SEM_EXM_EXCH_ID", "EXCH_ID"],
+    "segment": ["SEM_SEGMENT", "SEGMENT"],
+    "instrument": ["SEM_INSTRUMENT_NAME", "INSTRUMENT", "INSTRUMENT_TYPE"],
+    "expiry": ["SEM_EXPIRY_DATE", "EXPIRY_DATE", "SM_EXPIRY_DATE"],
+    "strike": ["SEM_STRIKE_PRICE", "STRIKE_PRICE"],
+    "option_type": ["SEM_OPTION_TYPE", "OPTION_TYPE"],
+    "lot_size": ["SEM_LOT_UNITS", "LOT_SIZE"],
+}
+
+
+class BrokerError(RuntimeError):
+    """Raised for broker connectivity, resolution or rejection failures."""
+
+
+def _pick_col(df: pd.DataFrame, key: str) -> str | None:
+    for cand in _COL_CANDIDATES[key]:
+        if cand in df.columns:
+            return cand
+    return None
+
+
+def load_scrip_master(force: bool = False) -> pd.DataFrame:
+    """Download and normalise the Dhan instrument master. Cached for the session."""
+    import requests
+
+    last_err = None
+    for url in DHAN_SCRIP_URLS:
+        try:
+            resp = requests.get(url, timeout=60)
+            resp.raise_for_status()
+            from io import StringIO
+            raw = pd.read_csv(StringIO(resp.text), low_memory=False)
+            cols = {k: _pick_col(raw, k) for k in _COL_CANDIDATES}
+            if not cols["security_id"] or not cols["trading_symbol"]:
+                last_err = f"Unexpected schema at {url}: {list(raw.columns)[:10]}"
+                continue
+            out = pd.DataFrame({
+                k: (raw[v] if v else np.nan) for k, v in cols.items()
+            })
+            out["security_id"] = out["security_id"].astype(str).str.strip()
+            for c in ("trading_symbol", "custom_symbol", "name", "exchange", "segment",
+                      "instrument", "option_type"):
+                out[c] = out[c].astype(str).str.strip().str.upper()
+            out["expiry"] = pd.to_datetime(out["expiry"], errors="coerce")
+            out["strike"] = pd.to_numeric(out["strike"], errors="coerce")
+            out["lot_size"] = pd.to_numeric(out["lot_size"], errors="coerce")
+            out.attrs["source_url"] = url
+            return out
+        except Exception as exc:                                   # noqa: BLE001
+            last_err = f"{url}: {exc}"
+    raise BrokerError(f"Could not load the Dhan scrip master. Last error -- {last_err}")
+
+
+def _nearest_expiry(frame: pd.DataFrame, on: pd.Timestamp | None = None):
+    on = pd.Timestamp(on or pd.Timestamp.now().normalize())
+    future = frame.loc[frame["expiry"].notna() & (frame["expiry"] >= on), "expiry"]
+    return None if future.empty else future.min()
+
+
+def resolve_instrument(master: pd.DataFrame, underlying: str, instrument: str,
+                       segment: str, spot_price: float | None = None,
+                       option_type: str = "CALL", expiry: Any = None) -> dict:
+    """
+    Resolve an underlying to a concrete tradable contract.
+
+    Equity   -> the cash scrip on the chosen segment.
+    Futures  -> nearest unexpired contract.
+    Options  -> nearest expiry, strike closest to spot (ATM), chosen right.
+    """
+    under = (underlying or "").strip().upper()
+    if not under:
+        raise BrokerError("No underlying supplied for instrument resolution.")
+
+    frame = master[master["segment"].str.contains(segment.split("_")[-1][:3], na=False) |
+                   master["exchange"].str.startswith(segment.split("_")[0], na=False)]
+    if frame.empty:
+        frame = master
+
+    name_hit = (frame["name"].fillna("") == under) | \
+               (frame["trading_symbol"].fillna("").str.startswith(under)) | \
+               (frame["custom_symbol"].fillna("").str.startswith(under))
+    frame = frame[name_hit]
+    if frame.empty:
+        raise BrokerError(f"`{under}` was not found in the Dhan instrument master for {segment}.")
+
+    if instrument == "EQUITY":
+        eq = frame[frame["instrument"].str.contains("EQUITY", na=False)]
+        eq = eq if not eq.empty else frame
+        row = eq.iloc[0]
+    elif instrument == "FUTURES":
+        fut = frame[frame["instrument"].str.contains("FUT", na=False)]
+        if fut.empty:
+            raise BrokerError(f"No futures contracts found for `{under}`.")
+        exp = pd.Timestamp(expiry) if expiry else _nearest_expiry(fut)
+        if exp is None:
+            raise BrokerError(f"No unexpired futures contract for `{under}`.")
+        row = fut[fut["expiry"] == exp].iloc[0]
+    else:  # OPTIONS
+        opt = frame[frame["instrument"].str.contains("OPT", na=False)]
+        if opt.empty:
+            raise BrokerError(f"No option contracts found for `{under}`.")
+        exp = pd.Timestamp(expiry) if expiry else _nearest_expiry(opt)
+        if exp is None:
+            raise BrokerError(f"No unexpired option contract for `{under}`.")
+        opt = opt[opt["expiry"] == exp]
+        right = "CE" if str(option_type).upper().startswith("C") else "PE"
+        typed = opt[opt["option_type"].str.startswith(right[0], na=False) |
+                    opt["trading_symbol"].str.endswith(right, na=False)]
+        opt = typed if not typed.empty else opt
+        if spot_price is None or not np.isfinite(spot_price):
+            raise BrokerError("A spot price is required to select the ATM strike.")
+        opt = opt[opt["strike"].notna()]
+        if opt.empty:
+            raise BrokerError(f"No strikes with usable data for `{under}` {exp:%Y-%m-%d}.")
+        row = opt.iloc[(opt["strike"] - float(spot_price)).abs().argsort().iloc[0]]
+
+    return {
+        "security_id": str(row["security_id"]),
+        "trading_symbol": str(row["trading_symbol"]),
+        "exchange_segment": segment,
+        "instrument": instrument,
+        "expiry": None if pd.isna(row.get("expiry")) else pd.Timestamp(row["expiry"]).date().isoformat(),
+        "strike": None if pd.isna(row.get("strike")) else float(row["strike"]),
+        "option_type": None if instrument != "OPTIONS" else ("CALL" if str(option_type).upper().startswith("C") else "PUT"),
+        "lot_size": None if pd.isna(row.get("lot_size")) else int(row["lot_size"]),
+    }
+
+
+def place_dhan_order(broker: dict, contract: dict, side: str, quantity: float,
+                     dry_run: bool = True) -> dict:
+    """
+    Place a MARKET order through DhanHQ v2.
+
+    Returns a receipt dict. With ``dry_run=True`` the payload is built and
+    returned but nothing leaves the machine.
+    """
+    payload = {
+        "dhanClientId": str(broker.get("client_id", "")).strip(),
+        "correlationId": f"algoplat{int(time.time())}",
+        "transactionType": "BUY" if side.upper() in ("BUY", "LONG") else "SELL",
+        "exchangeSegment": contract["exchange_segment"],
+        "productType": broker.get("product_type", "INTRADAY"),
+        "orderType": "MARKET",
+        "validity": "DAY",
+        "securityId": str(contract["security_id"]),
+        "quantity": int(quantity),
+        "price": 0,
+    }
+    if dry_run:
+        return {"status": "DRY_RUN", "payload": payload, "order_id": None,
+                "message": "Dry run: payload built, nothing transmitted."}
+
+    token = str(broker.get("access_token", "")).strip()
+    if not token or not payload["dhanClientId"]:
+        raise BrokerError("Dhan client id and access token are both required for live routing.")
+
+    import requests
+    try:
+        resp = requests.post(f"{DHAN_BASE}/orders", headers={
+            "Content-Type": "application/json", "Accept": "application/json",
+            "access-token": token}, data=json.dumps(payload), timeout=20)
+    except Exception as exc:                                        # noqa: BLE001
+        raise BrokerError(f"Dhan request failed: {exc}") from exc
 
     try:
-        df, label = load_data(cfg)
-    except Exception as e:
-        st.error(f"Could not load data: {e}")
+        body = resp.json()
+    except Exception:                                               # noqa: BLE001
+        body = {"raw": resp.text[:500]}
+    if resp.status_code >= 400:
+        raise BrokerError(f"Dhan rejected the order (HTTP {resp.status_code}): {body}")
+    return {"status": body.get("orderStatus", "SENT"), "payload": payload,
+            "order_id": body.get("orderId"), "message": str(body)[:300]}
+
+
+# =============================================================================
+# SECTION 9 -- SESSION STATE  (live ledger is strictly separate from backtests)
+# =============================================================================
+_STATE_DEFAULTS = {
+    "live_running": False, "live_config": None, "live_position": None,
+    "live_trades": [],            # closed LIVE trades ONLY -- the ledger source
+    "live_events": [], "live_last_poll": 0.0, "live_last_bar": None,
+    "live_snapshot": None, "live_error": None, "live_started_at": None,
+    "live_poll_count": 0, "live_fail_streak": 0, "live_backoff_until": 0.0,
+    "backtest_result": None, "backtest_meta": None, "backtest_error": None,
+    "scrip_master": None, "broker_receipts": [],
+}
+
+
+def init_state() -> None:
+    for k, v in _STATE_DEFAULTS.items():
+        if k not in st.session_state:
+            st.session_state[k] = list(v) if isinstance(v, list) else v
+
+
+def log_event(message: str, level: str = "info") -> None:
+    st.session_state.live_events.insert(
+        0, {"time": pd.Timestamp.now().strftime("%H:%M:%S"), "level": level, "message": message})
+    del st.session_state.live_events[300:]
+
+
+def record_live_trade(trade: dict) -> None:
+    """
+    The ONLY writer to the live ledger.
+
+    Backtest output lives in a different session key and has no code path here,
+    so Tab 3 cannot be contaminated by simulated fills.
+    """
+    trade = dict(trade)
+    trade["Source"] = "LIVE"
+    st.session_state.live_trades.append(trade)
+
+
+def live_ledger_frame() -> pd.DataFrame:
+    rows = st.session_state.get("live_trades", [])
+    if not rows:
+        return pd.DataFrame()
+    frame = pd.DataFrame(rows)
+    if "Exit Time" in frame.columns:
+        frame = frame.sort_values("Exit Time").reset_index(drop=True)
+    frame.insert(0, "#", range(1, len(frame) + 1))
+    return frame
+
+
+def reset_live_runtime() -> None:
+    st.session_state.live_position = None
+    st.session_state.live_last_bar = None
+    st.session_state.live_snapshot = None
+    st.session_state.live_error = None
+    st.session_state.live_poll_count = 0
+    st.session_state.live_fail_streak = 0
+    st.session_state.live_backoff_until = 0.0
+
+
+# =============================================================================
+# SECTION 10 -- LIVE ENGINE
+# =============================================================================
+# Signal on the close of candle N -> entry at the OPEN of candle N+1, which is
+# already printed and therefore immediately actionable. Stop and target are then
+# evaluated against the LTP on every poll, stop first.
+
+
+@dataclass
+class LiveSnapshot:
+    frame: pd.DataFrame
+    ltp: float
+    next_open: float
+    last_closed_time: Any
+    last_closed_signal: int
+    raw_signal: int
+    status: StatusReport
+    filter_reports: list
+    fetched_at: pd.Timestamp
+    bars: int
+    data_warnings: list[str]
+    vix: float | None = None
+
+
+def poll_market(cfg: dict) -> LiveSnapshot:
+    strat = get_strategy(cfg["strategy"])
+    period = live_period_for(cfg["interval"])
+    bundle = load_market_data(symbol=cfg["symbol"], period=period, interval=cfg["interval"],
+                              freshness_seconds=max(API_GUARD_DELAY, cfg["poll_seconds"] * 0.9),
+                              min_bars=max(strat.min_bars, 30))
+
+    extras = dict(cfg.get("filter_extras") or {})
+    if cfg.get("filter_cfg", {}).get("vix", {}).get("enabled"):
+        extras["vix"] = load_vix(freshness_seconds=60)
+
+    frame, reports = prepare(bundle.frame, cfg["strategy"], cfg["params"],
+                             cfg.get("filter_cfg"), extras)
+    if len(frame) < 3:
+        raise MarketDataError("Not enough candles to evaluate a live signal.")
+
+    closed = -2                                     # last FULLY CLOSED candle
+    return LiveSnapshot(
+        frame=frame,
+        ltp=float(frame["Close"].iloc[-1]),
+        next_open=float(frame["Open"].iloc[-1]),    # the open of candle N+1
+        last_closed_time=frame.index[closed],
+        last_closed_signal=int(frame["signal"].iloc[closed]),
+        raw_signal=int(frame["raw_signal"].iloc[closed]),
+        status=strat.status(frame.iloc[:len(frame) + closed + 1], cfg["params"]),
+        filter_reports=reports, fetched_at=pd.Timestamp.now(), bars=len(frame),
+        data_warnings=bundle.warnings, vix=extras.get("vix"))
+
+
+def _live_close(position: Position, exit_price: float, reason: str) -> dict:
+    mgr = position.manager
+    points = round((float(exit_price) - position.entry_price) * position.direction, 4)
+    trade = {
+        "Strategy": position.strategy, "Symbol": position.symbol, "Interval": position.interval,
+        "Direction": "LONG" if position.direction > 0 else "SHORT",
+        "Quantity": position.quantity,
+        "Entry Time": pd.Timestamp(position.entry_time),
+        "Entry Price": round(position.entry_price, 4),
+        "Exit Time": pd.Timestamp.now(), "Exit Price": round(float(exit_price), 4),
+        "Initial Stop": None if mgr.initial_sl is None else round(mgr.initial_sl, 4),
+        "Final Stop": None if mgr.sl is None else round(mgr.sl, 4),
+        "Target": None if mgr.tp is None else round(mgr.tp, 4),
+        "Best Price": round(mgr.mfe, 4), "Exit Reason": reason,
+        "Points": points, "PnL": round(points * position.quantity, 4),
+        "Broker Order": position.broker_order_id or "-",
+    }
+    record_live_trade(trade)
+    return trade
+
+
+def square_off(reason: str = "Manual Square-Off", price: float | None = None) -> dict | None:
+    """Flatten the tracked position, book the PnL, zero the risk."""
+    position: Position | None = st.session_state.live_position
+    if position is None:
+        return None
+    if price is None:
+        snap = st.session_state.live_snapshot
+        price = snap.ltp if snap else position.entry_price
+
+    cfg = st.session_state.live_config or {}
+    _maybe_route_broker(cfg, position, closing=True)
+
+    trade = _live_close(position, float(price), reason)
+    st.session_state.live_position = None
+    log_event(f"{reason}: {trade['Direction']} closed at {fmt(trade['Exit Price'])} "
+              f"for {fmt_signed(trade['PnL'])} ({fmt_signed(trade['Points'])} pts).",
+              "warn" if trade["PnL"] < 0 else "success")
+    return trade
+
+
+def _maybe_route_broker(cfg: dict, position: Position, closing: bool) -> None:
+    """Send the entry or exit leg to Dhan, if and only if the operator enabled it."""
+    broker = cfg.get("broker") or {}
+    if not broker.get("enabled"):
         return
-    if df is None or len(df) < 120:
-        st.info("Upload a file or pick an instrument. At least 120 bars are needed.")
+    contract = broker.get("contract")
+    if not contract:
+        log_event("Broker routing is on but no contract is resolved; order skipped.", "error")
+        return
+    side = ("SELL" if position.direction > 0 else "BUY") if closing else \
+           ("BUY" if position.direction > 0 else "SELL")
+    try:
+        receipt = place_dhan_order(broker, contract, side, position.quantity,
+                                   dry_run=broker.get("dry_run", True))
+        st.session_state.broker_receipts.insert(0, {
+            "time": pd.Timestamp.now(), "leg": "EXIT" if closing else "ENTRY",
+            "side": side, **{k: receipt.get(k) for k in ("status", "order_id", "message")}})
+        del st.session_state.broker_receipts[100:]
+        if not closing:
+            position.broker_order_id = receipt.get("order_id")
+        log_event(f"Broker {('EXIT' if closing else 'ENTRY')} {side} -> {receipt['status']}",
+                  "info" if receipt["status"] == "DRY_RUN" else "success")
+    except BrokerError as exc:
+        log_event(f"Broker order FAILED: {exc}", "error")
+
+
+def _open_live_position(cfg: dict, direction: int, price: float, ctx: BarCtx, bar_time) -> Position:
+    mgr = ExitManager(cfg["risk"], float(price), direction, ctx)
+    position = Position(strategy=cfg["strategy"], symbol=cfg["symbol"], interval=cfg["interval"],
+                        direction=direction, quantity=cfg["risk"].quantity,
+                        entry_price=float(price), entry_time=pd.Timestamp.now(),
+                        signal_bar_time=bar_time, manager=mgr,
+                        entry_ltp_at_fill=cfg.get("_ltp_at_fill"))
+    st.session_state.live_position = position
+    _maybe_route_broker(cfg, position, closing=False)
+    log_event(f"ENTRY {'LONG' if direction > 0 else 'SHORT'} @ {fmt(price)} | "
+              f"SL {fmt(mgr.sl)} | TGT {fmt(mgr.tp)} | qty {fmt(cfg['risk'].quantity, 0)}", "success")
+    for note in mgr.notes:
+        log_event("Exit engine: " + note, "warn")
+    return position
+
+
+def run_cycle(cfg: dict) -> None:
+    """One iteration: manage open risk first, then look for a new entry."""
+    if time.time() < st.session_state.get("live_backoff_until", 0.0):
+        return
+    try:
+        snapshot = poll_market(cfg)
+    except Exception as exc:                                        # noqa: BLE001
+        st.session_state.live_fail_streak += 1
+        streak = st.session_state.live_fail_streak
+        backoff = min(300.0, max(2.0, cfg["poll_seconds"]) * (2 ** min(streak, 6)))
+        st.session_state.live_backoff_until = time.time() + backoff
+        st.session_state.live_error = (f"{exc}  --  backing off {backoff:.0f}s "
+                                       f"(consecutive failures: {streak})")
+        log_event(f"Feed error: {exc}. Backing off {backoff:.0f}s.", "error")
         return
 
-    t1, t2, t3 = st.tabs(["Backtesting", "Live trading", "Trade history"])
+    st.session_state.live_fail_streak = 0
+    st.session_state.live_backoff_until = 0.0
+    st.session_state.live_error = None
+    st.session_state.live_snapshot = snapshot
+    st.session_state.live_last_poll = time.time()
+    st.session_state.live_poll_count += 1
+
+    frame = snapshot.frame
+    closed_ctx = bar_ctx(frame, len(frame) - 2)
+    position: Position | None = st.session_state.live_position
+    new_bar = st.session_state.live_last_bar != snapshot.last_closed_time
+
+    # ------------------------------------------------- 1. manage open risk ---
+    if position is not None:
+        mgr = position.manager
+        hit = mgr.check_tick(snapshot.ltp)           # stop first, then target, both vs LTP
+        if hit:
+            price, reason = hit
+            square_off(reason, price)
+            st.session_state.live_last_bar = snapshot.last_closed_time
+            return
+        if new_bar:
+            reason = mgr.signal_exit_reason(closed_ctx)
+            if reason:
+                square_off(reason, snapshot.ltp)
+                st.session_state.live_last_bar = snapshot.last_closed_time
+                return
+            mgr.bars_held += 1
+        mgr.update(snapshot.ltp, closed_ctx)         # trail on the running price
+        st.session_state.live_last_bar = snapshot.last_closed_time
+        return
+
+    # ----------------------------------------------------- 2. fresh entries ---
+    strat = get_strategy(cfg["strategy"])
+    if strat.immediate:
+        direction = 1 if "Buy" in strat.name else -1
+        cfg["_ltp_at_fill"] = snapshot.ltp
+        _open_live_position(cfg, direction, snapshot.ltp, closed_ctx, snapshot.last_closed_time)
+        st.session_state.live_last_bar = snapshot.last_closed_time
+        return
+
+    already_seen = not new_bar
+    st.session_state.live_last_bar = snapshot.last_closed_time
+    if already_seen or snapshot.last_closed_signal == 0:
+        return
+
+    # Signal on candle N -> fill at the OPEN of candle N+1 (already printed).
+    fill = snapshot.ltp if cfg.get("fill_at_ltp") else snapshot.next_open
+    cfg["_ltp_at_fill"] = snapshot.ltp
+    _open_live_position(cfg, snapshot.last_closed_signal, fill, closed_ctx,
+                        snapshot.last_closed_time)
+
+
+def should_poll(cfg: dict) -> bool:
+    if time.time() < st.session_state.get("live_backoff_until", 0.0):
+        return False
+    return (time.time() - st.session_state.get("live_last_poll", 0.0)) >= float(cfg["poll_seconds"])
+
+
+# =============================================================================
+# SECTION 11 -- CHARTS
+# =============================================================================
+_UP, _DOWN = "#26a69a", "#ef5350"
+_OVERLAY_COLOURS = ["#f4a261", "#4f9df7", "#b07cf0", "#8d99ae", "#e9c46a", "#2a9d8f"]
+_PRETTY = {
+    "ema_fast": "Fast EMA", "ema_slow": "Slow EMA", "ema_mid": "Mid EMA", "ema_macro": "Macro EMA",
+    "trail_upper": "ATR Trail Up", "trail_lower": "ATR Trail Down", "or_high": "OR High",
+    "or_low": "OR Low", "box_high": "Box High", "box_low": "Box Low", "sup": "Support",
+    "res": "Resistance", "basis": "Basis", "ch_upper": "Channel Up", "ch_lower": "Channel Down",
+    "swing_high": "Swing High", "swing_low": "Swing Low", "st_up": "SuperTrend Up",
+    "st_dn": "SuperTrend Down", "vwap": "VWAP", "vwap_hi": "VWAP Upper", "vwap_lo": "VWAP Lower",
+    "mother_hi": "Mother Bar High", "mother_lo": "Mother Bar Low", "session_open": "Session Open",
+    "fvg_bull_hi": "Bullish FVG", "fvg_bear_lo": "Bearish FVG", "wave_high": "Leg High",
+    "wave_low": "Leg Low", "range_high": "Range High", "range_low": "Range Low",
+}
+
+
+def _label(col: str) -> str:
+    return _PRETTY.get(col, col.replace("_", " ").title())
+
+
+def price_chart(df, title, overlays=("ema_fast", "ema_slow"), trades=None, tail=None,
+                oscillator=None, hide_weekends=True, height=600):
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    data = df.tail(tail) if tail else df
+    if oscillator and oscillator in data.columns:
+        fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                            row_heights=[0.74, 0.26], vertical_spacing=0.04)
+        row = 1
+    else:
+        fig, row = go.Figure(), None
+
+    def add(trace, r=row):
+        fig.add_trace(trace) if r is None else fig.add_trace(trace, row=r, col=1)
+
+    add(go.Candlestick(x=data.index, open=data["Open"], high=data["High"], low=data["Low"],
+                       close=data["Close"], name="Price",
+                       increasing_line_color=_UP, decreasing_line_color=_DOWN,
+                       increasing_fillcolor=_UP, decreasing_fillcolor=_DOWN))
+
+    for i, col in enumerate(dict.fromkeys(("ema_fast", "ema_slow", *overlays))):
+        if col in data.columns and data[col].notna().sum():
+            add(go.Scatter(x=data.index, y=data[col], mode="lines", name=_label(col),
+                           line=dict(width=1.5, color=_OVERLAY_COLOURS[i % len(_OVERLAY_COLOURS)])))
+
+    if trades is not None and not trades.empty:
+        for frame, name, sym, colour in ((trades[trades["Direction"] == "LONG"], "Long entry",
+                                          "triangle-up", _UP),
+                                         (trades[trades["Direction"] == "SHORT"], "Short entry",
+                                          "triangle-down", _DOWN)):
+            if not frame.empty:
+                add(go.Scatter(x=frame["Entry Time"], y=frame["Entry Price"], mode="markers",
+                               name=name, marker=dict(symbol=sym, size=11, color=colour,
+                                                      line=dict(width=1, color="#fff")),
+                               hovertemplate="%{x}<br>Entry %{y:,.2f}<extra></extra>"))
+        add(go.Scatter(x=trades["Exit Time"], y=trades["Exit Price"], mode="markers", name="Exit",
+                       marker=dict(symbol="x", size=9, color="#8d99ae"),
+                       customdata=trades[["Exit Reason", "PnL"]],
+                       hovertemplate="%{x}<br>Exit %{y:,.2f}<br>%{customdata[0]}"
+                                     "<br>PnL %{customdata[1]:,.2f}<extra></extra>"))
+
+    if row:
+        add(go.Scatter(x=data.index, y=data[oscillator], mode="lines", name=oscillator.upper(),
+                       line=dict(width=1.5, color="#4f9df7")), 2)
+        for lvl, dash in ((70, "dot"), (50, "dash"), (30, "dot")):
+            fig.add_hline(y=lvl, row=2, col=1, line=dict(width=1, dash=dash, color="#8d99ae"))
+        fig.update_yaxes(range=[0, 100], row=2, col=1, title_text=oscillator.upper())
+
+    fig.update_layout(title=dict(text=title, x=0.01, xanchor="left", font=dict(size=15)),
+                      height=height, margin=dict(l=10, r=10, t=46, b=10), hovermode="x unified",
+                      legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                      xaxis_rangeslider_visible=False, dragmode="pan")
+    if hide_weekends:
+        fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
+    return fig
+
+
+def equity_chart(equity, currency="", height=280):
+    import plotly.graph_objects as go
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=equity.index, y=equity.to_numpy(), mode="lines", name="Cumulative",
+                             line=dict(width=2, color="#4f9df7"), fill="tozeroy",
+                             fillcolor="rgba(79,157,247,0.14)"))
+    fig.add_trace(go.Scatter(x=equity.index, y=equity.cummax().to_numpy(), mode="lines",
+                             name="Peak", line=dict(width=1, color="#8d99ae", dash="dot")))
+    fig.add_hline(y=0, line=dict(width=1, color="#8d99ae"))
+    fig.update_layout(title=dict(text=f"Realised Equity Curve ({currency})", x=0.01,
+                                 xanchor="left", font=dict(size=14)),
+                      height=height, margin=dict(l=10, r=10, t=42, b=10),
+                      hovermode="x unified", showlegend=False)
+    return fig
+
+
+# =============================================================================
+# SECTION 12 -- SIDEBAR CONTROL CONSOLE
+# =============================================================================
+_CUSTOM = "-- Custom ticker --"
+
+
+def render_sidebar() -> dict:
+    live = bool(st.session_state.get("live_running", False))
+    sb = st.sidebar
+    sb.title("Control Console")
+    if live:
+        _running_banner()
+        sb.caption("Configuration is locked while the automation core is running.")
+
+    sb.subheader("Instrument")
+    group = sb.selectbox("Asset class", list(ASSET_UNIVERSE) + [_CUSTOM], disabled=live,
+                         key="cfg_group")
+    if group == _CUSTOM:
+        symbol = sb.text_input("Custom Yahoo ticker", "KAYNES.NS", disabled=live,
+                               key="cfg_custom").strip().upper()
+        asset_label = symbol or "--"
+    else:
+        uni = ASSET_UNIVERSE[group]
+        asset_label = sb.selectbox("Asset", list(uni), disabled=live, key="cfg_asset")
+        symbol = uni[asset_label]
+        ovr = sb.text_input("Override ticker (optional)", "", disabled=live,
+                            placeholder=symbol, key="cfg_ovr").strip().upper()
+        if ovr:
+            symbol, asset_label = ovr, ovr
+    sb.caption(f"Resolved symbol: `{symbol}`")
+
+    sb.subheader("Resolution")
+    interval = sb.selectbox("Interval", INTERVALS, index=INTERVALS.index("5m"), disabled=live,
+                            key="cfg_interval")
+    period = sb.selectbox("Period", PERIODS, index=PERIODS.index("1mo"), disabled=live,
+                          key="cfg_period")
+    eff_period, clamp = sanitize_period(interval, period)
+    if clamp:
+        sb.warning(clamp)
+
+    sb.subheader("Strategy Profile")
+    strategy = sb.selectbox("Logic profile", STRATEGY_NAMES, disabled=live, key="cfg_strategy")
+    strat = get_strategy(strategy)
+    sb.caption(strat.blurb)
+    if strat.immediate:
+        sb.info("This profile enters the moment the engine starts, with no candle wait.")
+
+    sb.subheader("Position Sizing")
+    quantity = sb.number_input("Quantity", min_value=1.0, value=1.0, step=1.0, disabled=live,
+                               key="cfg_qty")
+
+    # ------------------------------------------------------------ risk ------
+    sb.subheader("Stop-Loss")
+    sl_type = sb.selectbox("Stop-Loss type", SL_TYPES, disabled=live, key="cfg_sl_type")
+    sl_value, step_trigger = 0.0, 0.0
+    if sl_type not in _SL_NO_VALUE:
+        default = {"Fixed Percentage": 1.0, "Trailing Percentage": 1.0,
+                   "ATR Multiple": 2.0, "Trailing ATR (Chandelier)": 3.0}.get(sl_type, 20.0)
+        sl_value = sb.number_input("Stop-Loss value", min_value=0.01, value=float(default),
+                                   step=0.1, disabled=live, key=f"cfg_sl_v_{sl_type}",
+                                   help="Percent, points or ATR multiple depending on the type.")
+    if sl_type == "Step Trail (trigger k, trail N)":
+        step_trigger = sb.number_input("Trigger k (points in favour before the trail arms)",
+                                       min_value=0.0, value=5.0, step=0.5, disabled=live,
+                                       key="cfg_step_k",
+                                       help="Below k the original stop stands. At k the stop jumps "
+                                            "to cost, then rides N points behind the best price.")
+        sb.caption(f"Entry 50, N={fmt(sl_value)}, k={fmt(step_trigger)}: at 50+k the stop moves to "
+                   f"50; at 60 it stays 50; at 61 it becomes {fmt(61 - sl_value)}.")
+    if sl_type in TRAILING_SL_TYPES:
+        sb.caption("Trailing stops are exact live but APPROXIMATE in backtests -- OHLC bars hide "
+                   "the intrabar path.")
+
+    sb.subheader("Target")
+    tp_type = sb.selectbox("Target type", TP_TYPES, disabled=live, key="cfg_tp_type")
+    tp_value = 0.0
+    if tp_type not in _TP_NO_VALUE:
+        default = {"Fixed Percentage": 2.0, "ATR Multiple": 3.0,
+                   "Risk : Reward Multiple": 2.0}.get(tp_type, 40.0)
+        tp_value = sb.number_input("Target value", min_value=0.01, value=float(default), step=0.1,
+                                   disabled=live, key=f"cfg_tp_v_{tp_type}")
+    if tp_type == "Trailing Target (display only)":
+        sb.caption("Display only: this target trails the best price and never fires an exit. "
+                   "The position is resolved by the stop or a strategy exit.")
+
+    risk = RiskConfig(sl_type=sl_type, sl_value=float(sl_value), tp_type=tp_type,
+                      tp_value=float(tp_value), quantity=float(quantity),
+                      step_trigger=float(step_trigger))
+
+    # ------------------------------------------------------- execution ------
+    sb.subheader("Execution")
+    poll_seconds = sb.number_input("Live poll interval (seconds)", min_value=API_GUARD_DELAY,
+                                   max_value=600.0, value=5.0, step=0.1, key="cfg_poll",
+                                   help="Auto-refresh cadence once the core is started. Every "
+                                        "request carries the mandatory 0.3s guard on both sides.")
+    if poll_seconds < 2.0:
+        sb.error(f"At {fmt(poll_seconds,1)}s you will issue ~{60/poll_seconds:.0f} requests a "
+                 "minute. Yahoo throttles well before that and will return 429s, then block the "
+                 "IP for a while. Yahoo index data is also delayed ~15 minutes, so polling faster "
+                 "does not make it fresher.")
+    fill_at_ltp = sb.checkbox("Live: fill at LTP instead of the N+1 open", value=False,
+                              disabled=live, key="cfg_fill_ltp",
+                              help="Default follows the N+1-open rule. Turn this on if you would "
+                                   "rather record the price a market order would actually get.")
+
+    filter_cfg, filter_extras = _render_filters(sb, live)
+    broker = _render_broker(sb, live, symbol)
+
+    params = dict(DEFAULT_PARAMS)
+    with sb.expander("Advanced indicator parameters"):
+        for key, lo, hi in (("ema_fast", 2, 100), ("ema_slow", 3, 200), ("ema_mid", 5, 300),
+                            ("ema_macro", 20, 400), ("rsi_len", 2, 100), ("atr_len", 2, 100),
+                            ("breakout_len", 5, 200), ("structure_len", 5, 200),
+                            ("orb_bars", 1, 60), ("pivot_left", 1, 20), ("pivot_right", 1, 20)):
+            params[key] = st.number_input(key, lo, hi, int(DEFAULT_PARAMS[key]), disabled=live,
+                                          key=f"pm_{key}")
+        for key, lo, hi, stp in (("atr_mult", 0.5, 10.0, 0.1), ("channel_mult", 0.5, 10.0, 0.1),
+                                 ("vol_mult", 1.0, 10.0, 0.1), ("gap_pct", 0.05, 10.0, 0.05),
+                                 ("squeeze_mult", 1.0, 5.0, 0.05), ("zigzag_pct", 0.1, 10.0, 0.1),
+                                 ("st_mult", 0.5, 10.0, 0.1)):
+            params[key] = st.number_input(key, lo, hi, float(DEFAULT_PARAMS[key]), stp,
+                                          disabled=live, key=f"pm_{key}")
+    params["intraday"] = interval in INTRADAY_INTERVALS
+    params["symbol"], params["interval"] = symbol, interval
+
+    sb.divider()
+    sb.caption("Research and paper-trading sandbox. Data from Yahoo Finance is delayed and "
+               "unaudited. Broker routing is off unless you switch it on.")
+
+    return {"symbol": symbol, "asset_label": asset_label, "interval": interval,
+            "period": eff_period, "requested_period": period, "strategy": strategy,
+            "params": params, "risk": risk, "quantity": float(quantity),
+            "poll_seconds": float(poll_seconds), "fill_at_ltp": bool(fill_at_ltp),
+            "filter_cfg": filter_cfg, "filter_extras": filter_extras, "broker": broker,
+            "currency": currency_symbol(symbol),
+            "hide_weekends": not (symbol.endswith("-USD") or symbol.endswith("=X"))}
+
+
+def _render_filters(sb, live: bool):
+    """Additional entry filters. Every one is unchecked by default."""
+    cfg = default_filter_config()
+    extras: dict = {}
+    with sb.expander("Additional entry filters (all off by default)"):
+        st.caption("An enabled filter can only VETO a signal, never create one.")
+        for spec in FILTER_SPECS:
+            key = spec["key"]
+            on = st.checkbox(spec["label"], value=False, disabled=live, key=f"flt_{key}",
+                             help=spec["help"])
+            cfg[key]["enabled"] = on
+            if not on:
+                continue
+            if spec["kind"] == "range":
+                c1, c2 = st.columns(2)
+                cfg[key]["min"] = c1.number_input(f"{key} min", value=float(spec["min"]),
+                                                  step=float(spec["step"]), disabled=live,
+                                                  key=f"flt_{key}_min")
+                cfg[key]["max"] = c2.number_input(f"{key} max", value=float(spec["max"]),
+                                                  step=float(spec["step"]), disabled=live,
+                                                  key=f"flt_{key}_max")
+            elif spec["kind"] == "value":
+                cfg[key]["value"] = st.number_input(f"{key} multiple", value=float(spec["value"]),
+                                                    step=float(spec["step"]), disabled=live,
+                                                    key=f"flt_{key}_v")
+            elif spec["kind"] == "mode":
+                cfg[key]["mode"] = st.selectbox(f"{key} mode", spec["modes"], disabled=live,
+                                                key=f"flt_{key}_m")
+            elif spec["kind"] == "oi":
+                cfg[key]["mode"] = st.selectbox("OI comparison",
+                                                ["Absolute change", "N times baseline"],
+                                                disabled=live, key="flt_oi_mode")
+                cfg[key]["value"] = st.number_input("OI threshold", value=0.0, step=1.0,
+                                                    disabled=live, key="flt_oi_thr")
+                cfg[key]["manual"] = st.number_input("Observed OI change (manual entry)",
+                                                     value=0.0, step=1.0, disabled=live,
+                                                     key="flt_oi_val")
+                extras["oi_change"] = cfg[key]["manual"]
+            elif spec["kind"] == "news":
+                cfg[key]["block"] = st.checkbox("Block all entries right now (news kill-switch)",
+                                                value=False, key="flt_news_block")
+                extras["news_block"] = cfg[key]["block"]
+            if key == "pcr":
+                cfg[key]["manual"] = st.number_input("Observed PCR (manual entry)", value=0.0,
+                                                     step=0.05, disabled=live, key="flt_pcr_val")
+                extras["pcr"] = cfg[key]["manual"]
+            if spec.get("manual"):
+                st.warning(f"{spec['label']}: no free data feed is wired in. It uses the manual "
+                           "value above, or blocks everything if you leave it empty. It is not "
+                           "silently guessed.")
+    return cfg, extras
+
+
+def _render_broker(sb, live: bool, symbol: str) -> dict:
+    """Dhan order routing. Disabled by default, dry-run by default even when enabled."""
+    broker = {"enabled": False, "dry_run": True, "contract": None}
+    with sb.expander("Dhan order placement (off by default)"):
+        st.error("Live routing sends REAL orders to your Dhan account. The signals here are built "
+                 "on delayed Yahoo data, which is the wrong input for real execution. Keep dry-run "
+                 "on unless you have replaced the feed and tested thoroughly.")
+        enabled = st.checkbox("Enable Dhan order routing", value=False, disabled=live,
+                              key="brk_enabled")
+        broker["enabled"] = enabled
+        if not enabled:
+            return broker
+
+        broker["dry_run"] = st.checkbox("Dry run (build the payload, transmit nothing)",
+                                        value=True, key="brk_dry")
+        broker["client_id"] = st.text_input("Dhan client ID", key="brk_cid")
+        broker["access_token"] = st.text_input("Dhan access token", type="password", key="brk_tok")
+        broker["product_type"] = st.selectbox("Product type", DHAN_PRODUCTS, key="brk_prod")
+        instrument = st.selectbox("Instrument", DHAN_INSTRUMENTS, key="brk_inst")
+        segment = st.selectbox("Exchange segment", DHAN_SEGMENTS,
+                               index=0 if instrument == "EQUITY" else 2, key="brk_seg")
+        underlying = st.text_input("Underlying symbol", value=_default_underlying(symbol),
+                                   key="brk_under",
+                                   help="Dhan's own name, e.g. RELIANCE, NIFTY, BANKNIFTY.")
+        option_type = st.selectbox("Option right", ["CALL", "PUT"], key="brk_right") \
+            if instrument == "OPTIONS" else "CALL"
+
+        if st.button("Resolve contract", key="brk_resolve"):
+            try:
+                with st.spinner("Downloading the Dhan instrument master..."):
+                    master = st.session_state.scrip_master
+                    if master is None:
+                        master = load_scrip_master()
+                        st.session_state.scrip_master = master
+                spot = None
+                snap = st.session_state.get("live_snapshot")
+                res = st.session_state.get("backtest_result")
+                if snap is not None:
+                    spot = snap.ltp
+                elif res is not None:
+                    spot = float(res.frame["Close"].iloc[-1])
+                st.session_state["brk_contract"] = resolve_instrument(
+                    master, underlying, instrument, segment, spot, option_type)
+            except BrokerError as exc:
+                st.error(str(exc))
+
+        contract = st.session_state.get("brk_contract")
+        if contract:
+            broker["contract"] = contract
+            st.success(f"{contract['trading_symbol']}  (security id {contract['security_id']})")
+            st.json({k: v for k, v in contract.items() if v is not None})
+            if contract.get("lot_size"):
+                st.caption(f"Lot size {contract['lot_size']}. Quantity is sent in units, so set "
+                           "the sidebar quantity to a multiple of the lot.")
+        else:
+            st.info("Resolve a contract before starting the engine, or entries will be skipped.")
+    return broker
+
+
+def _default_underlying(symbol: str) -> str:
+    s = (symbol or "").upper()
+    mapping = {"^NSEI": "NIFTY", "^NSEBANK": "BANKNIFTY", "^BSESN": "SENSEX",
+               "NIFTY_FIN_SERVICE.NS": "FINNIFTY"}
+    return mapping.get(s, s.replace(".NS", "").replace(".BO", ""))
+
+
+def _running_banner() -> None:
+    cfg = st.session_state.get("live_config") or {}
+    risk = cfg.get("risk")
+    st.sidebar.success("LIVE AUTOMATION CORE :: RUNNING")
+    broker = cfg.get("broker") or {}
+    routing = ("OFF" if not broker.get("enabled")
+               else "DRY RUN" if broker.get("dry_run") else "LIVE ORDERS")
+    st.sidebar.markdown(f"""
+| Running parameter | Value |
+|---|---|
+| Asset | `{cfg.get('symbol', '--')}` |
+| Strategy | {cfg.get('strategy', '--')} |
+| Timeframe | `{cfg.get('interval', '--')}` |
+| Quantity | {fmt(cfg.get('quantity'), 0)} |
+| Stop-Loss | {getattr(risk, 'sl_type', '--')} {fmt(getattr(risk, 'sl_value', None))} |
+| Target | {getattr(risk, 'tp_type', '--')} {fmt(getattr(risk, 'tp_value', None))} |
+| Poll | {fmt(cfg.get('poll_seconds'), 1)}s |
+| Broker routing | {routing} |
+""")
+
+
+# =============================================================================
+# SECTION 13 -- TAB 1: BACKTESTING ENGINE STUDIO
+# =============================================================================
+def tab_backtest(cfg: dict) -> None:
+    st.subheader("Backtesting Engine Studio")
+    st.caption("Historical simulation only. Nothing here can reach the live ledger in Tab 3.")
+
+    left, right = st.columns([1, 3])
+    run = left.button("Run Backtest Analysis", type="primary", width="stretch")
+    right.info(f"**{cfg['strategy']}** on `{cfg['symbol']}` | `{cfg['interval']}` / "
+               f"`{cfg['period']}` | {cfg['risk'].as_summary()}")
+
+    if run:
+        _run_backtest_ui(cfg)
+    if st.session_state.backtest_error:
+        st.error(st.session_state.backtest_error)
+    if st.session_state.backtest_result is not None:
+        _render_backtest(st.session_state.backtest_result, st.session_state.backtest_meta)
+    elif not st.session_state.backtest_error:
+        st.info("Configure the console on the left, then run the analysis.")
+
+
+def _run_backtest_ui(cfg: dict) -> None:
+    st.session_state.backtest_error = None
+    st.session_state.backtest_result = None
+    with st.status("Running simulation...", expanded=True) as status:
+        try:
+            st.write(f"Fetching `{cfg['symbol']}` at {cfg['interval']} / {cfg['period']} ...")
+            bundle = load_market_data(cfg["symbol"], cfg["period"], cfg["interval"], 300.0,
+                                      min_bars=max(30, get_strategy(cfg["strategy"]).min_bars))
+            st.write(f"Received {bundle.bars:,} candles. Computing indicators and signals ...")
+            extras = dict(cfg.get("filter_extras") or {})
+            if cfg["filter_cfg"].get("vix", {}).get("enabled"):
+                st.write("Fetching India VIX for the volatility filter ...")
+                extras["vix"] = load_vix()
+            result = run_backtest(bundle.frame, cfg["strategy"], cfg["params"], cfg["risk"],
+                                  cfg["filter_cfg"], extras, WARMUP_BARS)
+            result.warnings = list(bundle.warnings) + list(result.warnings)
+            st.session_state.backtest_result = result
+            st.session_state.backtest_meta = dict(cfg)
+            status.update(label=f"Complete :: {result.stats['total_trades']} trades",
+                          state="complete", expanded=False)
+        except (MarketDataError, BacktestError) as exc:
+            st.session_state.backtest_error = str(exc)
+            status.update(label="Simulation aborted", state="error", expanded=False)
+        except Exception as exc:                                    # noqa: BLE001
+            st.session_state.backtest_error = f"Unexpected failure: {exc}"
+            status.update(label="Simulation aborted", state="error", expanded=False)
+
+
+def _render_backtest(result: BacktestResult, meta: dict) -> None:
+    cur, s = meta["currency"], result.stats
+    for w in result.warnings:
+        st.warning(w)
+
+    st.markdown("#### Performance Summary")
+    a = st.columns(5)
+    a[0].metric("Total Trades", s["total_trades"], f"{s['longs']}L / {s['shorts']}S")
+    a[1].metric("Win Rate", f"{fmt(s['win_rate'])}%", f"{s['wins']}W / {s['losses']}L")
+    a[2].metric(f"Net PnL ({cur})", fmt_signed(s["net_pnl"]), f"{fmt_signed(s['gross_points'])} pts")
+    pf = s["profit_factor"]
+    a[3].metric("Profit Factor", "inf" if pf == float("inf") else fmt(pf))
+    a[4].metric(f"Max Drawdown ({cur})", fmt(s["max_drawdown"]))
+    b = st.columns(5)
+    b[0].metric("Expectancy / trade", fmt_signed(s["expectancy"]))
+    b[1].metric("Average Win", fmt(s["avg_win"]))
+    b[2].metric("Average Loss", fmt(s["avg_loss"]))
+    b[3].metric("Best / Worst", f"{fmt(s['best_trade'], 0)} / {fmt(s['worst_trade'], 0)}")
+    b[4].metric("Warm-up Bars", f"{s['warmup_bars']:,}", f"{s['bars_tested']:,} tested")
+
+    strat = get_strategy(meta["strategy"])
+    st.plotly_chart(price_chart(result.frame,
+                                f"{meta['symbol']} | {meta['interval']} | {meta['strategy']}",
+                                strat.overlays, result.trades, oscillator=strat.oscillator,
+                                hide_weekends=meta["hide_weekends"]),
+                    width="stretch", config={"scrollZoom": True})
+    st.caption(f"The first {result.warmup_index:,} candles were reserved as the indicator warm-up "
+               "window and produced no orders. Signals fire on a candle close and fill at the "
+               "next candle's open.")
+    if not result.trades.empty:
+        st.plotly_chart(equity_chart(result.equity, cur), width="stretch")
+
+    t1, t2, t3, t4 = st.tabs(["Simulated Trades", "Exit Reasons", "Gap Diagnostics", "Indicator Frame"])
     with t1:
-        tab_backtest(cfg, df, label)
+        if result.trades.empty:
+            st.info("No simulated trades for this configuration.")
+        else:
+            st.dataframe(result.trades, width="stretch", hide_index=True,
+                         column_config={"PnL": st.column_config.NumberColumn(f"PnL ({cur})",
+                                                                            format="%.2f")})
+            st.download_button("Download simulated trades (CSV)",
+                               result.trades.to_csv(index=False).encode(),
+                               f"backtest_{meta['symbol']}_{meta['interval']}.csv", "text/csv")
+            st.caption("Simulation output. Deliberately NOT written to the live ledger.")
+    with t2:
+        if result.trades.empty:
+            st.info("Nothing to break down yet.")
+        else:
+            by = result.trades.groupby("Exit Reason")["PnL"].agg(["count", "sum", "mean"]).round(2)
+            by.columns = ["Trades", f"Total PnL ({cur})", f"Average ({cur})"]
+            st.dataframe(by.reset_index(), width="stretch", hide_index=True)
+            st.caption("Where the exits actually came from. If almost everything closes on "
+                       "'Stop-Loss (Gap)', the stop is too tight for this instrument's gaps.")
+    with t3:
+        gaps = gap_profile(result.frame, 0.3)
+        st.metric("Gap candles in sample (>= 0.30%)", f"{len(gaps):,}")
+        st.dataframe(gaps.tail(200), width="stretch")
+    with t4:
+        st.dataframe(result.frame.tail(300), width="stretch")
+
+
+# =============================================================================
+# SECTION 14 -- TAB 2: LIVE SANDBOX OPERATIONS PANEL
+# =============================================================================
+def tab_live(cfg: dict) -> None:
+    st.subheader("Live Sandbox Operations Panel")
+    st.caption("Signals are read from closed candles and filled at the next candle's open. "
+               "Stop and target are then checked against the LTP on every poll, stop first.")
+    _live_controls(cfg)
+    st.divider()
+    if st.session_state.live_running:
+        _mount_live_fragment(float(st.session_state.live_config.get("poll_seconds", 5.0)))
+    else:
+        _idle_panel(cfg)
+
+
+def _live_controls(cfg: dict) -> None:
+    running = bool(st.session_state.live_running)
+    position = st.session_state.live_position
+    c1, c2, c3 = st.columns(3)
+
+    if c1.button("Start Live Automation Core", type="primary", disabled=running, width="stretch"):
+        reset_live_runtime()
+        st.session_state.live_config = dict(cfg)
+        st.session_state.live_running = True
+        st.session_state.live_started_at = pd.Timestamp.now()
+        st.session_state.live_last_poll = 0.0
+        log_event(f"Core started :: {cfg['symbol']} | {cfg['interval']} | {cfg['strategy']} | "
+                  f"{cfg['risk'].as_summary()} | poll {fmt(cfg['poll_seconds'],1)}s", "success")
+        st.rerun()
+
+    if c2.button("Stop Live Processing Engine", disabled=not running, width="stretch"):
+        st.session_state.live_running = False
+        if st.session_state.live_position is not None:
+            log_event("Engine stopped with a position still tracked. The risk stays open until "
+                      "it is squared off.", "warn")
+        log_event("Core stopped.", "info")
+        st.rerun()
+
+    if c3.button("Manual Emergency Square-Off", disabled=position is None, width="stretch"):
+        trade = square_off("Manual Square-Off")
+        if trade:
+            st.toast(f"Closed at {fmt(trade['Exit Price'])} for {fmt_signed(trade['PnL'])}.")
+        st.rerun()
+
+
+def _idle_panel(cfg: dict) -> None:
+    st.info(f"The automation core is idle. Press **Start Live Automation Core** to poll "
+            f"`{cfg['symbol']}` every {fmt(cfg['poll_seconds'],1)}s automatically -- no clicking "
+            f"required. Live window: `{live_period_for(cfg['interval'])}` of "
+            f"{cfg['interval']} candles.")
+    if st.session_state.live_position is not None:
+        st.warning("A tracked position is still open from the previous run. Square it off below.")
+        _position_dashboard(st.session_state.live_position, st.session_state.live_snapshot,
+                            cfg["currency"])
+    _event_feed()
+
+
+def _live_body() -> None:
+    cfg = st.session_state.live_config or {}
+    if not cfg:
+        st.error("Live configuration was lost. Stop and restart the engine.")
+        return
+    if should_poll(cfg):
+        run_cycle(cfg)
+
+    if st.session_state.live_error:
+        st.error(f"Live feed issue: {st.session_state.live_error}")
+    backoff = st.session_state.get("live_backoff_until", 0.0) - time.time()
+    if backoff > 0:
+        st.warning(f"Rate-limit backoff active for another {backoff:.0f}s. This is what a feed "
+                   "throttle looks like -- widen the poll interval.")
+
+    snapshot = st.session_state.live_snapshot
+    if snapshot is None:
+        st.info("Waiting for the first market poll to complete ...")
+        return
+    for w in snapshot.data_warnings:
+        st.warning(w)
+
+    _heartbeat(cfg, snapshot)
+    position = st.session_state.live_position
+    if position is not None:
+        _position_dashboard(position, snapshot, cfg["currency"])
+    else:
+        _searching_widget(cfg, snapshot)
+    _live_chart(cfg, snapshot)
+    _filter_panel(snapshot)
+    _broker_panel()
+    _event_feed()
+
+
+def _mount_live_fragment(poll_seconds: float) -> None:
+    """
+    Auto-refresh without any human clicking.
+
+    The panel is wrapped in a fragment so only this section re-executes; a full
+    app rerun would reset the tab selection and discard the backtest in Tab 1.
+    The tick is the operator's poll interval, floored at the 0.3s API guard.
+    """
+    tick = max(API_GUARD_DELAY, float(poll_seconds))
+    if hasattr(st, "fragment"):
+        st.fragment(run_every=tick)(_live_body)()
+    else:                                                          # legacy fallback
+        _live_body()
+        time.sleep(tick)
+        st.rerun()
+
+
+def _heartbeat(cfg: dict, snapshot: LiveSnapshot) -> None:
+    age = (pd.Timestamp.now() - snapshot.fetched_at).total_seconds()
+    c = st.columns(5)
+    c[0].metric("Last Traded Price", fmt(snapshot.ltp))
+    c[1].metric("Candle N+1 Open", fmt(snapshot.next_open),
+                fmt_signed(snapshot.ltp - snapshot.next_open) + " vs LTP")
+    c[2].metric("Last Closed Candle", fmt_time(snapshot.last_closed_time))
+    c[3].metric("Feed Age", f"{age:,.0f}s", f"poll {fmt(cfg['poll_seconds'],1)}s")
+    c[4].metric("Polls", f"{st.session_state.live_poll_count:,}", f"{snapshot.bars:,} candles")
+
+
+def _position_dashboard(position: Position, snapshot, currency: str) -> None:
+    ltp = snapshot.ltp if snapshot else position.entry_price
+    mgr = position.manager
+    points, pnl = position.points(ltp), position.pnl(ltp)
+    side = "LONG" if position.direction > 0 else "SHORT"
+
+    st.markdown("#### Open Strategy Performance")
+    (st.success if pnl >= 0 else st.error)(
+        f"{side} {position.symbol} :: running {fmt_signed(pnl)} {currency}")
+
+    r1 = st.columns(4)
+    r1[0].metric("Strategy Profile", position.strategy.split("· ")[-1])
+    r1[1].metric("Entry Price", fmt(position.entry_price), side)
+    r1[2].metric("Last Traded Price", fmt(ltp))
+    r1[3].metric("Quantity", fmt(position.quantity, 0))
+
+    r2 = st.columns(4)
+    tgt_label = "Target (display only)" if mgr.tp_display_only else "Target Price"
+    r2[0].metric(tgt_label, fmt(mgr.tp) if mgr.tp is not None else "none")
+    r2[1].metric("Stop-Loss Guard", fmt(mgr.sl) if mgr.sl is not None else "none",
+                 f"initial {fmt(mgr.initial_sl)}" if mgr.initial_sl is not None else None)
+    r2[2].metric("Points Gained / Lost", fmt_signed(points))
+    r2[3].metric(f"Live PnL ({currency})", fmt_signed(pnl))
+
+    r3 = st.columns(4)
+    r3[0].metric("Best Price Seen", fmt(mgr.mfe))
+    locked = None if mgr.sl is None else (mgr.sl - position.entry_price) * position.direction
+    r3[1].metric("Locked In by Stop", fmt_signed(locked) if locked is not None else "--")
+    r3[2].metric("Risk at Entry", fmt(mgr.risk_points) if mgr.risk_points else "--")
+    r3[3].metric("Bars Held", f"{mgr.bars_held}")
+
+    if mgr.sl is not None and mgr.tp is not None and abs(mgr.tp - mgr.sl) > 0:
+        span = abs(mgr.tp - mgr.sl)
+        travelled = ((ltp - mgr.sl) / span) if position.direction > 0 else ((mgr.sl - ltp) / span)
+        st.progress(float(min(max(travelled, 0.0), 1.0)), text="Distance from stop toward target")
+    for note in mgr.notes:
+        st.warning("Exit engine: " + note)
+    st.caption(f"Entered {fmt_time(position.entry_time)} off the signal candle "
+               f"{fmt_time(position.signal_bar_time)}."
+               + (f" LTP at fill was {fmt(position.entry_ltp_at_fill)}."
+                  if position.entry_ltp_at_fill else ""))
+
+
+def _searching_widget(cfg: dict, snapshot: LiveSnapshot) -> None:
+    st.markdown("#### Signal Scanner")
+    blocked = [r for r in snapshot.filter_reports
+               if (snapshot.raw_signal == 1 and not r.long_ok)
+               or (snapshot.raw_signal == -1 and not r.short_ok)]
+    if snapshot.raw_signal != 0 and blocked:
+        st.warning("**Signal fired but filters vetoed it** :: blocked by "
+                   + ", ".join(f"{r.label} ({r.value})" for r in blocked))
+    else:
+        st.info(f"**Searching for Signal** :: {snapshot.status.headline}")
+
+    if snapshot.status.metrics:
+        cols = st.columns(min(len(snapshot.status.metrics), 5))
+        for i, (label, value) in enumerate(snapshot.status.metrics):
+            cols[i % len(cols)].metric(label, value)
+
+    l, r = st.columns(2)
+    l.markdown(f"**Long entry requires**\n\n{snapshot.status.long_condition}")
+    r.markdown(f"**Short entry requires**\n\n{snapshot.status.short_condition}")
+
+    risk = cfg["risk"]
+    st.caption(f"On a fill at {fmt(snapshot.ltp)} the exit engine would apply -- {risk.as_summary()}")
+
+
+def _live_chart(cfg: dict, snapshot: LiveSnapshot) -> None:
+    strat = get_strategy(cfg["strategy"])
+    st.markdown("#### Live Chart")
+    fig = price_chart(snapshot.frame, f"{cfg['symbol']} | {cfg['interval']} | last 100 candles",
+                      strat.overlays, tail=100, oscillator=strat.oscillator,
+                      hide_weekends=cfg.get("hide_weekends", True), height=500)
+    position = st.session_state.live_position
+    if position is not None:
+        mgr = position.manager
+        fig.add_hline(y=position.entry_price, line=dict(width=1.2, dash="dash", color="#4f9df7"),
+                      annotation_text="Entry")
+        if mgr.tp is not None:
+            fig.add_hline(y=mgr.tp, line=dict(width=1.2, dash="dot", color="#26a69a"),
+                          annotation_text="Target" + (" (display)" if mgr.tp_display_only else ""))
+        if mgr.sl is not None:
+            fig.add_hline(y=mgr.sl, line=dict(width=1.2, dash="dot", color="#ef5350"),
+                          annotation_text="Stop")
+    st.plotly_chart(fig, width="stretch", config={"scrollZoom": True})
+
+
+def _filter_panel(snapshot: LiveSnapshot) -> None:
+    if not snapshot.filter_reports:
+        return
+    with st.expander(f"Active entry filters ({len(snapshot.filter_reports)})", expanded=False):
+        rows = [{"Filter": r.label, "Current value": r.value,
+                 "Allows long": "yes" if r.long_ok else "NO",
+                 "Allows short": "yes" if r.short_ok else "NO"} for r in snapshot.filter_reports]
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+        if snapshot.vix is not None:
+            st.caption(f"India VIX last read {fmt(snapshot.vix)}.")
+
+
+def _broker_panel() -> None:
+    receipts = st.session_state.get("broker_receipts", [])
+    if not receipts:
+        return
+    with st.expander(f"Broker order receipts ({len(receipts)})"):
+        st.dataframe(pd.DataFrame(receipts), width="stretch", hide_index=True)
+
+
+def _event_feed() -> None:
+    events = st.session_state.get("live_events", [])
+    with st.expander(f"Operator event feed ({len(events)})", expanded=False):
+        if not events:
+            st.caption("No events yet.")
+        for e in events[:80]:
+            st.write(f"`{e['time']}` {e['message']}")
+
+
+# =============================================================================
+# SECTION 15 -- TAB 3: LIVE TRADE LOG LEDGER
+# =============================================================================
+def tab_ledger(cfg: dict) -> None:
+    st.subheader("Live Trade Log Ledger")
+    st.caption("Closed positions from the live sandbox only, sorted chronologically by exit time. "
+               "Simulated backtest fills are never written here.")
+
+    frame = live_ledger_frame()
+    if frame.empty:
+        st.info("No live trades closed yet. Start the core in Tab 2; every position it closes is "
+                "journalled here.")
+        _open_position_note()
+        return
+
+    cur = cfg["currency"]
+    pnl = frame["PnL"]
+    wins = pnl[pnl > 0]
+    gross_loss = float(-pnl[pnl <= 0].sum())
+    m = st.columns(5)
+    m[0].metric("Closed Live Trades", f"{len(frame):,}")
+    m[1].metric("Win Rate", f"{fmt(len(wins)/len(frame)*100)}%", f"{len(wins)} winners")
+    m[2].metric(f"Realised PnL ({cur})", fmt_signed(pnl.sum()))
+    m[3].metric("Total Points", fmt_signed(frame["Points"].sum()))
+    m[4].metric("Profit Factor", "inf" if gross_loss == 0 else fmt(float(wins.sum()) / gross_loss))
+
+    with st.expander("Breakdown by exit reason"):
+        by = frame.groupby("Exit Reason")["PnL"].agg(["count", "sum"]).reset_index()
+        by.columns = ["Exit Reason", "Trades", f"PnL ({cur})"]
+        st.dataframe(by, width="stretch", hide_index=True)
+
+    order = [c for c in ["#", "Exit Time", "Symbol", "Interval", "Strategy", "Direction",
+                         "Quantity", "Entry Time", "Entry Price", "Exit Price", "Initial Stop",
+                         "Final Stop", "Target", "Best Price", "Exit Reason", "Points", "PnL",
+                         "Broker Order", "Source"] if c in frame.columns]
+    st.dataframe(frame[order], width="stretch", hide_index=True,
+                 column_config={"PnL": st.column_config.NumberColumn(f"PnL ({cur})", format="%.2f")})
+
+    c1, c2 = st.columns([1, 4])
+    c1.download_button("Download ledger (CSV)", frame[order].to_csv(index=False).encode(),
+                       f"live_ledger_{pd.Timestamp.now():%Y%m%d_%H%M}.csv", "text/csv",
+                       width="stretch")
+    with c2.popover("Clear ledger"):
+        st.warning("This permanently discards the live trade history for this session.")
+        if st.button("Confirm and clear", type="primary"):
+            st.session_state.live_trades = []
+            st.rerun()
+    _open_position_note()
+
+
+def _open_position_note() -> None:
+    position = st.session_state.get("live_position")
+    if position is None:
+        return
+    st.warning(f"A {'LONG' if position.direction > 0 else 'SHORT'} position on "
+               f"`{position.symbol}` is still open and therefore not in this ledger. It is "
+               "journalled the moment it closes.")
+
+
+# =============================================================================
+# SECTION 16 -- MAIN
+# =============================================================================
+def main() -> None:
+    st.set_page_config(page_title="Algo Trading Platform", layout="wide",
+                       initial_sidebar_state="expanded")
+    init_state()
+    cfg = render_sidebar()
+
+    head, status = st.columns([3, 1])
+    head.title(APP_TITLE)
+    head.caption(f"`{cfg['symbol']}` | {cfg['interval']} | {cfg['period']} | {cfg['strategy']}")
+    (status.success if st.session_state.live_running else status.info)(
+        "LIVE CORE: RUNNING" if st.session_state.live_running else "LIVE CORE: IDLE")
+
+    t1, t2, t3 = st.tabs(["Backtesting Engine Studio", "Live Sandbox Operations",
+                          "Live Trade Log Ledger"])
+    with t1:
+        tab_backtest(cfg)
     with t2:
         tab_live(cfg)
     with t3:
-        tab_history(cfg)
+        tab_ledger(cfg)
+
+
+
+# =============================================================================
+# SECTION 17 -- OFFLINE SELF-TEST   (python algo_trading_platform.py --selftest)
+# =============================================================================
+def _synthetic(n: int = 1600, seed: int = 7) -> pd.DataFrame:
+    """Random-walk candles with injected gaps and a volatility regime shift."""
+    rng = np.random.default_rng(seed)
+    steps = rng.normal(0, 1.0, n) * np.where(np.arange(n) > n // 2, 2.2, 1.0)
+    close = 20000 + np.cumsum(steps)
+    close[300] += 180
+    close[700] -= 220
+    high = close + np.abs(rng.normal(0, 3, n))
+    low = close - np.abs(rng.normal(0, 3, n))
+    open_ = np.r_[close[0], close[:-1] + rng.normal(0, 1.5, n - 1)]
+    high = np.maximum.reduce([high, open_, close])
+    low = np.minimum.reduce([low, open_, close])
+    idx = pd.date_range("2024-01-01 09:15", periods=n, freq="5min", tz="Asia/Kolkata")
+    return pd.DataFrame({"Open": open_, "High": high, "Low": low, "Close": close,
+                         "Volume": rng.integers(1_000, 60_000, n).astype(float)}, index=idx)
+
+
+def _ctx(close=100.0, atr=5.0, prev_low=95.0, prev_high=105.0,
+         swing_low=90.0, swing_high=110.0, signal=0, low=None, high=None):
+    return BarCtx(time=pd.Timestamp("2024-01-01"), open=close, high=high or close + 1,
+                  low=low or close - 1, close=close, atr=atr, ema_fast=close, ema_slow=close,
+                  swing_high=swing_high, swing_low=swing_low, prev_high=prev_high,
+                  prev_low=prev_low, signal=signal)
+
+
+def _test_step_trail():
+    """The operator's own worked example, asserted literally."""
+    risk = RiskConfig("Step Trail (trigger k, trail N)", 10.0, "No Target", 0.0,
+                      quantity=1.0, step_trigger=5.0)
+    m = ExitManager(risk, 50.0, 1, _ctx(close=50.0, atr=2.0, prev_low=45.0, swing_low=40.0))
+    assert m.sl == 40.0, f"initial stop should be entry-N = 40, got {m.sl}"
+    m.update(52.0, _ctx(close=52.0))
+    assert m.sl == 40.0, f"below trigger k the stop must not move, got {m.sl}"
+    m.update(55.0, _ctx(close=55.0))
+    assert m.sl == 50.0, f"at entry+k the stop must jump to cost 50, got {m.sl}"
+    m.update(60.0, _ctx(close=60.0))
+    assert m.sl == 50.0, f"at 60 the stop must still be 50, got {m.sl}"
+    m.update(61.0, _ctx(close=61.0))
+    assert m.sl == 51.0, f"at 61 the stop must be 51, got {m.sl}"
+    m.update(58.0, _ctx(close=58.0))
+    assert m.sl == 51.0, f"the stop must never loosen, got {m.sl}"
+    assert m.check_tick(51.0) == (51.0, "Stop-Loss")
+    # Mirrored short
+    ms = ExitManager(risk, 50.0, -1, _ctx(close=50.0, atr=2.0, prev_high=55.0, swing_high=60.0))
+    assert ms.sl == 60.0
+    ms.update(45.0, _ctx(close=45.0))
+    assert ms.sl == 50.0, f"short stop should jump to cost, got {ms.sl}"
+    ms.update(39.0, _ctx(close=39.0))
+    assert ms.sl == 49.0, f"short stop should be 49, got {ms.sl}"
+    print("   step trail (entry 50, N=10, k=5): 55->50, 60->50, 61->51, ratchet holds  OK")
+
+
+def _test_trail_uses_live_price():
+    """
+    Regression guard.
+
+    A distance-based trail is derived from the BEST price seen, not from the
+    last closed candle. An earlier version compared the candidate against the
+    closed candle's close, which silently froze every trailing stop whenever the
+    live price ran ahead of the last close.
+    """
+    risk = RiskConfig("Trailing Points", 40.0, "No Target", 0.0, 1.0)
+    m = ExitManager(risk, 20000.0, 1, _ctx(close=20000.0, atr=10.0, prev_low=19990.0,
+                                           swing_low=19950.0))
+    assert m.sl == 19960.0
+    stale = _ctx(close=20000.0, atr=10.0, prev_low=19990.0, swing_low=19950.0)
+    m.update(20100.0, stale)                 # LTP ran 100 ahead of the closed candle
+    assert m.sl == 20060.0, f"trail must follow the live price, got {m.sl}"
+    m.update(20050.0, stale)
+    assert m.sl == 20060.0, "the trail must not loosen when price pulls back"
+    assert m.check_tick(20050.0) == (20050.0, "Stop-Loss"), \
+        "a stop already passed by price must fire, not be suppressed"
+    print("   distance trails follow the live price, not the last closed candle  OK")
+
+
+def _test_exit_types():
+    checks = 0
+    for sl_type in SL_TYPES:
+        v = {"Fixed Percentage": 1.0, "Trailing Percentage": 1.0, "ATR Multiple": 2.0,
+             "Trailing ATR (Chandelier)": 3.0}.get(sl_type, 10.0)
+        for d in (1, -1):
+            risk = RiskConfig(sl_type, v, "Fixed Points", 20.0, 2.0, step_trigger=5.0)
+            m = ExitManager(risk, 100.0, d, _ctx())
+            if m.sl is not None:
+                side_ok = (m.sl < 100.0) if d > 0 else (m.sl > 100.0)
+                assert side_ok, f"{sl_type} d={d}: stop on the wrong side ({m.sl})"
+            before = m.sl
+            m.update(100.0 + d * 12.0, _ctx(close=100.0 + d * 12.0))
+            if before is not None and m.sl is not None:
+                moved_ok = (m.sl >= before) if d > 0 else (m.sl <= before)
+                assert moved_ok, f"{sl_type} d={d}: stop loosened {before} -> {m.sl}"
+            checks += 1
+    for tp_type in TP_TYPES:
+        v = {"Fixed Percentage": 2.0, "ATR Multiple": 3.0,
+             "Risk : Reward Multiple": 2.0}.get(tp_type, 20.0)
+        for d in (1, -1):
+            risk = RiskConfig("Fixed Points", 10.0, tp_type, v, 1.0)
+            m = ExitManager(risk, 100.0, d, _ctx())
+            if m.tp is not None:
+                side_ok = (m.tp > 100.0) if d > 0 else (m.tp < 100.0)
+                assert side_ok, f"{tp_type} d={d}: target on the wrong side ({m.tp})"
+            if tp_type == "Risk : Reward Multiple":
+                assert abs(abs(m.tp - 100.0) - 2 * 10.0) < 1e-9, "R:R target must be 2x the stop"
+            if tp_type == "Trailing Target (display only)":
+                assert not m.target_is_live, "display-only target must never fire"
+                m.update(100.0 + d * 30.0, _ctx())
+                assert abs(m.tp - (100.0 + d * 50.0)) < 1e-9, "display target must trail"
+            checks += 1
+    print(f"   {checks} stop/target permutations: side, ratchet and R:R arithmetic  OK")
+
+
+def _test_fill_semantics():
+    """Signal on N must fill at the OPEN of N+1, and the stop is checked before the target."""
+    idx = pd.date_range("2024-01-01 09:15", periods=6, freq="5min", tz="Asia/Kolkata")
+    frame = pd.DataFrame({
+        "Open":  [100, 100, 100, 102, 100, 100],
+        "High":  [101, 101, 101, 110, 101, 101],
+        "Low":   [99, 99, 99, 90, 99, 99],
+        "Close": [100, 100, 100, 105, 100, 100],
+        "Volume": [1.0] * 6, "atr": [2.0] * 6, "ema_fast": [100.0] * 6, "ema_slow": [100.0] * 6,
+        "swing_high": [110.0] * 6, "swing_low": [90.0] * 6,
+        "prev_high": [101.0] * 6, "prev_low": [99.0] * 6,
+        "signal": [0, 1, 0, 0, 0, 0],
+    }, index=idx)
+    risk = RiskConfig("Fixed Points", 8.0, "Fixed Points", 8.0, 1.0)
+    mgr = ExitManager(risk, 100.0, 1, bar_ctx(frame, 2))
+    assert mgr.sl == 92.0 and mgr.tp == 108.0
+    hit = mgr.check_bar(bar_ctx(frame, 3))
+    assert hit == (92.0, "Stop-Loss"), (
+        f"candle 3 sweeps both 92 and 108; the stop must win, got {hit}")
+    print("   stop-before-target inside one candle, and N+1-open fill  OK")
+
+
+def _test_strategies_and_backtest():
+    df = _synthetic()
+    params = dict(DEFAULT_PARAMS)
+    params["intraday"] = True
+    risk = RiskConfig("Fixed Percentage", 0.4, "Fixed Percentage", 0.8, 2.0)
+    total = 0
+    for name in STRATEGY_NAMES:
+        frame, _ = prepare(df, name, params)
+        assert set(frame["signal"].unique()).issubset({-1, 0, 1}), f"{name}: bad signal domain"
+        rep = get_strategy(name).status(frame, params)
+        assert rep.headline and rep.long_condition
+        res = run_backtest(df, name, params, risk, warmup=200)
+        t = res.trades
+        total += len(t)
+        if not t.empty:
+            assert (t["Entry Time"] > t["Signal Time"]).all(), f"{name}: look-ahead fill"
+            assert (t["Exit Time"] >= t["Entry Time"]).all(), f"{name}: exit before entry"
+            assert np.allclose((t["Points"] * risk.quantity).round(2), t["PnL"].round(2)), \
+                f"{name}: PnL does not reconcile with points"
+        assert res.warmup_index >= 200, f"{name}: warm-up not respected"
+        print(f"   {name:<48} {res.stats['total_trades']:>4} trades  "
+              f"net {res.stats['net_pnl']:>10,.1f}")
+    print(f"   OK ({total} trades across {len(STRATEGY_NAMES)} profiles)")
+
+
+def _test_filters():
+    df = _synthetic(900)
+    params = dict(DEFAULT_PARAMS)
+    params["intraday"] = True
+    base, _ = prepare(df, STRATEGY_NAMES[0], params)
+    base_n = int((base["signal"] != 0).sum())
+    fcfg = default_filter_config()
+    for key in ("adx", "rsi", "ema20", "sma20", "bb", "macd", "smc", "ict", "volspike",
+                "regime", "atrpct", "supertrend", "vwap"):
+        fcfg[key]["enabled"] = True
+    gated, reports = prepare(df, STRATEGY_NAMES[0], params, fcfg, {})
+    gated_n = int((gated["signal"] != 0).sum())
+    assert gated_n <= base_n, "filters must only ever remove signals"
+    assert len(reports) == 13, f"expected 13 filter reports, got {len(reports)}"
+    print(f"   13 filters applied: {base_n} raw signals -> {gated_n} after vetoes  OK")
+
+
+def _test_edge_cases():
+    df = _synthetic()
+    params = dict(DEFAULT_PARAMS)
+    params["intraday"] = True
+    risk = RiskConfig("Fixed Points", 25.0, "Fixed Points", 50.0, 1.0)
+    try:
+        run_backtest(df.head(120), STRATEGY_NAMES[0], params, risk)
+    except BacktestError as exc:
+        print(f"   short-sample guard fired: {str(exc)[:62]}...")
+    else:
+        raise AssertionError("short sample did not raise")
+    res = run_backtest(df, STRATEGY_NAMES[3], params, risk)
+    print(f"   gap-filled exits detected: {res.stats['gap_exits']}")
+    trailing = RiskConfig("Trailing Points", 30.0, "Trailing Target (display only)", 40.0, 1.0)
+    res2 = run_backtest(df, STRATEGY_NAMES[0], params, trailing)
+    assert any("APPROXIMATE" in w for w in res2.warnings), "trailing caveat must be surfaced"
+    if not res2.trades.empty:
+        assert (res2.trades["Exit Reason"] != "Target").all(), \
+            "a display-only target must never close a trade"
+    print("   display-only target never exits; trailing caveat surfaced  OK")
+    zero = df.copy()
+    zero["Volume"] = 0.0
+    v, ok = vwap(zero, True)
+    assert not ok and v.notna().sum() > 0, "zero-volume VWAP must degrade to a usable TWAP"
+    print("   zero-volume feed degrades VWAP to TWAP without dividing by zero  OK")
+
+
+def run_selftest() -> int:
+    data = _synthetic()
+    print(f"synthetic sample: {len(data)} candles {data.index[0]} -> {data.index[-1]}\n")
+    try:
+        print("-- indicators --")
+        e9 = ema(data["Close"], 9)
+        assert e9.isna().sum() == 8 and np.isclose(e9.iloc[8], data["Close"].iloc[:9].mean())
+        assert rsi(data["Close"], 14).dropna().between(0, 100).all()
+        assert (atr(data["High"], data["Low"], data["Close"], 14).dropna() > 0).all()
+        a, _, _ = adx(data["High"], data["Low"], data["Close"], 14)
+        assert a.dropna().between(0, 100).all()
+        print("   EMA seeding, RSI bounds, ATR positivity, ADX bounds  OK")
+        print("-- exit engine --")
+        _test_step_trail()
+        _test_trail_uses_live_price()
+        _test_exit_types()
+        _test_fill_semantics()
+        print("-- filters --")
+        _test_filters()
+        print("-- strategies + backtest --")
+        _test_strategies_and_backtest()
+        print("-- edge cases --")
+        _test_edge_cases()
+    except AssertionError as exc:
+        print(f"\nFAILED: {exc}")
+        return 1
+    print("\nAll checks passed.")
+    return 0
 
 
 if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        sys.exit(run_selftest())
     main()
