@@ -205,6 +205,62 @@ TRAILING_TP_TYPES = {
     "Trail Current Swing High/Low",
 }
 
+# --------------------------------------------------------------------------- #
+# BACKTEST RELIABILITY OF EACH EXIT TYPE  -- read this before trusting a number
+# --------------------------------------------------------------------------- #
+# A backtest sees four numbers per candle (O/H/L/C). It cannot see the PATH
+# price took between them. That single limitation splits the exit types cleanly
+# into two groups:
+#
+#   DISTANCE TRAILS (points / percent / ATR / step) recompute the stop from the
+#   running extreme. Inside one candle, price can print the high (which lifts
+#   the stop) and then fall back through that lifted stop before the candle
+#   closes. A live tick feed catches this; OHLC cannot. The engine checks the
+#   OLD stop first and only then advances the trail, so these intrabar stop-outs
+#   are systematically MISSED and the backtest reads better than reality.
+#   -> NOT backtest-safe. Live behaviour is exact; backtested behaviour is not.
+#
+#   STRUCTURAL TRAILS (previous/current candle extreme, previous/current swing)
+#   only change at a candle boundary, and the level applied during candle i was
+#   already known at the close of candle i-1. There is no intrabar ambiguity to
+#   resolve, so the simulation matches what a live engine would have done.
+#   -> Backtest-safe, subject to the usual gap rule.
+#
+#   STATIC stops and targets never move, so they carry no path ambiguity either.
+#   -> Backtest-safe.
+DISTANCE_TRAIL_TYPES = {"Trailing Points", "Trailing Percentage",
+                        "Trailing ATR (Chandelier)", "Step Trail (trigger k, trail N)"}
+STRUCTURAL_TRAIL_TYPES = {"Trail Previous Candle Low/High", "Trail Current Candle Low/High",
+                          "Trail Previous Swing Low/High", "Trail Current Swing Low/High",
+                          "Price Action Structure Break", "Trail Previous Candle High/Low",
+                          "Trail Current Candle High/Low", "Trail Previous Swing High/Low",
+                          "Trail Current Swing High/Low"}
+
+
+def exit_reliability(sl_type: str, tp_type: str) -> tuple[str, list[str]]:
+    """Return ('Backtest-safe' | 'Optimistic', reasons) for an exit configuration."""
+    reasons: list[str] = []
+    verdict = "Backtest-safe"
+    for label, kind in (("Stop-loss", sl_type), ("Target", tp_type)):
+        if kind in DISTANCE_TRAIL_TYPES:
+            verdict = "Optimistic"
+            reasons.append(
+                f"{label} `{kind}` is a DISTANCE trail. It is recomputed from the running "
+                "extreme, so within a single candle price can lift the level and then fall "
+                "back through it. OHLC data cannot show that path, so the backtest misses "
+                "those stop-outs and overstates results. Live, on tick data, it is exact.")
+        elif kind in STRUCTURAL_TRAIL_TYPES:
+            reasons.append(
+                f"{label} `{kind}` is a STRUCTURAL trail: the level only changes at a candle "
+                "boundary and was known before the candle it is applied to. No intrabar "
+                "ambiguity, so the simulation matches live behaviour.")
+        elif kind == "Trailing Target (display only)":
+            reasons.append(f"{label} never fires an exit, so it cannot distort the result.")
+        else:
+            reasons.append(f"{label} `{kind}` is static: no path ambiguity.")
+    return verdict, reasons
+
+
 # Wall-clock length of one candle, used to decide whether a feed has gone stale.
 # How long a quote may sit unchanged before we call the venue closed, and how
 # many ticks of evidence we need before trusting movement either way.
@@ -220,10 +276,11 @@ DEFAULT_PARAMS: dict[str, float] = {
     "rsi_len": 14, "atr_len": 14, "atr_mult": 2.0, "channel_mult": 2.0,
     "vol_len": 20, "vol_mult": 1.5, "breakout_len": 20, "squeeze_mult": 1.2,
     "orb_bars": 3, "gap_pct": 0.30, "pullback_tol": 0.15,
-    "pivot_left": 3, "pivot_right": 3, "zigzag_pct": 0.8,
+    "pivot_left": 3, "pivot_right": 3, "zigzag_pct": 0.3,
     "adx_len": 14, "bb_len": 20, "bb_mult": 2.0,
     "macd_fast": 12, "macd_slow": 26, "macd_signal": 9,
     "st_len": 10, "st_mult": 3.0, "structure_len": 20,
+    "rsi_long_level": 40.0, "rsi_short_level": 60.0,
     "threshold_price": 0.0, "threshold_pct": 1.0,
     "threshold_ref": "Previous session close",
     "threshold_mode": "Cross above = BUY, cross below = SELL",
@@ -534,38 +591,6 @@ def swing_levels(high: pd.Series, low: pd.Series, left: int = 3, right: int = 3)
     prev_h = ph_raw.dropna().shift(1).reindex(high.index).ffill().rename("PREV_SWING_HIGH")
     prev_l = pl_raw.dropna().shift(1).reindex(low.index).ffill().rename("PREV_SWING_LOW")
     return cur_h, cur_l, prev_h, prev_l
-
-
-def zigzag_pivots(close: pd.Series, threshold_pct: float = 0.8) -> pd.Series:
-    """
-    Percentage zigzag: +1 marks a confirmed swing high, -1 a confirmed swing low.
-
-    Used by the Elliott Wave heuristic. Confirmation is retrospective by nature,
-    so the series is shifted so that a pivot only becomes visible on the bar the
-    reversal threshold was actually breached.
-    """
-    c = close.to_numpy(float)
-    n = len(c)
-    marks = np.zeros(n, dtype=int)
-    if n == 0:
-        return pd.Series(marks, index=close.index, name="ZZ")
-    thr = threshold_pct / 100.0
-    direction = 0
-    last_ext_i, last_ext = 0, c[0]
-    for i in range(1, n):
-        if not np.isfinite(c[i]):
-            continue
-        if direction >= 0 and c[i] > last_ext:
-            last_ext_i, last_ext = i, c[i]
-        elif direction <= 0 and c[i] < last_ext:
-            last_ext_i, last_ext = i, c[i]
-        if direction >= 0 and last_ext > 0 and c[i] <= last_ext * (1 - thr):
-            marks[last_ext_i] = 1          # confirmed swing high
-            direction, last_ext_i, last_ext = -1, i, c[i]
-        elif direction <= 0 and last_ext > 0 and c[i] >= last_ext * (1 + thr):
-            marks[last_ext_i] = -1         # confirmed swing low
-            direction, last_ext_i, last_ext = 1, i, c[i]
-    return pd.Series(marks, index=close.index, name="ZZ")
 
 
 def fair_value_gaps(df: pd.DataFrame):
@@ -1209,21 +1234,45 @@ def zigzag_pivot_table(close: pd.Series, threshold_pct: float = 0.8):
     if n == 0:
         return piv
     thr = threshold_pct / 100.0
-    direction, ext_i, ext = 0, 0, c[0]
+    # Direction starts at +1, never 0. With a neutral start the running extreme
+    # tracked BOTH directions at once, so it always equalled the current price,
+    # no reversal threshold could ever be breached, and the function returned an
+    # empty pivot list forever -- which is why the wave profile never fired.
+    direction, ext_i, ext = 1, 0, c[0]
     for i in range(1, n):
-        if not np.isfinite(c[i]):
+        if not np.isfinite(c[i]) or ext <= 0:
             continue
-        if direction >= 0 and c[i] > ext:
-            ext_i, ext = i, c[i]
-        elif direction <= 0 and c[i] < ext:
-            ext_i, ext = i, c[i]
-        if direction >= 0 and ext > 0 and c[i] <= ext * (1 - thr):
-            piv.append((ext_i, float(ext), 1, i))
-            direction, ext_i, ext = -1, i, c[i]
-        elif direction <= 0 and ext > 0 and c[i] >= ext * (1 + thr):
-            piv.append((ext_i, float(ext), -1, i))
-            direction, ext_i, ext = 1, i, c[i]
+        if direction > 0:
+            if c[i] > ext:
+                ext_i, ext = i, c[i]
+            elif c[i] <= ext * (1 - thr):
+                piv.append((ext_i, float(ext), 1, i))       # confirmed swing HIGH
+                direction, ext_i, ext = -1, i, c[i]
+        else:
+            if c[i] < ext:
+                ext_i, ext = i, c[i]
+            elif c[i] >= ext * (1 + thr):
+                piv.append((ext_i, float(ext), -1, i))      # confirmed swing LOW
+                direction, ext_i, ext = 1, i, c[i]
     return piv
+
+
+def zigzag_pivots(close: pd.Series, threshold_pct: float = 0.8) -> pd.Series:
+    """
+    Percentage zigzag: +1 marks a confirmed swing high, -1 a confirmed swing low.
+
+    Used by the Elliott Wave heuristic. Confirmation is retrospective by nature,
+    so the series is shifted so that a pivot only becomes visible on the bar the
+    reversal threshold was actually breached.
+    """
+    c = close.to_numpy(float)
+    n = len(c)
+    marks = np.zeros(n, dtype=int)
+    if n == 0:
+        return pd.Series(marks, index=close.index, name="ZZ")
+    for piv_i, _, kind, _ in zigzag_pivot_table(close, threshold_pct):
+        marks[piv_i] = kind
+    return pd.Series(marks, index=close.index, name="ZZ")
 
 
 # ------------------------------------------------------------ 01 Dual EMA ----
@@ -1747,61 +1796,96 @@ def s_inside_bar(df, p):
 
 
 # ------------------------------------------------- 24 Elliott wave 3 ---------
+def _auto_zigzag_threshold(df: pd.DataFrame, requested: float, atr_len: int) -> float:
+    """
+    Scale the zigzag threshold to the instrument's own volatility.
+
+    A fixed 0.8% threshold finds almost no pivots on a quiet series and far too
+    many on a violent one, which is why the wave logic previously sat silent. We
+    take roughly three ATRs as the swing size and never exceed what the user
+    asked for.
+    """
+    a = atr(df["High"], df["Low"], df["Close"], atr_len)
+    med_atr, med_px = float(a.median(skipna=True)), float(df["Close"].median())
+    if not np.isfinite(med_atr) or med_px <= 0:
+        return max(0.05, float(requested))
+    atr_pct = 3.0 * med_atr / med_px * 100.0
+    return float(max(0.05, min(float(requested), atr_pct)))
+
+
 def c_elliott(df, p):
     """
     Mechanical wave-3 heuristic, NOT a real Elliott count.
 
-    Looks for  low -> high -> higher-low  where the retracement sits between
-    38.2% and 78.6% of the first leg, then triggers when price reclaims the leg
-    high. Only pivots already CONFIRMED by the zigzag on or before the current
-    bar are consulted, so there is no look-ahead.
+    Looks for  low -> high -> higher-low  where the retracement of the first leg
+    sits inside the usual Fibonacci window, then triggers when price reclaims the
+    leg high. Only pivots already CONFIRMED by the zigzag on or before the
+    current bar are consulted, so there is no look-ahead.
     """
     out = df.copy()
-    pivots = zigzag_pivot_table(out["Close"], float(_p(p, "zigzag_pct")))
+    thr = _auto_zigzag_threshold(out, _p(p, "zigzag_pct"), int(_p(p, "atr_len")))
+    out["zigzag_threshold"] = thr
+    pivots = zigzag_pivot_table(out["Close"], thr)
     n = len(out)
     close = out["Close"].to_numpy(float)
     long = np.zeros(n, dtype=bool)
     short = np.zeros(n, dtype=bool)
-    wave_hi = np.full(n, np.nan)
-    wave_lo = np.full(n, np.nan)
+    wave_hi, wave_lo = np.full(n, np.nan), np.full(n, np.nan)
+    retr_col, label = np.full(n, np.nan), np.full(n, "", dtype=object)
+    piv_count = np.zeros(n, dtype=int)          # pivots CONFIRMED so far, for tuning
 
+    lo_f, hi_f = 0.236, 0.886          # the window practitioners actually use
     known: list[tuple[int, float, int, int]] = []
     ptr = 0
     for i in range(n):
         while ptr < len(pivots) and pivots[ptr][3] <= i:
             known.append(pivots[ptr])
             ptr += 1
+        piv_count[i] = len(known)
         if len(known) < 3:
             continue
         (_, p1, k1, _), (_, p2, k2, _), (_, p3, k3, _) = known[-3], known[-2], known[-1]
-        if (k1, k2, k3) == (-1, 1, -1):                 # low -> high -> low
+        if (k1, k2, k3) == (-1, 1, -1) and p2 > p1:          # low -> high -> low
             leg = p2 - p1
-            if leg > 0:
-                retr = (p2 - p3) / leg
-                wave_hi[i], wave_lo[i] = p2, p3
-                if 0.382 <= retr <= 0.786 and p3 > p1 and close[i] > p2:
-                    long[i] = True
-        elif (k1, k2, k3) == (1, -1, 1):                # high -> low -> high
+            retr = (p2 - p3) / leg if leg > 0 else np.nan
+            wave_hi[i], wave_lo[i], retr_col[i] = p2, p3, retr
+            label[i] = "Wave 2 retrace, awaiting reclaim of the leg high"
+            if leg > 0 and lo_f <= retr <= hi_f and p3 > p1 and close[i] > p2:
+                long[i] = True
+                label[i] = "Wave 3 trigger (long)"
+        elif (k1, k2, k3) == (1, -1, 1) and p2 < p1:         # high -> low -> high
             leg = p1 - p2
-            if leg > 0:
-                retr = (p3 - p2) / leg
-                wave_hi[i], wave_lo[i] = p3, p2
-                if 0.382 <= retr <= 0.786 and p3 < p1 and close[i] < p2:
-                    short[i] = True
+            retr = (p3 - p2) / leg if leg > 0 else np.nan
+            wave_hi[i], wave_lo[i], retr_col[i] = p3, p2, retr
+            label[i] = "Wave 2 retrace, awaiting loss of the leg low"
+            if leg > 0 and lo_f <= retr <= hi_f and p3 < p1 and close[i] < p2:
+                short[i] = True
+                label[i] = "Wave 3 trigger (short)"
     out["wave_high"], out["wave_low"] = wave_hi, wave_lo
+    out["wave_retrace"], out["wave_state"] = retr_col, label
+    out["zz_pivots"] = piv_count
     idx = out.index
     return _finalise(out, pd.Series(long, index=idx), pd.Series(short, index=idx))
 
 
 def s_elliott(df, p):
-    return _sr("Zigzag wave heuristic. Elliott labelling is subjective; this is a mechanical "
-               "approximation, not an analyst's count.",
-               [("Last price", fmt(safe_last(df["Close"]))),
-                ("Leg extreme", fmt(safe_last(df["wave_high"]))),
-                ("Retracement pivot", fmt(safe_last(df["wave_low"]))),
-                ("Zigzag threshold", f"{fmt(_p(p,'zigzag_pct'))}%")],
-               "Impulse leg up, 38.2-78.6% retrace holding above the origin, then reclaim of the leg high.",
-               "Impulse leg down, 38.2-78.6% retrace holding below the origin, then loss of the leg low.")
+    state = safe_last(df["wave_state"]) or "No qualifying wave structure yet"
+    retr = safe_last(df["wave_retrace"])
+    hi, lo, c = safe_last(df["wave_high"]), safe_last(df["wave_low"]), safe_last(df["Close"])
+    need_long = (hi - c) if (hi is not None and c is not None) else None
+    need_short = (c - lo) if (lo is not None and c is not None) else None
+    return _sr(f"{state}. Elliott labelling is subjective; this is a mechanical zigzag "
+               f"approximation, not an analyst's count.",
+               [("Last price", fmt(c)), ("Leg extreme", fmt(hi)), ("Retrace pivot", fmt(lo)),
+                ("Retracement", "--" if retr is None else f"{retr*100:.1f}%"),
+                ("Swing threshold", f"{fmt(safe_last(df['zigzag_threshold']), 3)}%"),
+                ("Pivots confirmed", fmt(safe_last(df["zz_pivots"]), 0)),
+                ("Points to long trigger", fmt_signed(need_long)),
+                ("Points to short trigger", fmt_signed(need_short))],
+               "Impulse leg up, a 23.6-88.6% retrace holding above the origin, then a close "
+               "back above the leg high.",
+               "Impulse leg down, a 23.6-88.6% retrace holding below the origin, then a close "
+               "back below the leg low.")
 
 
 # ------------------------------------------------- 25 SuperTrend flip --------
@@ -1953,6 +2037,102 @@ def s_threshold_pct(df, p):
                f"Close must cross the {fmt(_p(p,'threshold_pct'))}% band per the selected mode.")
 
 
+# ------------------------- 30-33 RSI crossover and combination profiles ------
+def _rsi_levels(p):
+    return float(_p(p, "rsi_long_level")), float(_p(p, "rsi_short_level"))
+
+
+def c_rsi_crossover(df, p):
+    """RSI reclaiming a configurable lower level / losing a configurable upper one."""
+    out = df.copy()
+    lo, hi = _rsi_levels(p)
+    out["rsi"] = rsi(out["Close"], int(_p(p, "rsi_len")))
+    out["rsi_long_level"], out["rsi_short_level"] = lo, hi
+    return _finalise(out, cross_over(out["rsi"], _const(out, lo)),
+                     cross_under(out["rsi"], _const(out, hi)))
+
+
+def s_rsi_crossover(df, p):
+    lo, hi = _rsi_levels(p)
+    r = safe_last(df["rsi"])
+    return _sr(f"RSI is {fmt(r)}; long level {fmt(lo)}, short level {fmt(hi)}.",
+               [("RSI", fmt(r)), ("Long level", fmt(lo)), ("Short level", fmt(hi)),
+                ("To long trigger", fmt_signed((lo - r) if r is not None else None)),
+                ("To short trigger", fmt_signed((hi - r) if r is not None else None))],
+               f"RSI must cross UP through {fmt(lo)}.", f"RSI must cross DOWN through {fmt(hi)}.")
+
+
+def c_bb_rsi(df, p):
+    """Bollinger band touch confirmed by RSI leaving its extreme."""
+    out = df.copy()
+    lo, hi = _rsi_levels(p)
+    out["rsi"] = rsi(out["Close"], int(_p(p, "rsi_len")))
+    mid, up, dn = bollinger(out["Close"], int(_p(p, "bb_len")), float(_p(p, "bb_mult")))
+    out["bb_mid"], out["bb_up"], out["bb_lo"] = mid, up, dn
+    long = (out["Low"] <= dn) & (out["Close"] > dn) & cross_over(out["rsi"], _const(out, lo))
+    short = (out["High"] >= up) & (out["Close"] < up) & cross_under(out["rsi"], _const(out, hi))
+    return _finalise(out, long, short)
+
+
+def s_bb_rsi(df, p):
+    lo, hi = _rsi_levels(p)
+    return _sr("Waiting for a band rejection confirmed by RSI.",
+               [("Last price", fmt(safe_last(df["Close"]))), ("RSI", fmt(safe_last(df["rsi"]))),
+                ("Lower band", fmt(safe_last(df["bb_lo"]))),
+                ("Upper band", fmt(safe_last(df["bb_up"]))),
+                ("RSI levels", f"{fmt(lo)} / {fmt(hi)}")],
+               f"Candle must tag the lower band and close above it while RSI crosses up through {fmt(lo)}.",
+               f"Candle must tag the upper band and close below it while RSI crosses down through {fmt(hi)}.")
+
+
+def c_ema_rsi(df, p):
+    """EMA crossover that only counts when RSI agrees with the direction."""
+    out = df.copy()
+    lo, hi = _rsi_levels(p)
+    out["ema_fast"] = ema(out["Close"], int(_p(p, "ema_fast")))
+    out["ema_slow"] = ema(out["Close"], int(_p(p, "ema_slow")))
+    out["rsi"] = rsi(out["Close"], int(_p(p, "rsi_len")))
+    long = cross_over(out["ema_fast"], out["ema_slow"]) & (out["rsi"] >= lo)
+    short = cross_under(out["ema_fast"], out["ema_slow"]) & (out["rsi"] <= hi)
+    return _finalise(out, long, short)
+
+
+def s_ema_rsi(df, p):
+    lo, hi = _rsi_levels(p)
+    f, sl_ = safe_last(df["ema_fast"]), safe_last(df["ema_slow"])
+    return _sr(f"EMA spread {fmt_signed((f - sl_) if (f and sl_) else None)}, "
+               f"RSI {fmt(safe_last(df['rsi']))}.",
+               [("Fast EMA", fmt(f)), ("Slow EMA", fmt(sl_)),
+                ("Points to cross", fmt(abs((f - sl_) if (f and sl_) else 0))),
+                ("RSI", fmt(safe_last(df["rsi"]))), ("RSI gates", f"{fmt(lo)} / {fmt(hi)}")],
+               f"Fast EMA crosses above slow EMA while RSI is at or above {fmt(lo)}.",
+               f"Fast EMA crosses below slow EMA while RSI is at or below {fmt(hi)}.")
+
+
+def c_vol_rsi(df, p):
+    """Volume spike plus an RSI crossing. Inert on feeds that report no volume."""
+    out = df.copy()
+    lo, hi = _rsi_levels(p)
+    out["rsi"] = rsi(out["Close"], int(_p(p, "rsi_len")))
+    out["vol_ma"] = sma(out["Volume"], int(_p(p, "vol_len")))
+    out["vol_ratio"] = out["Volume"] / out["vol_ma"].replace(0.0, np.nan)
+    surge = out["vol_ratio"] >= float(_p(p, "vol_mult"))
+    return _finalise(out, surge & cross_over(out["rsi"], _const(out, lo)),
+                     surge & cross_under(out["rsi"], _const(out, hi)))
+
+
+def s_vol_rsi(df, p):
+    lo, hi = _rsi_levels(p)
+    dead = float(df["Volume"].tail(50).abs().sum()) == 0.0
+    return _sr("This feed reports no volume, so this profile cannot arm." if dead else
+               f"Volume {fmt(safe_last(df['vol_ratio']))}x average, RSI {fmt(safe_last(df['rsi']))}.",
+               [("Volume ratio", fmt(safe_last(df["vol_ratio"]))),
+                ("RSI", fmt(safe_last(df["rsi"]))), ("RSI levels", f"{fmt(lo)} / {fmt(hi)}"),
+                ("Spike needed", f"{fmt(_p(p,'vol_mult'))}x")],
+               f"Volume spike with RSI crossing up through {fmt(lo)}.",
+               f"Volume spike with RSI crossing down through {fmt(hi)}.")
+
+
 # ------------------------------------------------------------- REGISTRY ------
 _DEFS = [
     ("S01", "01 · Dual EMA Crossover", "9 EMA crossing the 21 EMA.", 40,
@@ -2016,6 +2196,15 @@ _DEFS = [
      "Crosses of a percentage band around a moving reference price.", 30,
      c_threshold_pct, s_threshold_pct, ("threshold_up", "threshold_dn", "threshold_ref"),
      None, False),
+    ("S30", "30 · RSI Crossover (configurable levels)",
+     "RSI reclaiming your long level or losing your short level.", 40,
+     c_rsi_crossover, s_rsi_crossover, (), "rsi", False),
+    ("S31", "31 · Bollinger Band + RSI", "Band rejection confirmed by an RSI crossing.", 60,
+     c_bb_rsi, s_bb_rsi, ("bb_up", "bb_mid", "bb_lo"), "rsi", False),
+    ("S32", "32 · EMA Crossover + RSI", "EMA cross that only counts when RSI agrees.", 60,
+     c_ema_rsi, s_ema_rsi, ("ema_fast", "ema_slow"), "rsi", False),
+    ("S33", "33 · Volume Spike + RSI", "Volume confirmation on an RSI crossing.", 60,
+     c_vol_rsi, s_vol_rsi, (), "rsi", False),
 ]
 
 STRATEGIES: dict[str, Strategy] = {
@@ -2091,6 +2280,36 @@ def prepare(df: pd.DataFrame, strategy_name: str, params: dict,
 
 
 @dataclass
+class CostModel:
+    """
+    Round-trip trading costs. OFF by default so gross and net are never confused.
+
+    Deliberately simple and explicit rather than a full Indian tax schedule:
+    brokerage per side, an optional percentage of turnover covering STT / GST /
+    exchange and regulatory charges, and slippage in points per side. Enter the
+    numbers your own contract notes actually show.
+    """
+    enabled: bool = False
+    brokerage_per_side: float = 20.0
+    pct_of_turnover: float = 0.05
+    slippage_points: float = 0.0
+
+    def total(self, entry_price: float, exit_price: float, quantity: float) -> float:
+        if not self.enabled:
+            return 0.0
+        turnover = (abs(entry_price) + abs(exit_price)) * quantity
+        return (2.0 * self.brokerage_per_side
+                + turnover * self.pct_of_turnover / 100.0
+                + 2.0 * self.slippage_points * quantity)
+
+    def summary(self) -> str:
+        if not self.enabled:
+            return "Costs excluded (gross PnL)"
+        return (f"{fmt(self.brokerage_per_side,0)}/side + {fmt(self.pct_of_turnover,3)}% turnover "
+                f"+ {fmt(self.slippage_points,2)} pts slippage/side")
+
+
+@dataclass
 class RiskConfig:
     sl_type: str
     sl_value: float
@@ -2099,6 +2318,7 @@ class RiskConfig:
     quantity: float = 1.0
     step_trigger: float = 0.0        # `k` for the step trail
     min_stop_atr: float = 0.25       # fallback distance when a structural stop is invalid
+    costs: CostModel = field(default_factory=CostModel)
 
     def as_summary(self) -> str:
         sl = self.sl_type if self.sl_type in _SL_NO_VALUE else f"{self.sl_type} {fmt(self.sl_value)}"
@@ -2448,6 +2668,7 @@ class BacktestResult:
     warmup_index: int
     warnings: list[str] = field(default_factory=list)
     filter_reports: list = field(default_factory=list)
+    walk_forward: pd.DataFrame = field(default_factory=pd.DataFrame)
 
 
 def run_backtest(df: pd.DataFrame, strategy_name: str, params: dict, risk: RiskConfig,
@@ -2535,10 +2756,9 @@ def run_backtest(df: pd.DataFrame, strategy_name: str, params: dict, risk: RiskC
     if trades_df.empty:
         warnings.append("This configuration produced no entries. Try a longer period, a faster "
                         "interval, fewer filters, or a strategy whose conditions occur more often.")
-    if risk.sl_type in TRAILING_SL_TYPES or risk.tp_type in TRAILING_TP_TYPES:
-        warnings.append("A trailing stop is active. Backtested trailing results are APPROXIMATE: "
-                        "OHLC candles cannot tell us whether price hit the trailing level before "
-                        "or after the extreme that moved it. Treat these numbers as optimistic.")
+    verdict, reasons = exit_reliability(risk.sl_type, risk.tp_type)
+    stats["reliability"] = verdict
+    stats["reliability_reasons"] = reasons
     for note in sorted(fallback_notes):
         warnings.append("Exit engine: " + note)
 
@@ -2549,6 +2769,8 @@ def run_backtest(df: pd.DataFrame, strategy_name: str, params: dict, risk: RiskC
 def _close_trade(pos: Position, exit_price: float, exit_time, reason: str) -> dict:
     points = round((exit_price - pos.entry_price) * pos.direction, 4)
     mgr = pos.manager
+    gross = round(points * pos.quantity, 4)
+    cost = round(mgr.risk.costs.total(pos.entry_price, float(exit_price), pos.quantity), 4)
     return {
         "Direction": "LONG" if pos.direction > 0 else "SHORT",
         "Signal Time": pos.signal_bar_time,
@@ -2563,7 +2785,9 @@ def _close_trade(pos: Position, exit_price: float, exit_time, reason: str) -> di
         "Exit Reason": reason,
         "Bars Held": mgr.bars_held,
         "Points": points,
-        "PnL": round(points * pos.quantity, 4),
+        "Gross PnL": gross,
+        "Costs": cost,
+        "PnL": round(gross - cost, 4),
         "Quantity": pos.quantity,
     }
 
@@ -2582,11 +2806,30 @@ def _statistics(trades: pd.DataFrame, equity: pd.Series, risk: RiskConfig) -> di
         return {"total_trades": 0, "wins": 0, "losses": 0, "win_rate": 0.0, "gross_points": 0.0,
                 "net_pnl": 0.0, "profit_factor": 0.0, "avg_win": 0.0, "avg_loss": 0.0,
                 "expectancy": 0.0, "max_drawdown": 0.0, "best_trade": 0.0, "worst_trade": 0.0,
-                "longs": 0, "shorts": 0, "avg_bars": 0.0}
+                "longs": 0, "shorts": 0, "avg_bars": 0.0, "sharpe": 0.0,
+                "trades_per_year": 0.0, "total_costs": 0.0, "gross_pnl": 0.0}
     pnl = trades["PnL"]
     wins, losses = pnl[pnl > 0], pnl[pnl <= 0]
     gross_win, gross_loss = float(wins.sum()), float(-losses.sum())
     dd = equity - equity.cummax()
+
+    # Sharpe on per-trade returns, annualised by the observed trade frequency.
+    # Assumptions are stated in the UI: zero risk-free rate, trades treated as
+    # independent, and the annualisation factor derived from the sample's own
+    # span rather than a calendar convention.
+    returns = pnl / (trades["Entry Price"].abs() * trades["Quantity"]).replace(0.0, np.nan)
+    returns = returns.replace([np.inf, -np.inf], np.nan).dropna()
+    sharpe, trades_per_year = 0.0, 0.0
+    if len(returns) > 2 and float(returns.std(ddof=1)) > 0:
+        try:
+            span_days = max(
+                (pd.Timestamp(trades["Exit Time"].iloc[-1])
+                 - pd.Timestamp(trades["Entry Time"].iloc[0])).total_seconds() / 86400.0, 1e-6)
+        except Exception:                                           # noqa: BLE001
+            span_days = 1.0
+        trades_per_year = len(returns) / span_days * 365.0
+        sharpe = float(returns.mean() / returns.std(ddof=1) * np.sqrt(max(trades_per_year, 1e-9)))
+
     return {
         "total_trades": int(len(trades)), "wins": int(len(wins)), "losses": int(len(losses)),
         "win_rate": round(len(wins) / len(trades) * 100.0, 2),
@@ -2601,6 +2844,10 @@ def _statistics(trades: pd.DataFrame, equity: pd.Series, risk: RiskConfig) -> di
         "longs": int((trades["Direction"] == "LONG").sum()),
         "shorts": int((trades["Direction"] == "SHORT").sum()),
         "avg_bars": round(float(trades["Bars Held"].mean()), 1),
+        "sharpe": round(sharpe, 2),
+        "trades_per_year": round(trades_per_year, 1),
+        "total_costs": round(float(trades["Costs"].sum()), 2) if "Costs" in trades else 0.0,
+        "gross_pnl": round(float(trades["Gross PnL"].sum()), 2) if "Gross PnL" in trades else 0.0,
     }
 
 
@@ -2847,7 +3094,8 @@ _STATE_DEFAULTS = {
     "live_frame": None, "live_frame_at": 0.0, "live_reports": [],
     "live_frame_warnings": [], "live_vix": None, "candle_refreshes": 0,
     "ltp_note": None, "screener_results": None, "screener_error": None,
-    "last_seen_ltp": None, "last_ltp_change_ts": 0.0,
+    "last_seen_ltp": None, "last_ltp_change_ts": 0.0, "pending_ticker": None,
+    "optimizer_results": None, "pattern_results": None, "pending_combo": None,
 }
 
 
@@ -3037,7 +3285,12 @@ def _live_close(position: Position, exit_price: float, reason: str) -> dict:
         "Final Stop": None if mgr.sl is None else round(mgr.sl, 4),
         "Target": None if mgr.tp is None else round(mgr.tp, 4),
         "Best Price": round(mgr.mfe, 4), "Exit Reason": reason,
-        "Points": points, "PnL": round(points * position.quantity, 4),
+        "Points": points, "Gross PnL": round(points * position.quantity, 4),
+        "Costs": round(mgr.risk.costs.total(position.entry_price, float(exit_price),
+                                            position.quantity), 4),
+        "PnL": round(points * position.quantity
+                     - mgr.risk.costs.total(position.entry_price, float(exit_price),
+                                            position.quantity), 4),
         "Broker Order": position.broker_order_id or "-",
     }
     record_live_trade(trade)
@@ -3058,6 +3311,15 @@ def square_off(reason: str = "Manual Square-Off", price: float | None = None) ->
 
     trade = _live_close(position, float(price), reason)
     st.session_state.live_position = None
+    db_clear_position()
+    db_append_trade(trade)
+    err = send_email(cfg, f"EXIT {trade['Direction']} {trade['Symbol']} :: "
+                          f"{fmt_signed(trade['PnL'])}",
+                     f"Reason: {reason}\nEntry: {fmt(trade['Entry Price'])}\n"
+                     f"Exit: {fmt(trade['Exit Price'])}\nPoints: {fmt_signed(trade['Points'])}\n"
+                     f"PnL: {fmt_signed(trade['PnL'])}\nTime: {pd.Timestamp.now()}")
+    if err:
+        log_event(err, "error")
     log_event(f"{reason}: {trade['Direction']} closed at {fmt(trade['Exit Price'])} "
               f"for {fmt_signed(trade['PnL'])} ({fmt_signed(trade['Points'])} pts).",
               "warn" if trade["PnL"] < 0 else "success")
@@ -3099,6 +3361,16 @@ def _open_live_position(cfg: dict, direction: int, price: float, ctx: BarCtx, ba
                         entry_ltp_at_fill=cfg.get("_ltp_at_fill"))
     st.session_state.live_position = position
     _maybe_route_broker(cfg, position, closing=False)
+    db_save_position(position, cfg)
+    err = send_email(cfg, f"ENTRY {'LONG' if direction > 0 else 'SHORT'} {cfg['symbol']} "
+                          f"@ {fmt(price)}",
+                     f"Strategy: {cfg['strategy']}\nSymbol: {cfg['symbol']} ({cfg['interval']})\n"
+                     f"Direction: {'LONG' if direction > 0 else 'SHORT'}\n"
+                     f"Entry: {fmt(price)}\nStop: {fmt(mgr.sl)}\nTarget: {fmt(mgr.tp)}\n"
+                     f"Quantity: {fmt(cfg['risk'].quantity, 0)}\n"
+                     f"Time: {pd.Timestamp.now()}")
+    if err:
+        log_event(err, "error")
     log_event(f"ENTRY {'LONG' if direction > 0 else 'SHORT'} @ {fmt(price)} | "
               f"SL {fmt(mgr.sl)} | TGT {fmt(mgr.tp)} | qty {fmt(cfg['risk'].quantity, 0)}", "success")
     for note in mgr.notes:
@@ -3184,6 +3456,8 @@ def run_cycle(cfg: dict) -> None:
                 return
             mgr.bars_held += 1
         mgr.update(snapshot.ltp, closed_ctx)         # trail on the running price
+        if new_bar:
+            db_save_position(position, cfg)          # persist the ratcheted stop
         st.session_state.live_last_bar = snapshot.last_closed_time
         return
 
@@ -3315,7 +3589,30 @@ _CUSTOM = "-- Custom ticker --"
 def render_sidebar() -> dict:
     live = bool(st.session_state.get("live_running", False))
     sb = st.sidebar
+
+    # Consume a ticker handed over by the screener. This must happen BEFORE the
+    # widgets below are created, which is the whole reason for the handover key.
+    combo = st.session_state.pop("pending_combo", None)
+    if combo and not live:
+        st.session_state["cfg_strategy"] = combo["strategy"]
+        st.session_state["cfg_sl_type"] = combo["sl_type"]
+        st.session_state["cfg_tp_type"] = combo["tp_type"]
+        if combo.get("sl_value") is not None:
+            st.session_state[f"cfg_sl_v_{combo['sl_type']}"] = float(combo["sl_value"])
+        if combo.get("tp_value") is not None:
+            st.session_state[f"cfg_tp_v_{combo['tp_type']}"] = float(combo["tp_value"])
+        st.session_state["applied_from_screener"] = combo["strategy"]
+
+    pending = st.session_state.pop("pending_ticker", None)
+    if pending and not live:
+        st.session_state["cfg_group"] = _CUSTOM
+        st.session_state["cfg_custom"] = pending
+        st.session_state["applied_from_screener"] = pending
+
     sb.title("Control Console")
+    applied = st.session_state.pop("applied_from_screener", None)
+    if applied:
+        sb.success(f"`{applied}` applied from the screener.")
     if live:
         _running_banner()
         sb.caption("Configuration is locked while the automation core is running.")
@@ -3324,7 +3621,10 @@ def render_sidebar() -> dict:
     group = sb.selectbox("Asset class", list(ASSET_UNIVERSE) + [_CUSTOM], disabled=live,
                          key="cfg_group")
     if group == _CUSTOM:
-        symbol = sb.text_input("Custom Yahoo ticker", "KAYNES.NS", disabled=live,
+        # Seed the default only when nothing is set, so a ticker handed over by
+        # the screener is not fighting a hardcoded default on the same widget.
+        st.session_state.setdefault("cfg_custom", "KAYNES.NS")
+        symbol = sb.text_input("Custom Yahoo ticker", disabled=live,
                                key="cfg_custom").strip().upper()
         asset_label = symbol or "--"
     else:
@@ -3397,10 +3697,6 @@ def render_sidebar() -> dict:
         sb.caption("Structural target. If the level sits the wrong side of entry at fill time, "
                    "no target is set and the stop or a strategy exit resolves the trade.")
 
-    risk = RiskConfig(sl_type=sl_type, sl_value=float(sl_value), tp_type=tp_type,
-                      tp_value=float(tp_value), quantity=float(quantity),
-                      step_trigger=float(step_trigger))
-
     # ------------------------------------------------------- execution ------
     sb.subheader("Execution")
     poll_seconds = sb.number_input("Live poll interval (seconds)", min_value=API_GUARD_DELAY,
@@ -3427,6 +3723,58 @@ def render_sidebar() -> dict:
                               help="Default follows the N+1-open rule. Turn this on if you would "
                                    "rather record the price a market order would actually get.")
 
+    sb.subheader("Analysis Options")
+    costs = CostModel(enabled=sb.checkbox("Include charges / brokerage in PnL", value=False,
+                                          key="cfg_costs_on",
+                                          help="Off by default so gross and net are never "
+                                               "confused. When on, every trade is charged."))
+    if costs.enabled:
+        costs.brokerage_per_side = sb.number_input("Brokerage per side", 0.0, 10000.0, 20.0, 1.0,
+                                                   key="cfg_brok")
+        costs.pct_of_turnover = sb.number_input("Taxes / charges (% of turnover)", 0.0, 5.0,
+                                                0.05, 0.01, key="cfg_pct")
+        costs.slippage_points = sb.number_input("Slippage (points per side)", 0.0, 500.0, 0.0,
+                                                0.1, key="cfg_slip")
+        sb.caption("Enter what your own contract notes show. This is a simple model, not the "
+                   "full Indian tax schedule.")
+    risk = RiskConfig(sl_type=sl_type, sl_value=float(sl_value), tp_type=tp_type,
+                      tp_value=float(tp_value), quantity=float(quantity),
+                      step_trigger=float(step_trigger), costs=costs)
+
+    walk_fwd = sb.checkbox("Run segment stability (walk-forward) check", value=False,
+                           key="cfg_wfo",
+                           help="Splits the sample into sequential segments and reports each "
+                                "separately, so one lucky window cannot carry the whole result.")
+    wf_folds = sb.number_input("Segments", 2, 12, 5, 1, key="cfg_wfo_folds") if walk_fwd else 5
+
+    verdict, _reasons = exit_reliability(sl_type, tp_type)
+    (sb.success if verdict == "Backtest-safe" else sb.warning)(
+        f"Exit configuration is **{verdict}** for backtesting.")
+
+    use_dhan_data = sb.checkbox("Use Dhan market data (needs API token)", value=False,
+                                key="cfg_dhan_data",
+                                help="Replaces Yahoo's delayed quote with Dhan's real-time LTP. "
+                                     "Read-only: this places no orders. Credentials are entered "
+                                     "in the Dhan panel below.")
+
+    email_cfg = {"enabled": False}
+    with sb.expander("Email notifications (off by default)"):
+        email_cfg["enabled"] = st.checkbox("Send email on entry and exit", value=False,
+                                           key="cfg_email_on")
+        if email_cfg["enabled"]:
+            email_cfg["from"] = st.text_input("From address", "srinivasp451@gmail.com",
+                                              key="cfg_email_from")
+            email_cfg["to"] = st.text_input("To address", "srinivasp451@gmail.com",
+                                            key="cfg_email_to")
+            email_cfg["password"] = st.text_input("App password", type="password",
+                                                  key="cfg_email_pw",
+                                                  help="A Gmail App Password, not your account "
+                                                       "password. It is held in memory for this "
+                                                       "session only and never written to disk.")
+            email_cfg["host"] = st.text_input("SMTP host", "smtp.gmail.com", key="cfg_email_host")
+            email_cfg["port"] = st.number_input("SMTP port (SSL)", 1, 65535, 465,
+                                                key="cfg_email_port")
+
     filter_cfg, filter_extras = _render_filters(sb, live)
     broker = _render_broker(sb, live, symbol)
 
@@ -3444,6 +3792,12 @@ def render_sidebar() -> dict:
                                  ("st_mult", 0.5, 10.0, 0.1)):
             params[key] = st.number_input(key, lo, hi, float(DEFAULT_PARAMS[key]), stp,
                                           disabled=live, key=f"pm_{key}")
+    if strategy.startswith(("30 ", "31 ", "32 ", "33 ")):
+        sb.subheader("RSI Levels")
+        params["rsi_long_level"] = sb.number_input("RSI long level", 1.0, 99.0, 40.0, 1.0,
+                                                   disabled=live, key="cfg_rsi_long")
+        params["rsi_short_level"] = sb.number_input("RSI short level", 1.0, 99.0, 60.0, 1.0,
+                                                    disabled=live, key="cfg_rsi_short")
     if strategy.startswith(("28 ", "29 ")):
         sb.subheader("Threshold Settings")
         params["threshold_mode"] = sb.selectbox("Trigger mode", THRESHOLD_MODES, disabled=live,
@@ -3472,7 +3826,9 @@ def render_sidebar() -> dict:
             "params": params, "risk": risk, "quantity": float(quantity),
             "poll_seconds": float(poll_seconds), "fill_at_ltp": bool(fill_at_ltp),
             "allow_stale_entries": bool(allow_stale),
-            "candle_seconds": float(candle_seconds),
+            "candle_seconds": float(candle_seconds), "costs": costs,
+            "walk_forward": bool(walk_fwd), "wf_folds": int(wf_folds),
+            "use_dhan_data": bool(use_dhan_data), "email": email_cfg,
             "filter_cfg": filter_cfg, "filter_extras": filter_extras, "broker": broker,
             "currency": currency_symbol(symbol),
             "hide_weekends": not (symbol.endswith("-USD") or symbol.endswith("=X"))}
@@ -3569,8 +3925,8 @@ def _render_broker(sb, live: bool, symbol: str) -> dict:
         broker["dry_run"] = st.checkbox("Dry run (build the payload, transmit nothing)",
                                         value=True, key="brk_dry")
         broker["use_live_ltp"] = st.checkbox(
-            "Use Dhan for the live LTP (read-only, places no orders)", value=True,
-            key="brk_ltp",
+            "Use Dhan for the live LTP (read-only, places no orders)",
+            value=bool(st.session_state.get("cfg_dhan_data", False)), key="brk_ltp",
             help="Yahoo's Indian feed is delayed ~15 minutes, so on a 5m chart the LTP can sit "
                  "unchanged for a quarter of an hour however fast you poll. This replaces it "
                  "with Dhan's real-time quote. Requires a Dhan Data API subscription.")
@@ -3684,6 +4040,11 @@ def _run_backtest_ui(cfg: dict) -> None:
             result = run_backtest(bundle.frame, cfg["strategy"], cfg["params"], cfg["risk"],
                                   cfg["filter_cfg"], extras, WARMUP_BARS)
             result.warnings = list(bundle.warnings) + list(result.warnings)
+            if cfg.get("walk_forward"):
+                st.write(f"Running {cfg['wf_folds']} stability segments ...")
+                result.walk_forward = walk_forward(bundle.frame, cfg["strategy"], cfg["params"],
+                                                   cfg["risk"], cfg["filter_cfg"], extras,
+                                                   int(cfg["wf_folds"]))
             st.session_state.backtest_result = result
             st.session_state.backtest_meta = dict(cfg)
             status.update(label=f"Complete :: {result.stats['total_trades']} trades",
@@ -3696,8 +4057,64 @@ def _run_backtest_ui(cfg: dict) -> None:
             status.update(label="Simulation aborted", state="error", expanded=False)
 
 
+def _trust_header(result: BacktestResult, meta: dict) -> None:
+    """
+    A blunt verdict on whether this result deserves any confidence.
+
+    Backtests fail in predictable ways: too few trades, an exit type the
+    simulation cannot model honestly, results carried by gap fills, or no cost
+    model. Each is checked and named rather than left for the operator to spot.
+    """
+    s = result.stats
+    problems, cautions = [], []
+
+    if s["total_trades"] == 0:
+        problems.append("No trades at all -- there is nothing here to evaluate.")
+    elif s["total_trades"] < 30:
+        problems.append(f"Only {s['total_trades']} trades. Below roughly 30 the win rate and "
+                        "Sharpe are noise; this sample cannot distinguish edge from luck.")
+    elif s["total_trades"] < 100:
+        cautions.append(f"{s['total_trades']} trades is a thin sample. Treat the numbers as "
+                        "indicative, not established.")
+
+    if s.get("reliability") == "Optimistic":
+        problems.append("A distance-based trailing exit is active, which the simulation cannot "
+                        "model honestly on OHLC data. Live results will be WORSE than shown.")
+    if s["total_trades"] and s["gap_exits"] / max(s["total_trades"], 1) > 0.25:
+        cautions.append(f"{s['gap_exits']} of {s['total_trades']} exits filled through gaps. The "
+                        "stop is too tight for this instrument's gap behaviour.")
+    if not meta["risk"].costs.enabled and s["total_trades"]:
+        cautions.append("Costs are excluded. Brokerage, taxes and slippage often exceed the edge "
+                        "on fast intraday profiles -- enable the cost model before believing this.")
+    if s["total_trades"] and s["max_drawdown"] and abs(s["max_drawdown"]) > abs(s["net_pnl"]):
+        cautions.append("Maximum drawdown exceeds total profit. Even if the edge is real, it "
+                        "would be very hard to sit through.")
+    if not meta.get("walk_forward"):
+        cautions.append("No segment stability check was run, so it is unknown whether one lucky "
+                        "stretch carried the result.")
+
+    if problems:
+        st.error("### Do not trust this result yet\n\n"
+                 + "\n".join(f"- {x}" for x in problems)
+                 + ("\n\nAlso worth noting:\n" + "\n".join(f"- {x}" for x in cautions)
+                    if cautions else ""))
+    elif cautions:
+        st.warning("### Treat this result with caution\n\n"
+                   + "\n".join(f"- {x}" for x in cautions))
+    else:
+        st.success("### This result passes the basic sanity checks\n\n"
+                   f"- {s['total_trades']} trades, a sample large enough to mean something.\n"
+                   "- Exit configuration is backtest-safe: no path ambiguity to guess at.\n"
+                   "- Costs are included and drawdown sits within total profit.\n"
+                   "- Segment stability was checked.\n\n"
+                   "Passing these checks means the simulation is *honest*. It does not mean the "
+                   "edge will persist: markets change, and out-of-sample forward testing on "
+                   "paper is the only thing that tells you whether it still works.")
+
+
 def _render_backtest(result: BacktestResult, meta: dict) -> None:
     cur, s = meta["currency"], result.stats
+    _trust_header(result, meta)
 
     st.markdown("#### Performance Summary")
     a = st.columns(5)
@@ -3713,6 +4130,24 @@ def _render_backtest(result: BacktestResult, meta: dict) -> None:
     b[2].metric("Average Loss", fmt(s["avg_loss"]))
     b[3].metric("Best / Worst", f"{fmt(s['best_trade'], 0)} / {fmt(s['worst_trade'], 0)}")
     b[4].metric("Warm-up Bars", f"{s['warmup_bars']:,}", f"{s['bars_tested']:,} tested")
+    c = st.columns(5)
+    c[0].metric("Sharpe Ratio", fmt(s["sharpe"]), f"~{fmt(s['trades_per_year'],0)} trades/yr",
+                help="Per-trade returns annualised by the sample's own trade frequency. Zero "
+                     "risk-free rate, trades treated as independent. A Sharpe from a few dozen "
+                     "trades is a noisy estimate, not a property of the strategy.")
+    c[1].metric(f"Gross PnL ({cur})", fmt_signed(s.get("gross_pnl", s["net_pnl"])))
+    c[2].metric(f"Costs charged ({cur})", fmt(s.get("total_costs", 0.0)),
+                meta["risk"].costs.summary())
+    c[3].metric("Avg Bars Held", fmt(s["avg_bars"], 1))
+    c[4].metric("Gap Exits", f"{s['gap_exits']:,}")
+
+    if meta.get("walk_forward") and not result.walk_forward.empty:
+        st.markdown("#### Segment Stability")
+        st.caption("The sample split into sequential stretches. With a fixed configuration there "
+                   "is no in-sample fitting to guard against, so this asks a narrower question: "
+                   "did the result hold across the whole sample, or did one window carry it? "
+                   "Use the Strategy Optimiser for the fit-then-test version.")
+        st.dataframe(result.walk_forward, width="stretch", hide_index=True)
 
     if result.warnings:
         with st.expander(f"Run notes and caveats ({len(result.warnings)})", expanded=False):
@@ -3776,6 +4211,22 @@ def _live_controls(cfg: dict) -> None:
     running = bool(st.session_state.live_running)
     position = st.session_state.live_position
     c1, c2, c3 = st.columns(3)
+
+    saved = db_load_position() if st.session_state.live_position is None else None
+    if saved:
+        st.warning(f"An open {('LONG' if saved['direction'] > 0 else 'SHORT')} position on "
+                   f"`{saved['symbol']}` was saved at {saved.get('saved_at', '?')[:19]} and never "
+                   "closed. Its trailed stop and target are restored exactly as they were -- "
+                   "recomputing them would hand back risk the trade had already locked away.")
+        rc1, rc2 = st.columns(2)
+        if rc1.button("Resume saved position", type="primary", width="stretch"):
+            st.session_state.live_position = restore_position(saved)
+            log_event(f"Resumed the saved {saved['symbol']} position from the database.", "warn")
+            st.rerun()
+        if rc2.button("Discard saved position", width="stretch"):
+            db_clear_position()
+            log_event("Discarded the saved position without booking a trade.", "warn")
+            st.rerun()
 
     if c1.button("Start Live Automation Core", type="primary", disabled=running, width="stretch"):
         reset_live_runtime()
@@ -3852,6 +4303,7 @@ def _live_body() -> None:
         _position_dashboard(position, snapshot, cfg["currency"])
     else:
         _searching_widget(cfg, snapshot)
+    _strategy_status_panel(cfg, snapshot)
     _live_chart(cfg, snapshot)
     _recent_trades()
     _feed_diagnostics()
@@ -4044,6 +4496,38 @@ def _live_chart(cfg: dict, snapshot: LiveSnapshot) -> None:
             fig.add_hline(y=mgr.sl, line=dict(width=1.2, dash="dot", color="#ef5350"),
                           annotation_text="Stop")
     st.plotly_chart(fig, width="stretch", config={"scrollZoom": True})
+
+
+def _strategy_status_panel(cfg: dict, snapshot: LiveSnapshot) -> None:
+    """
+    What the strategy and every active filter are doing RIGHT NOW.
+
+    Shown whether or not a position is open: when one is open the scanner is
+    hidden, and without this the operator loses all visibility into why the
+    engine would or would not take the next trade.
+    """
+    st.markdown("#### Strategy & Filter Status")
+    st.info(f"**{cfg['strategy']}** :: {snapshot.status.headline}")
+    metrics = [("Live LTP", fmt(snapshot.ltp))] + list(snapshot.status.metrics)
+    cols = st.columns(min(len(metrics), 5))
+    for i, (label, value) in enumerate(metrics):
+        cols[i % len(cols)].metric(label, value)
+
+    l, r = st.columns(2)
+    l.markdown(f"**Long needs**\n\n{snapshot.status.long_condition}")
+    r.markdown(f"**Short needs**\n\n{snapshot.status.short_condition}")
+
+    if snapshot.filter_reports:
+        rows = [{"Filter": rep.label, "Now": rep.value,
+                 "Long": "PASS" if rep.long_ok else "BLOCK",
+                 "Short": "PASS" if rep.short_ok else "BLOCK"}
+                for rep in snapshot.filter_reports]
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+        blocking = [r["Filter"] for r in rows if r["Long"] == "BLOCK" and r["Short"] == "BLOCK"]
+        if blocking:
+            st.caption("Currently blocking BOTH directions: " + ", ".join(blocking))
+    else:
+        st.caption("No entry filters are enabled.")
 
 
 def _recent_trades() -> None:
@@ -4299,11 +4783,11 @@ def tab_screener(cfg: dict) -> None:
         pick = st.selectbox("Select a ticker", results["Ticker"].tolist(), key="scr_pick")
         a, b = st.columns([1, 3])
         if a.button("Apply to sidebar", type="primary", width="stretch"):
-            # Push the choice into the sidebar widgets so backtesting and live
-            # trading pick it up without any retyping.
-            st.session_state.cfg_group = "-- Custom ticker --"
-            st.session_state.cfg_custom = pick
-            st.toast(f"{pick} applied to the sidebar.")
+            # Streamlit forbids writing a widget's key AFTER that widget has been
+            # instantiated, and the sidebar is built before this tab renders. So
+            # we park the choice in a plain key and the sidebar consumes it at
+            # the top of the next run, before any widget exists.
+            st.session_state.pending_ticker = pick
             st.rerun()
         b.caption("Applies the ticker to the sidebar so the Backtesting and Live tabs use it. "
                   "Everything else in your configuration is left untouched.")
@@ -4374,6 +4858,148 @@ def _open_position_note() -> None:
                "journalled the moment it closes.")
 
 
+def tab_optimiser(cfg: dict) -> None:
+    st.subheader("Strategy Optimiser")
+    st.error("**Read this before using the output.** Searching hundreds of combinations and "
+             "keeping the best one is the most reliable way to fool yourself in this entire "
+             "application. With enough attempts something always looks excellent on any sample, "
+             "including pure noise. The ranking below is a SHORTLIST to validate out of sample, "
+             "never a result. Simple Buy, Simple Sell and the threshold profiles are excluded "
+             "because they are execution helpers, not edges.")
+
+    c1, c2, c3, c4 = st.columns(4)
+    objective = c1.selectbox("Optimise for", OPTIMISER_OBJECTIVES, key="opt_obj")
+    target = c2.number_input("Desired value", value=80.0, step=1.0, key="opt_target",
+                             help="Combinations at or above this are highlighted as meeting "
+                                  "your goal. It does not restrict the search.")
+    min_trades = c3.number_input("Minimum trades", 5, 1000, 30, 5, key="opt_min",
+                                 help="Combinations with fewer trades are discarded: below "
+                                      "roughly 30 the statistics are noise.")
+    iterations = c4.number_input("Combinations to test", 20, 2000, 150, 10, key="opt_iters")
+
+    safe_only = st.checkbox("Only search backtest-safe exits", value=True, key="opt_safe",
+                            help="Excludes distance-based trailing stops, whose backtested "
+                                 "results are systematically optimistic.")
+
+    if st.button("Run Optimiser", type="primary", width="stretch"):
+        st.session_state.optimizer_results = None
+        bar = st.progress(0.0, text="Loading data ...")
+        try:
+            bundle = load_market_data(cfg["symbol"], cfg["period"], cfg["interval"], 300.0,
+                                      min_bars=WARMUP_BARS + 60)
+            results = optimise(bundle.frame, cfg["params"], cfg["quantity"], cfg["costs"],
+                               objective, int(min_trades), int(iterations),
+                               safe_exits_only=safe_only, progress=bar)
+            st.session_state.optimizer_results = (results, objective, float(target))
+        except Exception as exc:                                    # noqa: BLE001
+            st.error(f"Optimiser failed: {exc}")
+        bar.empty()
+
+    payload = st.session_state.optimizer_results
+    if payload is None:
+        st.info("Set an objective and run the search on the sidebar's current ticker and period.")
+        return
+    results, objective, target = payload
+    if results.empty:
+        st.warning("No combination produced enough trades to be worth reporting. Lower the "
+                   "minimum trade count, widen the period, or use a faster interval.")
+        return
+
+    hits = results[results["Score"] >= target]
+    st.success(f"{len(results)} combinations survived the trade-count filter. "
+               f"{len(hits)} reached your target of {fmt(target)} on {objective}.")
+    if len(results) >= 50:
+        st.warning(f"You tested {len(results)} combinations. At that many attempts, the top of "
+                   "the table is partly selection luck. Re-test the leaders on a different "
+                   "period before believing any of them.")
+
+    st.dataframe(results.head(40), width="stretch", hide_index=True)
+    pick = st.selectbox("Apply which rank?", results["Rank"].tolist(), key="opt_pick")
+    row = results[results["Rank"] == pick].iloc[0]
+    if st.button("Apply this combination to the sidebar", type="primary", width="stretch"):
+        st.session_state.pending_combo = {
+            "strategy": row["Strategy"], "sl_type": row["Stop-Loss"], "sl_value": row["SL Value"],
+            "tp_type": row["Target"], "tp_value": row["TP Value"]}
+        st.rerun()
+    st.caption(f"Rank {pick}: {row['Strategy']} | SL {row['Stop-Loss']} | TGT {row['Target']} | "
+               f"filter {row['Filter']} | {row['Trades']} trades | reliability {row['Reliability']}")
+    st.download_button("Download all combinations (CSV)", results.to_csv(index=False).encode(),
+                       "optimiser_results.csv", "text/csv")
+
+
+def tab_patterns(cfg: dict) -> None:
+    st.subheader("Chart Pattern Scanner")
+    st.caption("Rule-of-thumb geometric detection on confirmed zigzag pivots and candle shapes. "
+               "Two analysts would disagree about half of these, so treat a hit as worth a look "
+               "rather than a verdict.")
+
+    c1, c2, c3 = st.columns(3)
+    universe = c1.selectbox("Universe", SCREENER_UNIVERSES + ["Current sidebar ticker"],
+                            index=len(SCREENER_UNIVERSES), key="pat_universe")
+    sensitivity = c2.number_input("Zigzag sensitivity (%)", 0.1, 10.0, 0.6, 0.1, key="pat_zz",
+                                  help="Smaller finds more, and noisier, structures.")
+    max_names = c3.number_input("Max tickers", 1, 200, 25, key="pat_max")
+
+    custom_text, uploaded = "", None
+    if universe.startswith("Custom"):
+        custom_text = st.text_area("Tickers", "RELIANCE\nTCS\nINFY", key="pat_custom")
+        uploaded = st.file_uploader("...or upload a list", type=["csv", "txt"], key="pat_upload")
+
+    if universe == "Current sidebar ticker":
+        tickers = [cfg["symbol"]]
+    else:
+        tickers, _ = _universe_tickers(universe, custom_text, uploaded)
+    tickers = tickers[:int(max_names)]
+
+    if st.button("Scan for Patterns", type="primary", width="stretch"):
+        bar = st.progress(0.0, text="Scanning ...")
+        found, frames = [], {}
+        for i, ticker in enumerate(tickers):
+            bar.progress((i + 1) / max(1, len(tickers)), text=f"Scanning {ticker} ...")
+            try:
+                bundle = load_market_data(ticker, cfg["period"], cfg["interval"], 300.0,
+                                          min_bars=40)
+            except Exception:                                       # noqa: BLE001
+                continue
+            frames[ticker] = bundle.frame
+            for hit in detect_patterns(bundle.frame, float(sensitivity)):
+                found.append({"Ticker": ticker, **hit})
+        bar.empty()
+        st.session_state.pattern_results = (pd.DataFrame(found), frames)
+
+    payload = st.session_state.pattern_results
+    if payload is None:
+        st.info("Pick a universe and scan.")
+        return
+    results, frames = payload
+    if results.empty:
+        st.info("No patterns detected on this configuration. Lower the zigzag sensitivity to "
+                "find more structures.")
+        return
+
+    bias = st.multiselect("Show", ["Bullish", "Bearish", "Neutral"],
+                          default=["Bullish", "Bearish"], key="pat_bias")
+    view = results[results["Bias"].isin(bias)] if bias else results
+    st.dataframe(view.sort_values("At", ascending=False), width="stretch", hide_index=True)
+
+    if not view.empty:
+        pick = st.selectbox("Plot which ticker?", sorted(view["Ticker"].unique()), key="pat_pick")
+        frame = frames.get(pick)
+        if frame is not None:
+            plot = frame.copy()
+            plot["ema_fast"] = ema(plot["Close"], int(_p(cfg["params"], "ema_fast")))
+            plot["ema_slow"] = ema(plot["Close"], int(_p(cfg["params"], "ema_slow")))
+            fig = price_chart(plot, f"{pick} | {cfg['interval']} | detected patterns",
+                              tail=200, hide_weekends=cfg.get("hide_weekends", True))
+            for _, hit in view[view["Ticker"] == pick].iterrows():
+                colour = {"Bullish": "#26a69a", "Bearish": "#ef5350"}.get(hit["Bias"], "#8d99ae")
+                fig.add_vline(x=hit["At"], line=dict(width=1, dash="dot", color=colour),
+                              annotation_text=hit["Pattern"], annotation_position="top")
+            st.plotly_chart(fig, width="stretch", config={"scrollZoom": True})
+        st.download_button("Download patterns (CSV)", view.to_csv(index=False).encode(),
+                           "chart_patterns.csv", "text/csv")
+
+
 # =============================================================================
 # SECTION 16 -- MAIN
 # =============================================================================
@@ -4389,8 +5015,9 @@ def main() -> None:
     (status.success if st.session_state.live_running else status.info)(
         "LIVE CORE: RUNNING" if st.session_state.live_running else "LIVE CORE: IDLE")
 
-    t1, t2, t3, t4 = st.tabs(["Backtesting Engine Studio", "Live Sandbox Operations",
-                              "Live Trade Log Ledger", "Signal Screener"])
+    t1, t2, t3, t4, t5, t6 = st.tabs(
+        ["Backtesting Engine Studio", "Live Sandbox Operations", "Live Trade Log Ledger",
+         "Signal Screener", "Strategy Optimiser", "Chart Patterns"])
     with t1:
         tab_backtest(cfg)
     with t2:
@@ -4399,6 +5026,10 @@ def main() -> None:
         tab_ledger(cfg)
     with t4:
         tab_screener(cfg)
+    with t5:
+        tab_optimiser(cfg)
+    with t6:
+        tab_patterns(cfg)
 
 
 
@@ -4658,6 +5289,43 @@ def _test_liveness_logic():
     print("   liveness judged on observed price movement, not candle age  OK")
 
 
+def _test_zigzag_and_elliott():
+    """
+    Regression guard: the zigzag used to return an EMPTY pivot list, always.
+
+    With direction initialised to 0 the running extreme tracked both directions
+    at once, so it always equalled the current price, no reversal threshold
+    could ever be breached, and the Elliott profile was structurally incapable
+    of producing a signal.
+    """
+    rng = np.random.default_rng(3)
+    n = 1200
+    close = 20000 * np.exp(np.cumsum(rng.normal(0, 0.0016, n)))
+    idx = pd.date_range("2024-01-01 09:15", periods=n, freq="5min", tz="Asia/Kolkata")
+    series = pd.Series(close, index=idx)
+
+    piv = zigzag_pivot_table(series, 0.3)
+    assert len(piv) > 10, f"zigzag must find pivots on a trending walk, found {len(piv)}"
+    kinds = [k for _, _, k, _ in piv]
+    assert set(kinds) == {1, -1}, "pivots must alternate between highs and lows"
+    for a, b in zip(kinds, kinds[1:]):
+        assert a != b, "two consecutive pivots of the same kind is impossible"
+    for pivot_i, _, _, confirm_i in piv:
+        assert confirm_i > pivot_i, "a pivot cannot be known before it has been confirmed"
+
+    op = np.r_[close[0], close[:-1]]
+    frame = pd.DataFrame({"Open": op, "High": np.maximum(op, close) * 1.0006,
+                          "Low": np.minimum(op, close) * 0.9994, "Close": close,
+                          "Volume": 1000.0}, index=idx)
+    params = dict(DEFAULT_PARAMS)
+    params["intraday"] = True
+    out, _ = prepare(frame, "24 \u00b7 Elliott Wave Impulse (heuristic)", params)
+    fired = int((out["signal"] != 0).sum())
+    assert fired > 0, "the wave profile must be able to produce signals"
+    assert (out["zz_pivots"].iloc[-1] > 0), "pivot count must be reported for tuning"
+    print(f"   zigzag pivots alternate and confirm late; wave profile fired {fired} times  OK")
+
+
 def _test_fill_semantics():
     """Signal on N must fill at the OPEN of N+1, and the stop is checked before the target."""
     idx = pd.date_range("2024-01-01 09:15", periods=6, freq="5min", tz="Asia/Kolkata")
@@ -4779,7 +5447,21 @@ def _test_edge_cases():
     print(f"   gap-filled exits detected: {res.stats['gap_exits']}")
     trailing = RiskConfig("Trailing Points", 30.0, "Trailing Target (display only)", 40.0, 1.0)
     res2 = run_backtest(df, STRATEGY_NAMES[0], params, trailing)
-    assert any("APPROXIMATE" in w for w in res2.warnings), "trailing caveat must be surfaced"
+    assert res2.stats["reliability"] == "Optimistic", \
+        "a distance trail must be flagged as not backtest-safe"
+    assert any("DISTANCE trail" in r for r in res2.stats["reliability_reasons"])
+    struct = RiskConfig("Trail Current Swing Low/High", 0.0, "Fixed Points", 40.0, 1.0)
+    res3 = run_backtest(df, STRATEGY_NAMES[0], params, struct)
+    assert res3.stats["reliability"] == "Backtest-safe", \
+        "a structural trail only changes at candle boundaries, so it IS backtest-safe"
+    costed = RiskConfig("Fixed Points", 25.0, "Fixed Points", 50.0, 1.0,
+                        costs=CostModel(enabled=True, brokerage_per_side=20.0,
+                                        pct_of_turnover=0.05, slippage_points=1.0))
+    res4 = run_backtest(df, STRATEGY_NAMES[0], params, costed)
+    if not res4.trades.empty:
+        assert res4.stats["total_costs"] > 0, "costs must be charged when enabled"
+        assert res4.stats["net_pnl"] < res4.stats["gross_pnl"], "net must sit below gross"
+    print("   reliability verdicts and cost deduction  OK")
     if not res2.trades.empty:
         assert (res2.trades["Exit Reason"] != "Target").all(), \
             "a display-only target must never close a trade"
@@ -4811,6 +5493,7 @@ def run_selftest() -> int:
         _test_fill_semantics()
         _test_tick_vs_candle_split()
         _test_liveness_logic()
+        _test_zigzag_and_elliott()
         _test_threshold_strategies()
         print("-- filters --")
         _test_filters()
@@ -4824,6 +5507,344 @@ def run_selftest() -> int:
         return 1
     print("\nAll checks passed.")
     return 0
+
+
+
+
+# =============================================================================
+# SECTION 18 -- PERSISTENCE, WALK-FORWARD, NOTIFICATIONS, OPTIMISER, PATTERNS
+# =============================================================================
+import sqlite3                                                      # noqa: E402
+
+DB_PATH = "algo_platform_state.db"
+
+
+def _db():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.execute("""CREATE TABLE IF NOT EXISTS open_position
+                    (id INTEGER PRIMARY KEY CHECK (id = 1), payload TEXT, saved_at TEXT)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS trades
+                    (id INTEGER PRIMARY KEY AUTOINCREMENT, payload TEXT, exit_time TEXT)""")
+    return conn
+
+
+def db_save_position(position: "Position", cfg: dict) -> None:
+    """
+    Persist the open position so an overnight hold survives a restart.
+
+    A position open at 15:30 is still risk at 09:15 the next morning. Without
+    this the app forgets it, the stop stops existing, and the operator finds out
+    the hard way.
+    """
+    if position is None:
+        db_clear_position()
+        return
+    mgr = position.manager
+    payload = {
+        "strategy": position.strategy, "symbol": position.symbol,
+        "interval": position.interval, "direction": position.direction,
+        "quantity": position.quantity, "entry_price": position.entry_price,
+        "entry_time": str(position.entry_time), "signal_bar_time": str(position.signal_bar_time),
+        "broker_order_id": position.broker_order_id,
+        "risk": {"sl_type": mgr.risk.sl_type, "sl_value": mgr.risk.sl_value,
+                 "tp_type": mgr.risk.tp_type, "tp_value": mgr.risk.tp_value,
+                 "quantity": mgr.risk.quantity, "step_trigger": mgr.risk.step_trigger,
+                 "costs": mgr.risk.costs.__dict__},
+        "manager": {"sl": mgr.sl, "tp": mgr.tp, "initial_sl": mgr.initial_sl,
+                    "mfe": mgr.mfe, "bars_held": mgr.bars_held,
+                    "risk_points": mgr.risk_points},
+        "saved_at": pd.Timestamp.now().isoformat(),
+    }
+    with _db() as conn:
+        conn.execute("INSERT OR REPLACE INTO open_position (id, payload, saved_at) "
+                     "VALUES (1, ?, ?)", (json.dumps(payload), payload["saved_at"]))
+
+
+def db_load_position() -> dict | None:
+    try:
+        with _db() as conn:
+            row = conn.execute("SELECT payload FROM open_position WHERE id = 1").fetchone()
+        return json.loads(row[0]) if row else None
+    except Exception:                                               # noqa: BLE001
+        return None
+
+
+def db_clear_position() -> None:
+    try:
+        with _db() as conn:
+            conn.execute("DELETE FROM open_position WHERE id = 1")
+    except Exception:                                               # noqa: BLE001
+        pass
+
+
+def db_append_trade(trade: dict) -> None:
+    try:
+        with _db() as conn:
+            conn.execute("INSERT INTO trades (payload, exit_time) VALUES (?, ?)",
+                         (json.dumps(trade, default=str), str(trade.get("Exit Time"))))
+    except Exception:                                               # noqa: BLE001
+        pass
+
+
+def db_load_trades() -> list[dict]:
+    try:
+        with _db() as conn:
+            rows = conn.execute("SELECT payload FROM trades ORDER BY id").fetchall()
+        return [json.loads(r[0]) for r in rows]
+    except Exception:                                               # noqa: BLE001
+        return []
+
+
+def restore_position(payload: dict) -> "Position":
+    """Rebuild a live position, including its trailed stop, from the database."""
+    r = payload["risk"]
+    costs = CostModel(**r.get("costs", {}))
+    risk = RiskConfig(sl_type=r["sl_type"], sl_value=r["sl_value"], tp_type=r["tp_type"],
+                      tp_value=r["tp_value"], quantity=r["quantity"],
+                      step_trigger=r.get("step_trigger", 0.0), costs=costs)
+    ctx = BarCtx(time=None, open=payload["entry_price"], high=payload["entry_price"],
+                 low=payload["entry_price"], close=payload["entry_price"], atr=np.nan,
+                 ema_fast=np.nan, ema_slow=np.nan, swing_high=np.nan, swing_low=np.nan,
+                 prev_swing_high=np.nan, prev_swing_low=np.nan, prev_high=np.nan,
+                 prev_low=np.nan, signal=0)
+    mgr = ExitManager(risk, payload["entry_price"], payload["direction"], ctx)
+    m = payload["manager"]
+    # The TRAILED levels are restored, not recomputed. Recomputing would silently
+    # reset a stop that had already ratcheted up, handing back risk the trade had
+    # already locked away.
+    mgr.sl, mgr.tp = m.get("sl"), m.get("tp")
+    mgr.initial_sl, mgr.mfe = m.get("initial_sl"), m.get("mfe", payload["entry_price"])
+    mgr.bars_held, mgr.risk_points = int(m.get("bars_held", 0)), m.get("risk_points")
+    return Position(strategy=payload["strategy"], symbol=payload["symbol"],
+                    interval=payload["interval"], direction=int(payload["direction"]),
+                    quantity=float(payload["quantity"]),
+                    entry_price=float(payload["entry_price"]),
+                    entry_time=payload.get("entry_time"),
+                    signal_bar_time=payload.get("signal_bar_time"), manager=mgr,
+                    broker_order_id=payload.get("broker_order_id"))
+
+
+# --------------------------------------------------------------------------- #
+# EMAIL NOTIFICATIONS
+# --------------------------------------------------------------------------- #
+def send_email(cfg: dict, subject: str, body: str) -> str | None:
+    """Send a notification via SMTP. Returns an error string, or None on success."""
+    mail = (cfg or {}).get("email") or {}
+    if not mail.get("enabled"):
+        return None
+    sender, to, password = mail.get("from"), mail.get("to"), mail.get("password")
+    if not (sender and to and password):
+        return "Email is enabled but the sender, recipient or app password is missing."
+    try:
+        import smtplib
+        from email.message import EmailMessage
+        msg = EmailMessage()
+        msg["Subject"], msg["From"], msg["To"] = subject, sender, to
+        msg.set_content(body)
+        with smtplib.SMTP_SSL(mail.get("host", "smtp.gmail.com"),
+                              int(mail.get("port", 465)), timeout=20) as smtp:
+            smtp.login(sender, password)
+            smtp.send_message(msg)
+        return None
+    except Exception as exc:                                        # noqa: BLE001
+        return f"Email failed: {exc}"
+
+
+# --------------------------------------------------------------------------- #
+# WALK-FORWARD
+# --------------------------------------------------------------------------- #
+def walk_forward(df: pd.DataFrame, strategy: str, params: dict, risk: RiskConfig,
+                 filter_cfg: dict | None, extras: dict | None, folds: int = 5) -> pd.DataFrame:
+    """
+    Sequential out-of-sample segments.
+
+    IMPORTANT ON NAMING: with a fixed configuration there is no in-sample fitting
+    to guard against, so this is a STABILITY report, not classical walk-forward
+    optimisation. It answers "did this hold up across different stretches of the
+    sample, or does one lucky window carry the whole result?" The optimiser tab
+    runs the fit-then-test version.
+    """
+    rows = []
+    size = len(df) // max(1, folds)
+    for k in range(folds):
+        lo = k * size
+        hi = len(df) if k == folds - 1 else (k + 1) * size
+        segment = df.iloc[max(0, lo - WARMUP_BARS):hi]
+        try:
+            res = run_backtest(segment, strategy, params, risk, filter_cfg, extras, WARMUP_BARS)
+        except BacktestError:
+            rows.append({"Segment": k + 1, "From": df.index[lo], "To": df.index[hi - 1],
+                         "Trades": 0, "Win %": 0.0, "Net PnL": 0.0, "Sharpe": 0.0,
+                         "Note": "too few candles"})
+            continue
+        st_ = res.stats
+        rows.append({"Segment": k + 1, "From": df.index[lo], "To": df.index[hi - 1],
+                     "Trades": st_["total_trades"], "Win %": st_["win_rate"],
+                     "Net PnL": st_["net_pnl"], "Sharpe": st_["sharpe"], "Note": ""})
+    return pd.DataFrame(rows)
+
+
+# --------------------------------------------------------------------------- #
+# STRATEGY OPTIMISER
+# --------------------------------------------------------------------------- #
+# Excluded from the search: Simple Buy, Simple Sell and both threshold profiles.
+# They are execution helpers, not edges -- optimising them would just be fitting
+# noise to whichever direction the sample happened to drift.
+_OPTIMISER_EXCLUDE = ("16 \u00b7", "17 \u00b7", "28 \u00b7", "29 \u00b7")
+
+OPTIMISER_OBJECTIVES = ["Win rate (accuracy)", "Sharpe ratio", "Net PnL", "Expectancy per trade",
+                        "Profit factor"]
+
+_OPT_SL_GRID = [("Fixed Percentage", 0.5), ("Fixed Percentage", 1.0), ("Fixed Points", 20.0),
+                ("Fixed Points", 40.0), ("ATR Multiple", 1.5), ("ATR Multiple", 2.5),
+                ("Trail Current Swing Low/High", 0.0), ("Trail Previous Candle Low/High", 0.0),
+                ("Trailing ATR (Chandelier)", 3.0)]
+_OPT_TP_GRID = [("Fixed Percentage", 1.0), ("Fixed Percentage", 2.0), ("Fixed Points", 40.0),
+                ("Fixed Points", 80.0), ("ATR Multiple", 3.0),
+                ("Risk : Reward Multiple", 1.5), ("Risk : Reward Multiple", 2.5),
+                ("Trail Current Swing High/Low", 0.0)]
+_OPT_FILTERS = [None, "adx", "rsi", "ema20", "supertrend", "macd", "regime"]
+
+
+def _objective_value(stats: dict, objective: str) -> float:
+    return {"Win rate (accuracy)": stats["win_rate"], "Sharpe ratio": stats["sharpe"],
+            "Net PnL": stats["net_pnl"], "Expectancy per trade": stats["expectancy"],
+            "Profit factor": 0.0 if stats["profit_factor"] == float("inf")
+            else stats["profit_factor"]}.get(objective, 0.0)
+
+
+def optimise(df: pd.DataFrame, base_params: dict, quantity: float, costs: CostModel,
+             objective: str, min_trades: int, iterations: int, seed: int = 11,
+             safe_exits_only: bool = True, progress=None) -> pd.DataFrame:
+    """
+    Randomised search over strategy x stop x target x one optional filter.
+
+    Randomised rather than exhaustive because the full grid is tens of thousands
+    of backtests. And a caution that matters more than the search itself: the
+    more combinations tried, the more likely the winner is luck. Treat the
+    ranking as a shortlist to validate out of sample, never as a result.
+    """
+    rng = np.random.default_rng(seed)
+    names = [n for n in STRATEGY_NAMES if not n.startswith(_OPTIMISER_EXCLUDE)]
+    sl_grid = [x for x in _OPT_SL_GRID
+               if not (safe_exits_only and x[0] in DISTANCE_TRAIL_TYPES)]
+    rows, seen = [], set()
+
+    for it in range(int(iterations)):
+        if progress is not None and it % 5 == 0:
+            progress.progress(min(1.0, (it + 1) / iterations), text=f"Tested {it} combinations ...")
+        strategy = names[int(rng.integers(len(names)))]
+        sl_type, sl_val = sl_grid[int(rng.integers(len(sl_grid)))]
+        tp_type, tp_val = _OPT_TP_GRID[int(rng.integers(len(_OPT_TP_GRID)))]
+        filt = _OPT_FILTERS[int(rng.integers(len(_OPT_FILTERS)))]
+        key = (strategy, sl_type, sl_val, tp_type, tp_val, filt)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        fcfg = default_filter_config()
+        if filt:
+            fcfg[filt]["enabled"] = True
+        risk = RiskConfig(sl_type, sl_val, tp_type, tp_val, quantity, costs=costs)
+        try:
+            res = run_backtest(df, strategy, dict(base_params), risk, fcfg, {}, WARMUP_BARS)
+        except (BacktestError, MarketDataError, Exception):          # noqa: BLE001
+            continue
+        st_ = res.stats
+        if st_["total_trades"] < min_trades:
+            continue
+        rows.append({
+            "Strategy": strategy, "Stop-Loss": sl_type,
+            "SL Value": sl_val if sl_type not in _SL_NO_VALUE else None,
+            "Target": tp_type, "TP Value": tp_val if tp_type not in _TP_NO_VALUE else None,
+            "Filter": FILTER_LABELS.get(filt, "none"), "Trades": st_["total_trades"],
+            "Win %": st_["win_rate"], "Sharpe": st_["sharpe"], "Net PnL": st_["net_pnl"],
+            "Expectancy": st_["expectancy"], "Profit Factor": st_["profit_factor"],
+            "Max DD": st_["max_drawdown"], "Reliability": st_["reliability"],
+            "Score": _objective_value(st_, objective),
+        })
+
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        return frame
+    frame = frame.sort_values("Score", ascending=False).reset_index(drop=True)
+    frame.insert(0, "Rank", range(1, len(frame) + 1))
+    return frame
+
+
+# --------------------------------------------------------------------------- #
+# CHART PATTERNS
+# --------------------------------------------------------------------------- #
+def detect_patterns(df: pd.DataFrame, zigzag_pct: float = 0.6) -> list[dict]:
+    """
+    Classic chart patterns from confirmed zigzag pivots plus candle geometry.
+
+    Every pattern is a rule-of-thumb approximation with tolerances chosen by
+    hand. Two analysts would disagree about half of these; treat a hit as
+    "worth a look", never as a verdict.
+    """
+    out: list[dict] = []
+    piv = zigzag_pivot_table(df["Close"], zigzag_pct)
+    n = len(df)
+    if n < 20:
+        return out
+
+    def add(name, bias, idx, note):
+        out.append({"Pattern": name, "Bias": bias, "At": df.index[min(idx, n - 1)], "Note": note})
+
+    # ---- pivot-based structures ----
+    if len(piv) >= 4:
+        (_, a, ka, _), (_, b, kb, _), (_, c, kc, _), (_, d, kd, ci) = piv[-4:]
+        if (ka, kb, kc, kd) == (1, -1, 1, -1) and abs(a - c) / max(a, 1e-9) < 0.02:
+            add("Double Top", "Bearish", ci, f"Two highs within 2%: {fmt(a)} / {fmt(c)}")
+        if (ka, kb, kc, kd) == (-1, 1, -1, 1) and abs(a - c) / max(a, 1e-9) < 0.02:
+            add("Double Bottom", "Bullish", ci, f"Two lows within 2%: {fmt(a)} / {fmt(c)}")
+    if len(piv) >= 5:
+        highs = [(v, i) for _, v, k, i in piv[-5:] if k == 1]
+        lows = [(v, i) for _, v, k, i in piv[-5:] if k == -1]
+        if len(highs) >= 3:
+            h1, h2, h3 = highs[-3][0], highs[-2][0], highs[-1][0]
+            if h2 > h1 and h2 > h3 and abs(h1 - h3) / max(h1, 1e-9) < 0.03:
+                add("Head & Shoulders", "Bearish", highs[-1][1],
+                    f"Head {fmt(h2)} between shoulders {fmt(h1)} / {fmt(h3)}")
+        if len(lows) >= 3:
+            l1, l2, l3 = lows[-3][0], lows[-2][0], lows[-1][0]
+            if l2 < l1 and l2 < l3 and abs(l1 - l3) / max(l1, 1e-9) < 0.03:
+                add("Inverse Head & Shoulders", "Bullish", lows[-1][1],
+                    f"Head {fmt(l2)} between shoulders {fmt(l1)} / {fmt(l3)}")
+        hs = [v for _, v, k, _ in piv[-5:] if k == 1]
+        ls = [v for _, v, k, _ in piv[-5:] if k == -1]
+        if len(hs) >= 2 and len(ls) >= 2:
+            if hs[-1] < hs[-2] and ls[-1] > ls[-2]:
+                add("Symmetrical Triangle", "Neutral", n - 1, "Lower highs into higher lows")
+            elif abs(hs[-1] - hs[-2]) / max(hs[-2], 1e-9) < 0.01 and ls[-1] > ls[-2]:
+                add("Ascending Triangle", "Bullish", n - 1, "Flat highs, rising lows")
+            elif abs(ls[-1] - ls[-2]) / max(ls[-2], 1e-9) < 0.01 and hs[-1] < hs[-2]:
+                add("Descending Triangle", "Bearish", n - 1, "Flat lows, falling highs")
+
+    # ---- recent candle geometry ----
+    tail = df.tail(6)
+    o, h, l_, c = (tail["Open"], tail["High"], tail["Low"], tail["Close"])
+    body = (c - o).abs()
+    rng = (h - l_).replace(0.0, np.nan)
+    lower = tail[["Open", "Close"]].min(axis=1) - l_
+    upper = h - tail[["Open", "Close"]].max(axis=1)
+    for i in range(1, len(tail)):
+        if body.iloc[i] > 0 and lower.iloc[i] >= 2 * body.iloc[i] and \
+                (lower.iloc[i] / rng.iloc[i]) > 0.5:
+            add("Hammer / Pin Bar", "Bullish", n - len(tail) + i, "Long lower rejection wick")
+        if body.iloc[i] > 0 and upper.iloc[i] >= 2 * body.iloc[i] and \
+                (upper.iloc[i] / rng.iloc[i]) > 0.5:
+            add("Shooting Star", "Bearish", n - len(tail) + i, "Long upper rejection wick")
+        if c.iloc[i] > o.iloc[i] and c.iloc[i - 1] < o.iloc[i - 1] and \
+                c.iloc[i] >= o.iloc[i - 1] and o.iloc[i] <= c.iloc[i - 1]:
+            add("Bullish Engulfing", "Bullish", n - len(tail) + i, "Body engulfs the prior candle")
+        if c.iloc[i] < o.iloc[i] and c.iloc[i - 1] > o.iloc[i - 1] and \
+                c.iloc[i] <= o.iloc[i - 1] and o.iloc[i] >= c.iloc[i - 1]:
+            add("Bearish Engulfing", "Bearish", n - len(tail) + i, "Body engulfs the prior candle")
+        if h.iloc[i] < h.iloc[i - 1] and l_.iloc[i] > l_.iloc[i - 1]:
+            add("Inside Bar", "Neutral", n - len(tail) + i, "Coil inside the prior range")
+    return out
 
 
 if __name__ == "__main__":
