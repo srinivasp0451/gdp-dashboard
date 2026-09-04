@@ -622,21 +622,54 @@ def adx(df, period=14):
     return dx.ewm(alpha=1 / period, adjust=False).mean()
 
 
+def vwap_basis(df):
+    """
+    Whether a genuine VOLUME-weighted VWAP is possible on this data.
+
+    Cash indices (Nifty, BankNifty, Sensex) have no traded volume of their own
+    — an index is a calculation, not an instrument. Feeds handle this
+    inconsistently: some report 0, some report the summed constituent volume,
+    some omit the column. Returns "volume" when volume is genuinely present,
+    otherwise "typical" — in which case what is computed is a session-anchored
+    average of the typical price, i.e. VWAP with equal weights. That is a
+    reasonable reference line, but it is NOT the same thing as VWAP and must
+    not be presented as if it were.
+    """
+    if "Volume" not in df.columns:
+        return "typical"
+    v = pd.to_numeric(df["Volume"], errors="coerce").fillna(0.0)
+    if v.sum() <= 0 or (v > 0).mean() < 0.5:
+        return "typical"
+    return "volume"
+
+
 def vwap(df):
     """Session-anchored VWAP (TradingView convention): the cumulative
-    typical-price×volume / volume RESETS at the start of each trading day,
-    so gap-up/gap-down opens start a fresh session anchor exactly like TV's
-    built-in VWAP. Falls back to a whole-window cumulative VWAP if the index
-    isn't date-aware (shouldn't happen with yfinance/Dhan data)."""
+    typical-price×volume / volume RESETS at the start of each trading day, so
+    a gap open starts a fresh anchor exactly like TV's built-in VWAP.
+
+    When the feed carries no usable volume (typical for cash indices) this
+    degrades to a session-anchored TYPICAL-PRICE average rather than returning
+    NaN — see vwap_basis(), which tells the UI which of the two it is getting
+    so the label can be accurate."""
     tp = (df["High"] + df["Low"] + df["Close"]) / 3
-    pv = tp * df["Volume"]
+    basis = vwap_basis(df)
     try:
         day = pd.Index(df.index).normalize()
-        cum_pv = pv.groupby(day).cumsum()
-        cum_v = df["Volume"].groupby(day).cumsum()
-        return cum_pv / cum_v.replace(0, np.nan)
+        if basis == "volume":
+            v = pd.to_numeric(df["Volume"], errors="coerce").fillna(0.0)
+            cum_pv = (tp * v).groupby(day).cumsum()
+            cum_v = v.groupby(day).cumsum()
+            out = cum_pv / cum_v.replace(0, np.nan)
+            # Any early-session bars with zero cumulative volume fall back to
+            # the running typical price so the line starts at the open.
+            return out.fillna(tp.groupby(day).expanding().mean().reset_index(level=0, drop=True))
+        return tp.groupby(day).expanding().mean().reset_index(level=0, drop=True)
     except Exception:
-        return pv.cumsum() / df["Volume"].cumsum().replace(0, np.nan)
+        if basis == "volume":
+            v = pd.to_numeric(df["Volume"], errors="coerce").fillna(0.0)
+            return (tp * v).cumsum() / v.cumsum().replace(0, np.nan)
+        return tp.expanding().mean()
 
 
 def supertrend(df, period=10, mult=3):
@@ -4623,6 +4656,39 @@ def trade_history_fragment():
 ZERO_HERO_STRATEGY = "Zero Hero (Expiry Day OTM Momentum)"
 
 
+def entries_taken_today(strategy=None):
+    """
+    How many positions were ACTUALLY OPENED today.
+
+    Deliberately distinct from "how many bars met the conditions". The live
+    engine only ever acts on the latest closed bar, so a qualifying bar from
+    earlier in the session — before monitoring was started, or between manual
+    Run Once clicks — was never tradeable. Counting those as "entries used"
+    made the status board claim trades that do not exist in the history, and
+    would eventually block real entries against a cap that nothing had
+    consumed.
+    """
+    today = ist_now().date()
+    n = 0
+    for row in st.session_state.get("live_history", []) or []:
+        try:
+            et = row.get("Entry Time")
+            d = et.date() if hasattr(et, "date") else pd.to_datetime(et).date()
+            if d == today and not str(row.get("Exit Reason", "")).startswith("Partial Book"):
+                n += 1
+        except Exception:
+            continue
+    for pos in st.session_state.get("live_positions", []) or []:
+        try:
+            et = pos.get("entry_time")
+            d = et.date() if hasattr(et, "date") else pd.to_datetime(et).date()
+            if d == today:
+                n += 1
+        except Exception:
+            continue
+    return n
+
+
 def _zero_hero_expiry_mask(index, params):
     """
     Which bars fall on an expiry day.
@@ -4779,11 +4845,16 @@ def zero_hero_state(df, params):
             fired = long_ok | short_ok
             rank = fired.groupby(day).cumsum()
             allowed = fired & (rank <= max_per_day)
-            # How many entries the CURRENT day has already used, for the board.
+            # Bars in TODAY'S loaded candles that met every condition. This is
+            # a historical count, not a record of trades: most of these bars
+            # occurred before monitoring was running and were never tradeable.
             last_day = day[-1]
             same_day = pd.Series(day == last_day, index=idx)
-            out["used_today"] = int((allowed & same_day).sum())
-            out["cap_blocked"] = bool(fired.iloc[-1] and not allowed.iloc[-1])
+            out["qualifying_bars_today"] = int((allowed & same_day).sum())
+            # The cap is about REAL trades, so it is measured against positions
+            # actually opened today.
+            out["used_today"] = entries_taken_today()
+            out["cap_blocked"] = bool(fired.iloc[-1] and out["used_today"] >= max_per_day)
             long_ok = long_ok & allowed
             short_ok = short_ok & allowed
         except Exception:
@@ -7359,6 +7430,12 @@ def render_config_controls(ui, prefix="sb"):
                                              20, 2, 300, is_int=True, prefix=prefix)
         params["zh_use_vwap"] = cfg_checkbox(ui, "Require agreement with session VWAP", "zh_use_vwap",
                                              True, prefix=prefix)
+        if params["zh_use_vwap"]:
+            ui.caption("Note on indices: a cash index has no traded volume of its own, so a true volume-weighted "
+                       "VWAP is not always possible. When the feed carries usable volume it is used; when it does "
+                       "not, this becomes a session-anchored average of the typical price (VWAP with equal "
+                       "weights). The status board states which one you are looking at rather than labelling both "
+                       "'VWAP'.")
         ui.markdown("**📊 Option-chain confirmation** (both OFF by default)")
         params["zh_use_oi_change"] = cfg_checkbox(ui, "Require ΔOI confirmation (unwinding / short covering)",
                                                   "zh_use_oi_change", False, prefix=prefix)
@@ -8763,8 +8840,15 @@ def describe_signal_status(df, strategy, params, filters):
             else:
                 lines.append("   3. Breakout range: not formed yet for this session.")
             if params.get("zh_use_vwap", True) and pd.notna(zh["vwap"].iloc[_i]):
-                lines.append(f"   4. VWAP {float(zh['vwap'].iloc[_i]):.2f}: LONG {_mark(zh['vwap_up'].iloc[_i])} · "
-                             f"SHORT {_mark(zh['vwap_dn'].iloc[_i])}")
+                _vb = vwap_basis(df)
+                _vlabel = ("VWAP (volume-weighted)" if _vb == "volume"
+                           else "Session typical-price average (no volume on this feed)")
+                lines.append(f"   4. {_vlabel} {float(zh['vwap'].iloc[_i]):.2f}: "
+                             f"LONG {_mark(zh['vwap_up'].iloc[_i])} · SHORT {_mark(zh['vwap_dn'].iloc[_i])}")
+                if _vb != "volume":
+                    lines.append("        ↳ A cash index has no traded volume of its own, so a true VWAP is not "
+                                 "possible here. This line is the session-anchored average of the typical price "
+                                 "(VWAP with equal weights) — a fair reference, but not the same statistic.")
             _tv = zh["thrust_val"].iloc[_i]
             if pd.notna(_tv):
                 lines.append(f"   5. Thrust {float(_tv):+.2f}× ATR over {int(params.get('zh_thrust_bars', 3))} bars "
@@ -8793,13 +8877,20 @@ def describe_signal_status(df, strategy, params, filters):
                 lines.append(f"   7. Fresh trigger: {_mark(_fresh)}"
                              + (f" (cooldown {_cool} bars)" if _cool else ""))
             _used, _cap = int(zh.get("used_today", 0)), int(zh.get("max_per_day", 0))
+            _qbars = int(zh.get("qualifying_bars_today", 0))
             if _cap > 0:
                 _cap_left = max(0, _cap - _used)
-                lines.append(f"   8. Daily entry cap: {_used}/{_cap} used today — "
+                lines.append(f"   8. Daily entry cap: **{_used} position(s) actually opened today** of {_cap} — "
                              + ("❌ cap reached, no further entries today" if zh.get("cap_blocked") or _cap_left == 0
                                 else f"✅ {_cap_left} remaining"))
             else:
                 lines.append("   8. Daily entry cap: disabled (unlimited entries)")
+            if _qbars:
+                lines.append(f"   ℹ️ {_qbars} bar(s) in today's loaded candles met every condition, but only "
+                             f"{_used} position(s) were opened. The live engine acts ONLY on the latest closed "
+                             "bar, so a qualifying bar from earlier in the session — before monitoring was "
+                             "started, or between manual **Run Once** clicks — was never tradeable and produces "
+                             "no trade-history row. Use **Run Continuously** to act on signals as they form.")
 
             # ---- condition 9: optional option-chain confirmation ----
             _chain_on = bool(params.get("zh_use_oi_change") or params.get("zh_use_pcr")
@@ -9074,7 +9165,9 @@ def describe_signal_status(df, strategy, params, filters):
             else:
                 b_ok, s_ok = c_now > v_val + buf, c_now < v_val - buf
                 rule = "trend: buys ABOVE VWAP, sells BELOW"
-            lines.append(f"VWAP filter: session VWAP {v_val:.2f} vs price {c_now:.2f} ({c_now - v_val:+.2f}"
+            _vb2 = vwap_basis(df)
+            _vn2 = "session VWAP" if _vb2 == "volume" else "session typical-price average (no volume on this feed)"
+            lines.append(f"VWAP filter: {_vn2} {v_val:.2f} vs price {c_now:.2f} ({c_now - v_val:+.2f}"
                          + (f", buffer {buf:.2f}" if buf else "") + f") · {rule} → "
                          f"BUYs {'✅' if b_ok else '❌'} · SELLs {'✅' if s_ok else '❌'}.")
         else:
@@ -10397,7 +10490,8 @@ with tab_live:
             c5.metric("Highest", f"{pos['highest']:.2f}")
             c6.metric("Lowest", f"{pos['lowest']:.2f}")
             c7.metric("Remaining Qty", f"{pos['remaining_qty']}/{pos['original_qty']}")
-            if pos.get("zh_premium_stop") or pos.get("opt_entry_premium"):
+            if pos.get("trade_instrument") == "OPTION" or pos.get("zh_premium_stop") \
+                    or pos.get("opt_entry_premium"):
                 # For Zero Hero the REAL exits live on the premium, so show them
                 # next to the underlying levels rather than leaving the user to
                 # infer the trade from index points that are only a backstop.
@@ -10412,10 +10506,27 @@ with tab_live:
                 p1.metric(f"{pos.get('opt_leg', 'Option')} Premium Paid", f"₹{_ep:.2f}" if _ep else "n/a")
                 p2.metric("Premium Now", f"₹{_cur:.2f}" if _cur else "n/a",
                           f"{(_cur - _ep):+.2f}" if (_cur and _ep) else None)
-                p3.metric("Premium Stop", f"₹{pos['zh_premium_stop']:.2f}" if pos.get("zh_premium_stop") else "n/a")
-                p4.metric("Premium Target", f"₹{pos['zh_premium_target']:.2f}" if pos.get("zh_premium_target") else "n/a")
-                st.caption("🎟 These premium levels are the ACTIVE exits for this trade; the underlying SL/Target "
-                           "above are only a wide catastrophic backstop.")
+                # For a premium-tracked position the position's OWN sl/target
+                # already are the premium levels. Zero Hero also stores them
+                # under its own keys, so fall back to those. Reading only the
+                # Zero Hero keys would have left chain-strategy option trades
+                # showing "n/a" for their actual working exits.
+                _psl = (pos.get("sl") if pos.get("trade_instrument") == "OPTION"
+                        else None) or pos.get("zh_premium_stop")
+                _ptg = (pos.get("target") if pos.get("trade_instrument") == "OPTION"
+                        else None) or pos.get("zh_premium_target")
+                p3.metric("Premium Stop", f"₹{float(_psl):.2f}" if _psl else "n/a")
+                p4.metric("Premium Target", f"₹{float(_ptg):.2f}" if _ptg else "n/a")
+                if _cur and _ep:
+                    _pl_pts = _cur - _ep
+                    _qty = float(pos.get("remaining_qty", 0) or 0)
+                    st.metric("Open P&L (premium)", f"{_pl_pts:+,.2f} pts",
+                              f"₹{_pl_pts * _qty:+,.2f} on {int(_qty)} qty")
+                st.caption(f"🎟 This position is tracked on the **{pos.get('opt_leg', 'option')} premium** — the "
+                           "instrument actually bought. The levels above are the ACTIVE exits; any underlying "
+                           "SL/Target shown earlier is only a wide catastrophic backstop."
+                           + (f"  Underlying was {pos['underlying_entry']:,.2f} at entry."
+                              if pos.get("underlying_entry") else ""))
         else:
             st.caption("No open paper position.")
 
