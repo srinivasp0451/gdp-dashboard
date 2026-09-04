@@ -6697,7 +6697,7 @@ def resume_overnight_position(cfg, pos, ticker, strategy):
         points = (fill - pos["entry_price"]) * direction
         row = {
             "Entry Time": pos.get("entry_time"), "Entry Price": round(float(pos["entry_price"]), 2),
-            "Direction": "LONG" if int(pos.get("direction", 1)) == 1 else "SHORT",
+            "Direction": position_direction_label(pos),
             "Exit Time": ist_now(), "Exit Price": round(fill, 2),
             "SL": round(float(sl), 2) if sl is not None else None,
             "Target": round(float(tgt), 2) if tgt is not None else None,
@@ -9220,6 +9220,37 @@ def _options_active(full_cfg):
         and pc.get("ce_security_id") and pc.get("pe_security_id")
 
 
+def position_direction_label(pos):
+    """
+    What to show in the Direction column.
+
+    "SHORT" on a bought put is actively misleading: nothing was sold, a PE was
+    BOUGHT, and the position is long that premium. Option trades are therefore
+    labelled by the leg and the view, e.g. "BUY PE (short view)".
+    """
+    pos = pos or {}
+    sig_dir = int(pos.get("direction", 1))
+    if pos.get("trade_instrument") == "OPTION":
+        leg = pos.get("opt_leg") or ("CE" if sig_dir == 1 else "PE")
+        return f"BUY {leg} ({'long' if sig_dir == 1 else 'short'} view)"
+    return "LONG" if sig_dir == 1 else "SHORT"
+
+
+def position_pl_direction(pos):
+    """
+    The direction P&L must be measured in.
+
+    A bought option is ALWAYS long its own premium: buying a PE on a SHORT
+    signal still profits when the PE's premium rises. Using the signal
+    direction (-1) there would invert the sign and report every winning put as
+    a loss. Underlying positions keep the signal direction, where -1 correctly
+    means "profits when price falls".
+    """
+    if (pos or {}).get("trade_instrument") == "OPTION":
+        return 1
+    return int((pos or {}).get("direction", 1))
+
+
 def option_trade_active(full_cfg):
     """
     True when the POSITION ITSELF should be tracked on the option premium.
@@ -9238,6 +9269,59 @@ def option_trade_active(full_cfg):
     return bool(pc.get("ce_security_id") and pc.get("pe_security_id")
                 and (pc.get("options_mode") or pc.get("chain_strategy_mode")
                      or pc.get("zero_hero_mode") or "Options" in str(pc.get("instrument", ""))))
+
+
+def options_intent_active(full_cfg, strategy=None):
+    """
+    Whether the USER has asked to trade options — regardless of whether the
+    contract has resolved yet.
+
+    This is deliberately separate from option_trade_active(). That one asks
+    "can we price the option right now?"; this one asks "did the user ask for
+    options at all?". The distinction matters because when the answer here is
+    yes but the contract cannot be resolved, the correct response is to BLOCK
+    the entry — not to quietly open a position on the underlying. Silently
+    falling through is how a SHORT signal ended up SHORTING the stock itself,
+    when an options trader shorting a view means BUYING A PUT.
+    """
+    cfg = full_cfg or {}
+    if cfg.get("options_mode") or cfg.get("premium_mode"):
+        return True
+    strategy = strategy or cfg.get("strategy")
+    if strategy in OPTION_CHAIN_STRATEGIES or strategy == ZERO_HERO_STRATEGY:
+        return True
+    pc = cfg.get("product_cfg") or {}
+    return bool(pc.get("options_mode") or pc.get("chain_strategy_mode")
+                or pc.get("zero_hero_mode") or "Options" in str(pc.get("instrument", "")))
+
+
+def option_entry_blocker(full_cfg, direction, strategy=None):
+    """
+    Why an options entry cannot proceed, or None when it can.
+
+    Returns a specific, actionable reason rather than a generic failure, since
+    each cause has a different fix.
+    """
+    if not options_intent_active(full_cfg, strategy):
+        return None
+    if not (full_cfg or {}).get("trade_on_premium", True):
+        return None          # user explicitly chose to trade the underlying
+    pc = (full_cfg or {}).get("product_cfg") or {}
+    leg = "CE" if direction == 1 else "PE"
+    sec = pc.get("ce_security_id") if direction == 1 else pc.get("pe_security_id")
+    if not sec:
+        return (f"the {leg} contract has not resolved yet — its Security ID is empty. Check the expiry and "
+                "strike in the sidebar; the scrip-master lookup fills these automatically once they are valid.")
+    _, token = _dhan_creds()
+    if not str(token or "").strip():
+        return ("option premiums come from Dhan and there is no Access Token set. Option prices are not "
+                "available from yfinance at all, so an options position cannot be priced — not even on paper. "
+                "Add the token under 🔐 Dhan Account.")
+    prem = dhan_get_ltp(sec, pc.get("exchange_segment", "NSE_FNO"))
+    if prem is None or float(prem) <= 0:
+        return (f"the live premium for the {leg} leg (security {sec}) could not be read. This is usual outside "
+                "market hours, and can also mean the contract is illiquid or the expiry has passed.")
+    return None
 
 
 def option_leg_for(full_cfg, direction):
@@ -9469,12 +9553,12 @@ def evaluate_live_signal(ticker, interval, period, strategy, params, filters, sl
                 if pos["target_type"] == "Partial Book + Trail Remainder" and "Target Hit" in hard_reason and not pos["partial_booked"]:
                     book_qty = max(1, round(pos["original_qty"] * pos["partial_book_pct"] / 100.0))
                     book_qty = min(book_qty, pos["remaining_qty"])
-                    partial_points = (hard_price - pos["entry_price"]) * pos["direction"]
+                    partial_points = (hard_price - pos["entry_price"]) * position_pl_direction(pos)
                     exit_candle = sig_df.iloc[-1]
                     partial_reason = f"Partial Book ({book_qty}/{pos['original_qty']} qty @ Target 1)"
                     row = {
                         "Entry Time": pos["entry_time"], "Entry Price": round(pos["entry_price"], 2),
-                        "Direction": "LONG" if pos["direction"] == 1 else "SHORT",
+                        "Direction": position_direction_label(pos),
                         "Exit Time": sig_df.index[-1], "Exit Price": round(float(hard_price), 2),
                         "SL": round(pos["initial_sl"], 2), "Target": round(pos["initial_target"], 2),
                         "Highest": round(pos["highest"], 2), "Lowest": round(pos["lowest"], 2),
@@ -9549,7 +9633,7 @@ def evaluate_live_signal(ticker, interval, period, strategy, params, filters, sl
                 if full_cfg.get("email_enabled"):
                     email_trade_event(full_cfg, "Converted to Delivery", {
                         "Ticker": ticker, "Strategy": strategy,
-                        "Direction": "LONG" if pos["direction"] == 1 else "SHORT",
+                        "Direction": position_direction_label(pos),
                         "Entry Price": round(pos["entry_price"], 2),
                         "SL": round(pos["sl"], 2), "Target": round(pos["target"], 2),
                         "Qty": pos.get("remaining_qty"), "Note": _conv_msg,
@@ -9572,11 +9656,11 @@ def evaluate_live_signal(ticker, interval, period, strategy, params, filters, sl
             # restored position resumes with the correct risk, not stale levels.
             db_persist_position_state(ticker, strategy)
         if exited:
-            points = (exit_price - pos["entry_price"]) * pos["direction"]
+            points = (exit_price - pos["entry_price"]) * position_pl_direction(pos)
             exit_candle = sig_df.iloc[-1]
             row = {
                 "Entry Time": pos["entry_time"], "Entry Price": round(pos["entry_price"], 2),
-                "Direction": "LONG" if pos["direction"] == 1 else "SHORT",
+                "Direction": position_direction_label(pos),
                 "Exit Time": sig_df.index[-1], "Exit Price": round(float(exit_price), 2),
                 "SL": round(pos["initial_sl"], 2), "Target": round(pos["initial_target"], 2),
                 "Highest": round(pos["highest"], 2), "Lowest": round(pos["lowest"], 2),
@@ -9676,6 +9760,21 @@ def evaluate_live_signal(ticker, interval, period, strategy, params, filters, sl
             # the instrument actually bought, otherwise a 4× premium move shows
             # up as a handful of index points and an index-point stop fires on
             # noise that never touched the option.
+            _opt_block = option_entry_blocker(full_cfg, last_sig, strategy)
+            if _opt_block:
+                # Options were requested but cannot be priced. Opening on the
+                # underlying instead would be a different trade in a different
+                # instrument — and on a SHORT signal it would SHORT the stock,
+                # when an options trader expressing that view BUYS A PUT. So
+                # the entry is refused and the reason stated.
+                st.error(f"🚫 Options entry blocked — {_opt_block}\n\n"
+                         f"No position was opened. The underlying was NOT traded as a substitute: a "
+                         f"{'LONG' if last_sig == 1 else 'SHORT'} signal here means BUY "
+                         f"{'CE' if last_sig == 1 else 'PE'}, which is not the same trade as "
+                         f"{'buying' if last_sig == 1 else 'shorting'} {ticker}.")
+                st.session_state["live_blocked_reason"] = f"Options entry blocked — {_opt_block}"
+                return sig_df
+
             if option_trade_active(full_cfg):
                 _leg, _sec, _prem = option_leg_for(full_cfg, last_sig)
                 if _prem and _prem > 0:
@@ -9696,9 +9795,9 @@ def evaluate_live_signal(ticker, interval, period, strategy, params, filters, sl
                             f"target ₹{_otgt:.2f}. P&L is measured in premium points, not index points "
                             f"(index was {entry_price:,.2f} at entry).")
                 else:
-                    st.warning("🎟 This configuration trades the option leg, but the premium could not be read, so "
-                               "the position has been opened on the UNDERLYING instead. Check the Dhan token and "
-                               "that the CE/PE Security IDs are filled — otherwise SL/target are in index points.")
+                    st.error("🚫 The option premium became unavailable between the check and the entry, so no "
+                             "position was opened. Nothing was traded on the underlying as a substitute.")
+                    return sig_df
             if strategy == ZERO_HERO_STRATEGY:
                 _ep = new_pos.get("opt_entry_premium")
                 if _ep:
@@ -9726,7 +9825,7 @@ def evaluate_live_signal(ticker, interval, period, strategy, params, filters, sl
                     st.json(res)
                 email_trade_event(full_cfg, "Trade Entry", {
                     "Ticker": ticker, "Strategy": strategy,
-                    "Direction": "LONG" if last_sig == 1 else "SHORT",
+                    "Direction": position_direction_label(new_pos),
                     "Entry Price": round(entry_price, 2),
                     "SL": round(sl, 2), "Target": round(target, 2), "Qty": qty,
                     **({"Option Leg": new_pos.get("opt_leg"),
@@ -10132,10 +10231,10 @@ with tab_live:
         raw = fetch_data(ticker, interval, period)
         ltp_now = get_live_ltp(ticker)
         exit_price = ltp_now if ltp_now is not None else (float(raw["Close"].iloc[-1]) if not raw.empty else pos["current_price"])
-        points = (exit_price - pos["entry_price"]) * pos["direction"]
+        points = (exit_price - pos["entry_price"]) * position_pl_direction(pos)
         _sq_row = {
             "Entry Time": pos["entry_time"], "Entry Price": round(pos["entry_price"], 2),
-            "Direction": "LONG" if pos["direction"] == 1 else "SHORT",
+            "Direction": position_direction_label(pos),
             "Exit Time": datetime.now(), "Exit Price": round(exit_price, 2),
             "SL": round(pos["initial_sl"], 2), "Target": round(pos["initial_target"], 2),
             "Highest": round(pos["highest"], 2), "Lowest": round(pos["lowest"], 2),
