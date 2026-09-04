@@ -1482,12 +1482,17 @@ def dhan_get_option_chain(under_security_id, under_segment, expiry, _token_fp):
 
 
 def get_chain_snapshot(underlying_name, expiry=None):
-    """Fetch a chain snapshot for an EXPLICIT underlying/expiry. Used by the
-    Option Chain Analysis tab so it works regardless of which strategy is
-    selected in the sidebar."""
+    """
+    Snapshot for an explicit underlying name.
+
+    Legacy entry point kept for callers that pass a bare name. It accepts a
+    STOCK name too by delegating to the kind-aware resolver, so a stock never
+    silently returns None (or, worse, gets index expiries) just because it is
+    absent from DHAN_INDEX_MAP.
+    """
     meta = DHAN_INDEX_MAP.get(underlying_name)
     if not meta:
-        return None
+        return get_chain_snapshot_for(resolve_chain_underlying("Stock", underlying_name), expiry)
     _, token = _dhan_creds()
     if not token:
         return None
@@ -1524,28 +1529,49 @@ def get_zero_hero_snapshot(params=None):
     """
     store = st.session_state.app_cfg
     params = params or {}
-    und = (params.get("zh_underlying")
-           or store.get("zh_underlying")
-           or zero_hero_default_underlying())
+    d_kind, d_name = default_chain_underlying()
+    kind = params.get("zh_kind") or store.get("zh_kind") or d_kind
+    und = params.get("zh_underlying") or store.get("zh_underlying") or d_name
     exp = params.get("zh_expiry") or store.get("zh_expiry")
-    return get_chain_snapshot(und, exp)
+    return get_chain_snapshot_for(resolve_chain_underlying(kind, und), exp)
 
 
-def zero_hero_default_underlying():
-    """The Zero Hero underlying implied by the currently selected ticker, so
-    picking 'Sensex' in the sidebar defaults the strategy to the Sensex chain
-    rather than leaving it on Nifty50."""
+def default_chain_underlying():
+    """
+    (kind, name) implied by the ticker selection at the top of the sidebar.
+
+    Returns a STOCK when Options Trading is set to Stocks, so a strategy-level
+    underlying dropdown can offer the right instrument instead of silently
+    falling back to an index — which also meant index (weekly) expiries were
+    offered for what is a monthly stock-option chain.
+    """
     store = st.session_state.app_cfg
     tc = store.get("ticker_choice")
     if tc in DHAN_INDEX_MAP:
-        return tc
+        return "Index", tc
+    if tc == "Custom":
+        sym = _yf_symbol_to_plain(str(store.get("ticker_custom", "") or ""))
+        if sym:
+            return "Stock", sym
     if tc == "Options Trading":
         kind = store.get("opt_underlying_kind", "Index")
         if kind == "Index" and store.get("opt_index") in DHAN_INDEX_MAP:
-            return store["opt_index"]
-        if kind == "Premium" and store.get("prem_underlying") in DHAN_INDEX_MAP:
-            return store["prem_underlying"]
-    return "Nifty50"
+            return "Index", store["opt_index"]
+        if kind == "Stocks" and str(store.get("opt_stock", "") or "").strip():
+            return "Stock", _yf_symbol_to_plain(str(store["opt_stock"]).strip())
+        if kind == "Premium":
+            pu = store.get("prem_underlying")
+            if pu in DHAN_INDEX_MAP:
+                return "Index", pu
+            if pu == "Custom Stock" and str(store.get("prem_stock", "") or "").strip():
+                return "Stock", _yf_symbol_to_plain(str(store["prem_stock"]).strip())
+    return "Index", "Nifty50"
+
+
+def zero_hero_default_underlying():
+    """Backwards-compatible name — the underlying only (see
+    default_chain_underlying for the kind as well)."""
+    return default_chain_underlying()[1]
 
 
 def evaluate_oi_signal(params, snap):
@@ -7014,16 +7040,29 @@ def render_config_controls(ui, prefix="sb"):
                    "Impulse-only restricts entries to swings that continue the structure.")
     if strategy in OPTION_CHAIN_STRATEGIES:
         # ---- shared chain source (all option-chain strategies use this) ----
+        _oi_auto_kind, _oi_auto_name = default_chain_underlying()
+        _oi_sig = (ticker_choice, store.get("opt_underlying_kind"), store.get("opt_index"),
+                   store.get("opt_stock"), store.get("prem_underlying"))
+        if store.get("_oi_ticker_sig") != _oi_sig:
+            cfg_force("oi_kind", _oi_auto_kind)
+            if _oi_auto_kind == "Index":
+                cfg_force("oi_underlying", _oi_auto_name)
+            else:
+                cfg_force("oi_stock", _oi_auto_name)
+            store["_oi_ticker_sig"] = _oi_sig
         params["oi_kind"] = cfg_selectbox(ui, "Underlying type", "oi_kind", ["Index", "Stock"],
-                                          default="Index", prefix=prefix)
+                                          default=_oi_auto_kind, prefix=prefix)
         if params["oi_kind"] == "Index":
-            params["oi_underlying"] = cfg_selectbox(ui, "Option Chain Underlying", "oi_underlying",
-                                                    list(DHAN_INDEX_MAP.keys()), default="Nifty50", prefix=prefix)
+            params["oi_underlying"] = cfg_selectbox(
+                ui, "Option Chain Underlying", "oi_underlying", list(DHAN_INDEX_MAP.keys()),
+                default=_oi_auto_name if _oi_auto_kind == "Index" else "Nifty50", prefix=prefix)
         else:
-            params["oi_underlying"] = cfg_text(ui, "Stock symbol (NSE F&O, e.g. RELIANCE)",
-                                               "oi_stock", "RELIANCE", prefix=prefix)
+            params["oi_underlying"] = cfg_text(
+                ui, "Stock symbol (NSE F&O, e.g. RELIANCE)", "oi_stock",
+                _oi_auto_name if _oi_auto_kind == "Stock" else "RELIANCE", prefix=prefix)
             ui.caption("Only stocks with listed options work here — the chain endpoint returns nothing for "
-                       "non-F&O symbols.")
+                       "non-F&O symbols. Stock options are usually MONTHLY, so the expiry list will show "
+                       "month-ends rather than weekly dates.")
         _oi_info = resolve_chain_underlying(params["oi_kind"], params["oi_underlying"])
         if not _oi_info:
             ui.warning(f"Could not resolve '{params['oi_underlying']}' in Dhan's scrip master.")
@@ -7210,22 +7249,43 @@ def render_config_controls(ui, prefix="sb"):
                    "zero-hero trading as 'high accuracy' is mis-selling it. Size every entry as money you are "
                    "willing to lose in full, and validate on the Backtest and Optimization tabs first.")
 
-        # Follow the sidebar ticker automatically: choosing Sensex should price
-        # the Sensex chain, not leave the strategy on a Nifty default. Still
-        # user-editable — the auto-set only fires when the ticker changes.
-        _zh_auto = zero_hero_default_underlying()
-        if store.get("_zh_ticker_sig") != ticker_choice:
-            cfg_force("zh_underlying", _zh_auto)
-            store["_zh_ticker_sig"] = ticker_choice
-        _zh_u = cfg_selectbox(ui, "Underlying", "zh_underlying", list(DHAN_INDEX_MAP.keys()),
-                              default=_zh_auto, prefix=prefix)
-        if ticker_choice in DHAN_INDEX_MAP and _zh_u != ticker_choice:
-            ui.warning(f"⚠️ The sidebar ticker is **{ticker_choice}** but this strategy is set to trade the "
-                       f"**{_zh_u}** option chain. Signals would be computed on {ticker_choice} while the contract "
-                       f"came from {_zh_u} — set both to the same index unless you mean to do this.")
+        # Follow the ticker selection automatically, INCLUDING its kind: with
+        # Options Trading → Stocks the strategy must offer a stock underlying
+        # and stock (monthly) expiries, not an index list.
+        _zh_auto_kind, _zh_auto_name = default_chain_underlying()
+        _sig_tuple = (ticker_choice, store.get("opt_underlying_kind"), store.get("opt_index"),
+                      store.get("opt_stock"), store.get("prem_underlying"))
+        if store.get("_zh_ticker_sig") != _sig_tuple:
+            cfg_force("zh_kind", _zh_auto_kind)
+            if _zh_auto_kind == "Index":
+                cfg_force("zh_underlying", _zh_auto_name)
+            else:
+                cfg_force("zh_stock", _zh_auto_name)
+            store["_zh_ticker_sig"] = _sig_tuple
+
+        _zh_kind = cfg_selectbox(ui, "Underlying type", "zh_kind", ["Index", "Stock"],
+                                 default=_zh_auto_kind, prefix=prefix)
+        if _zh_kind == "Index":
+            _zh_u = cfg_selectbox(ui, "Underlying", "zh_underlying", list(DHAN_INDEX_MAP.keys()),
+                                  default=_zh_auto_name if _zh_auto_kind == "Index" else "Nifty50",
+                                  prefix=prefix)
+        else:
+            _zh_u = cfg_text(ui, "Underlying stock (NSE F&O, e.g. RELIANCE)", "zh_stock",
+                             _zh_auto_name if _zh_auto_kind == "Stock" else "RELIANCE", prefix=prefix)
+            ui.caption("Stock options are usually MONTHLY, so the expiry list below will show month-ends rather "
+                       "than weekly dates. Only F&O stocks have chains at all.")
+        params["zh_kind"] = _zh_kind
+        _zh_uinfo = resolve_chain_underlying(_zh_kind, _zh_u)
+        if not _zh_uinfo:
+            ui.warning(f"Could not resolve '{_zh_u}' in Dhan's scrip master — check the symbol, and note that "
+                       "only stocks with listed options have a chain.")
+        if (_zh_kind, _zh_u) != (_zh_auto_kind, _zh_auto_name):
+            ui.warning(f"⚠️ The ticker selection implies **{_zh_auto_kind}: {_zh_auto_name}**, but this strategy is "
+                       f"set to **{_zh_kind}: {_zh_u}**. Signals would be computed on one instrument while the "
+                       "contract came from another — align them unless that is deliberate.")
         params["zh_underlying"] = _zh_u
-        _zh_meta = DHAN_INDEX_MAP[_zh_u]
-        _zh_exps = dhan_get_expiries(_zh_meta["underlying"], "OPTIDX", _zh_meta["exchange"])
+        _zh_exps = (dhan_get_expiries(_zh_uinfo["underlying"], _zh_uinfo["opt_instrument"],
+                                      _zh_uinfo["exchange"]) if _zh_uinfo else [])
         if _zh_exps:
             params["zh_expiry"] = cfg_selectbox(ui, "Expiry (nearest pre-selected)", "zh_expiry",
                                                 _zh_exps, default=_zh_exps[0], prefix=prefix)
@@ -7932,14 +7992,23 @@ def render_config_controls(ui, prefix="sb"):
         # the configuration changes. Without this the entry would be placed
         # on the index itself, which is not the trade at all.
         ui.markdown("#### 🎟 Zero Hero Contract")
-        _zh_und = params.get("zh_underlying") or zero_hero_default_underlying()
-        _zh_meta2 = DHAN_INDEX_MAP.get(_zh_und, DHAN_INDEX_MAP["Nifty50"])
-        ui.caption(f"Trading the **{_zh_und}** chain ({_zh_meta2['exchange']} · "
-                   f"{_zh_meta2['underlying']}), default lot quantity {_zh_meta2.get('default_opt_qty')}.")
+        _zh_k2 = params.get("zh_kind", "Index")
+        _zh_und = (params.get("zh_underlying") if _zh_k2 == "Index"
+                   else store.get("zh_stock", "RELIANCE")) or zero_hero_default_underlying()
+        _zh_ui2 = resolve_chain_underlying(_zh_k2, _zh_und)
+        if not _zh_ui2:
+            ui.warning(f"Cannot resolve '{_zh_und}' — no contract can be selected until it resolves.")
+            _zh_ui2 = resolve_chain_underlying("Index", "Nifty50")
+        _zh_meta2 = {"exchange": _zh_ui2["exchange"], "underlying": _zh_ui2["underlying"],
+                     # Index lot sizes come from the map; a stock's comes from the
+                     # scrip master, which is authoritative for that contract.
+                     "default_opt_qty": DHAN_INDEX_MAP.get(_zh_und, {}).get("default_opt_qty")}
         _zh_exp2 = params.get("zh_expiry")
-        _zh_snap = get_chain_snapshot_for(
-            resolve_chain_underlying("Index", params.get("zh_underlying", zero_hero_default_underlying())),
-            _zh_exp2)
+        _zh_snap = get_chain_snapshot_for(_zh_ui2, _zh_exp2)
+        ui.caption(f"Trading the **{_zh_und}** {'index' if _zh_k2 == 'Index' else 'stock'} option chain "
+                   f"({_zh_meta2['exchange']} · {_zh_meta2['underlying']} · {_zh_ui2['opt_instrument']})"
+                   + (f", default lot quantity {_zh_meta2['default_opt_qty']}."
+                      if _zh_meta2.get("default_opt_qty") else ", lot size taken from the scrip master."))
         _zh_ce, _zh_ce_msg = select_zero_hero_leg(_zh_snap, 1, params)
         _zh_pe, _zh_pe_msg = select_zero_hero_leg(_zh_snap, -1, params)
         if _zh_ce:
@@ -7951,21 +8020,21 @@ def render_config_controls(ui, prefix="sb"):
         else:
             ui.caption(f"📉 SHORT leg unresolved — {_zh_pe_msg}")
 
-        _zh_sig = ("ZH", params.get("zh_underlying"), _zh_exp2,
+        _zh_sig = ("ZH", _zh_k2, _zh_und, _zh_exp2,
                    (_zh_ce or {}).get("strike"), (_zh_pe or {}).get("strike"))
 
         def _fetch_zh_legs():
             got = False
             if _zh_ce:
-                _i = dhan_lookup_option(_zh_meta2["underlying"], _zh_exp2, _zh_ce["strike"], "CE",
-                                        "OPTIDX", _zh_meta2["exchange"])
+                _i = dhan_lookup_option(_zh_ui2["underlying"], _zh_exp2, _zh_ce["strike"], "CE",
+                                        _zh_ui2["opt_instrument"], _zh_ui2["exchange"])
                 if _i:
                     cfg_force("ce_security_id", _i["security_id"])
                     store["_zh_lot"] = _i.get("lot_size")
                     got = True
             if _zh_pe:
-                _i = dhan_lookup_option(_zh_meta2["underlying"], _zh_exp2, _zh_pe["strike"], "PE",
-                                        "OPTIDX", _zh_meta2["exchange"])
+                _i = dhan_lookup_option(_zh_ui2["underlying"], _zh_exp2, _zh_pe["strike"], "PE",
+                                        _zh_ui2["opt_instrument"], _zh_ui2["exchange"])
                 if _i:
                     cfg_force("pe_security_id", _i["security_id"])
                     got = True
@@ -7981,10 +8050,10 @@ def render_config_controls(ui, prefix="sb"):
                              "ce_security_id", "", prefix=prefix).strip()
         _zh_pe_id = cfg_text(ui, "PE Security ID (auto-filled — bought on SHORT signals)",
                              "pe_security_id", "", prefix=prefix).strip()
-        _zh_qty_default = _zh_meta2.get("default_opt_qty", 65)
-        if store.get("_zh_qty_sig") != params.get("zh_underlying"):
-            cfg_force("dhan_qty", int(_zh_qty_default))
-            store["_zh_qty_sig"] = params.get("zh_underlying")
+        _zh_qty_default = int(_zh_meta2.get("default_opt_qty") or store.get("_zh_lot") or 1)
+        if store.get("_zh_qty_sig") != (_zh_k2, _zh_und):
+            cfg_force("dhan_qty", _zh_qty_default)
+            store["_zh_qty_sig"] = (_zh_k2, _zh_und)
         c1, c2 = ui.columns(2)
         entry_order_type = cfg_selectbox(c1, "Entry Order Type", "entry_order_type",
                                          ["MARKET", "LIMIT"], default="MARKET", prefix=prefix)
@@ -8003,7 +8072,7 @@ def render_config_controls(ui, prefix="sb"):
             ui.caption("💰 Cost per entry — only ONE leg is bought per signal, whichever way the breakout goes: "
                        + " · ".join(_cost_bits) + ".")
         product_cfg = {
-            "instrument": "Index Options",
+            "instrument": "Index Options" if _zh_k2 == "Index" else "Stock Options",
             "exchange": _zh_meta2["exchange"],
             "exchange_segment": f"{_zh_meta2['exchange']}_FNO",
             "product": "INTRADAY",
@@ -8036,16 +8105,22 @@ def render_config_controls(ui, prefix="sb"):
         _cs_trade_opts = cfg_checkbox(ui, "Trade CE/PE legs (LONG → buy CE, SHORT → buy PE)",
                                       "chain_trade_options", True, prefix=prefix)
         if _cs_trade_opts:
-            _cs_und = params.get("oi_underlying", store.get("oi_underlying", "Nifty50"))
-            _cs_meta = DHAN_INDEX_MAP.get(_cs_und, DHAN_INDEX_MAP["Nifty50"])
+            _cs_kind = params.get("oi_kind", store.get("oi_kind", "Index"))
+            _cs_und = (params.get("oi_underlying") if _cs_kind == "Index"
+                       else store.get("oi_stock", "RELIANCE")) or "Nifty50"
+            _cs_ui = resolve_chain_underlying(_cs_kind, _cs_und)
+            if not _cs_ui:
+                ui.warning(f"Cannot resolve '{_cs_und}' — no option leg can be selected until it resolves.")
+                _cs_ui = resolve_chain_underlying("Index", "Nifty50")
+            _cs_meta = {"underlying": _cs_ui["underlying"], "exchange": _cs_ui["exchange"]}
             _cs_exp = params.get("oi_expiry", store.get("oi_expiry"))
-            _cs_strikes = dhan_get_strikes(_cs_meta["underlying"], _cs_exp, "OPTIDX",
-                                           _cs_meta["exchange"]) if _cs_exp else []
+            _cs_strikes = dhan_get_strikes(_cs_ui["underlying"], _cs_exp, _cs_ui["opt_instrument"],
+                                           _cs_ui["exchange"]) if _cs_exp else []
             _cs_offset = cfg_number(ui, "Strike offset from ATM (0 = ATM, +1 = one strike OTM, −1 = ITM)",
                                     "chain_strike_offset", 0, -20, 20, is_int=True, prefix=prefix)
             _cs_atm = None
             if _cs_strikes:
-                _cs_ltp = _current_underlying_ltp(TICKER_MAP.get(_cs_und, "^NSEI"))
+                _cs_ltp = _current_underlying_ltp(_cs_ui.get("yf") or TICKER_MAP.get(_cs_und, "^NSEI"))
                 _cs_atm = round_to_nearest_strike(_cs_ltp, _cs_strikes)
             if _cs_atm is not None and _cs_strikes:
                 _ai = _cs_strikes.index(_cs_atm)
@@ -8053,13 +8128,13 @@ def render_config_controls(ui, prefix="sb"):
                 # offset is applied in opposite directions for the two legs.
                 _ce_strike = _cs_strikes[min(len(_cs_strikes) - 1, max(0, _ai + int(_cs_offset)))]
                 _pe_strike = _cs_strikes[min(len(_cs_strikes) - 1, max(0, _ai - int(_cs_offset)))]
-                _sig = ("CHAIN", _cs_und, _cs_exp, _ce_strike, _pe_strike)
+                _sig = ("CHAIN", _cs_kind, _cs_und, _cs_exp, _ce_strike, _pe_strike)
 
                 def _fetch_chain_legs():
-                    ce = dhan_lookup_option(_cs_meta["underlying"], _cs_exp, _ce_strike, "CE",
-                                            "OPTIDX", _cs_meta["exchange"])
-                    pe = dhan_lookup_option(_cs_meta["underlying"], _cs_exp, _pe_strike, "PE",
-                                            "OPTIDX", _cs_meta["exchange"])
+                    ce = dhan_lookup_option(_cs_ui["underlying"], _cs_exp, _ce_strike, "CE",
+                                            _cs_ui["opt_instrument"], _cs_ui["exchange"])
+                    pe = dhan_lookup_option(_cs_ui["underlying"], _cs_exp, _pe_strike, "PE",
+                                            _cs_ui["opt_instrument"], _cs_ui["exchange"])
                     if ce:
                         cfg_force("ce_security_id", ce["security_id"])
                         store["_opt_lot_size"] = ce.get("lot_size")
@@ -8081,10 +8156,11 @@ def render_config_controls(ui, prefix="sb"):
                               "ce_security_id", "", prefix=prefix).strip()
             _pe_id = cfg_text(ui, "PE Security ID (auto-filled, used on SHORT signals)",
                               "pe_security_id", "", prefix=prefix).strip()
-            _cs_qty_default = _cs_meta.get("default_opt_qty", 65)
-            if store.get("_chain_qty_sig") != _cs_und:
-                cfg_force("dhan_qty", int(_cs_qty_default))
-                store["_chain_qty_sig"] = _cs_und
+            _cs_qty_default = int(DHAN_INDEX_MAP.get(_cs_und, {}).get("default_opt_qty")
+                                  or store.get("_opt_lot_size") or 1)
+            if store.get("_chain_qty_sig") != (_cs_kind, _cs_und):
+                cfg_force("dhan_qty", _cs_qty_default)
+                store["_chain_qty_sig"] = (_cs_kind, _cs_und)
             c1, c2 = ui.columns(2)
             entry_order_type = cfg_selectbox(c1, "Entry Order Type", "entry_order_type",
                                              ["MARKET", "LIMIT"], default="MARKET", prefix=prefix)
@@ -8093,7 +8169,7 @@ def render_config_controls(ui, prefix="sb"):
             dhan_qty = cfg_number(ui, "Dhan Quantity (lots × lot size)", "dhan_qty",
                                   int(_cs_qty_default), 1, 1000000, is_int=True, prefix=prefix)
             product_cfg = {
-                "instrument": "Index Options",
+                "instrument": "Index Options" if _cs_kind == "Index" else "Stock Options",
                 "exchange": _cs_meta["exchange"],
                 "exchange_segment": f"{_cs_meta['exchange']}_FNO",
                 "product": "MARGIN",
