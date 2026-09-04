@@ -281,6 +281,9 @@ DEFAULT_PARAMS: dict[str, float] = {
     "macd_fast": 12, "macd_slow": 26, "macd_signal": 9,
     "st_len": 10, "st_mult": 3.0, "structure_len": 20,
     "rsi_long_level": 40.0, "rsi_short_level": 60.0,
+    "oi_change_threshold": 0.0, "pcr_min": 0.8, "pcr_max": 1.2,
+    "zero_hero_atr": 2.0, "expiry_weekday": 3, "gamma_tail_bars": 6,
+    "flip_entries": False,
     "threshold_price": 0.0, "threshold_pct": 1.0,
     "threshold_ref": "Previous session close",
     "threshold_mode": "Cross above = BUY, cross below = SELL",
@@ -2037,6 +2040,496 @@ def s_threshold_pct(df, p):
                f"Close must cross the {fmt(_p(p,'threshold_pct'))}% band per the selected mode.")
 
 
+# ------------------------------------ 34-43 Fibonacci and structure ----------
+FIB_RATIOS = (0.236, 0.382, 0.5, 0.618, 0.786)
+HYBRID_LOGIC = ["All selected must agree (AND)", "Any one is enough (OR)"]
+
+
+def fib_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Attach retracement levels measured off the last CONFIRMED swing pair.
+
+    The leg direction is inferred from where price currently sits between the
+    two pivots. Everything derives from confirmed pivots, so nothing here can
+    see the future.
+    """
+    out = df
+    hi, lo = out["swing_high"], out["swing_low"]
+    leg = hi - lo
+    out["fib_leg"] = leg
+    up_leg = (out["Close"] - lo).abs() >= (hi - out["Close"]).abs()
+    out["fib_up_leg"] = up_leg
+    for r in FIB_RATIOS:
+        out[f"fib_{int(r*1000)}"] = np.where(up_leg, hi - leg * r, lo + leg * r)
+    out["fib_golden_hi"] = out[["fib_500", "fib_618"]].max(axis=1)
+    out["fib_golden_lo"] = out[["fib_500", "fib_618"]].min(axis=1)
+    return out
+
+
+def _fib_base(df, p):
+    out = df.copy()
+    sh, sl_, _, _ = swing_levels(out["High"], out["Low"],
+                                 int(_p(p, "pivot_left")), int(_p(p, "pivot_right")))
+    out["swing_high"], out["swing_low"] = sh, sl_
+    return fib_frame(out)
+
+
+def _fib_zone_touch(out: pd.DataFrame):
+    """Long when a rising leg retraces into the golden zone and closes back up."""
+    long = (out["fib_up_leg"] & (out["Low"] <= out["fib_golden_hi"])
+            & (out["Close"] > out["fib_golden_lo"]) & (out["Close"] > out["Open"]))
+    short = ((~out["fib_up_leg"]) & (out["High"] >= out["fib_golden_lo"])
+             & (out["Close"] < out["fib_golden_hi"]) & (out["Close"] < out["Open"]))
+    return long, short
+
+
+def _fib_status(df, extra=None):
+    return _sr("Watching for a retracement into the 50-61.8% zone of the last confirmed leg.",
+               [("Last price", fmt(safe_last(df["Close"]))),
+                ("Swing high", fmt(safe_last(df["swing_high"]))),
+                ("Swing low", fmt(safe_last(df["swing_low"]))),
+                ("Golden zone", f"{fmt(safe_last(df['fib_golden_lo']))} - "
+                                f"{fmt(safe_last(df['fib_golden_hi']))}"),
+                ("Leg direction", "up" if safe_last(df["fib_up_leg"]) else "down")]
+               + list(extra or []),
+               "Rising leg retraces into the golden zone and the candle closes green.",
+               "Falling leg retraces into the golden zone and the candle closes red.")
+
+
+def c_fib_zone(df, p):
+    out = _fib_base(df, p)
+    return _finalise(out, *_fib_zone_touch(out))
+
+
+def s_fib_zone(df, p):
+    return _fib_status(df)
+
+
+def c_fib_rsi(df, p):
+    out = _fib_base(df, p)
+    out["rsi"] = rsi(out["Close"], int(_p(p, "rsi_len")))
+    long, short = _fib_zone_touch(out)
+    return _finalise(out, long & (out["rsi"] >= float(_p(p, "rsi_long_level"))),
+                     short & (out["rsi"] <= float(_p(p, "rsi_short_level"))))
+
+
+def s_fib_rsi(df, p):
+    return _fib_status(df, [("RSI", fmt(safe_last(df["rsi"])))])
+
+
+def c_fib_volume(df, p):
+    out = _fib_base(df, p)
+    out["vol_ma"] = sma(out["Volume"], int(_p(p, "vol_len")))
+    out["vol_ratio"] = out["Volume"] / out["vol_ma"].replace(0.0, np.nan)
+    dead = float(out["Volume"].abs().sum()) == 0.0
+    surge = pd.Series(True, index=out.index) if dead else \
+        (out["vol_ratio"] >= float(_p(p, "vol_mult")))
+    long, short = _fib_zone_touch(out)
+    return _finalise(out, long & surge, short & surge)
+
+
+def s_fib_volume(df, p):
+    dead = float(df["Volume"].tail(50).abs().sum()) == 0.0
+    return _fib_status(df, [("Volume ratio", "n/a (feed has no volume)" if dead
+                             else fmt(safe_last(df["vol_ratio"])))])
+
+
+def c_fib_vwap(df, p):
+    out = _fib_base(df, p)
+    vw, vol_ok = vwap(out, bool(p.get("intraday", True)))
+    out["vwap"] = vw
+    out.attrs["vwap_is_volume_weighted"] = vol_ok
+    long, short = _fib_zone_touch(out)
+    return _finalise(out, long & (out["Close"] > out["vwap"]),
+                     short & (out["Close"] < out["vwap"]))
+
+
+def s_fib_vwap(df, p):
+    ok = bool(df.attrs.get("vwap_is_volume_weighted", True))
+    return _fib_status(df, [("VWAP" if ok else "TWAP (no volume)", fmt(safe_last(df["vwap"])))])
+
+
+def c_fib_macd(df, p):
+    out = _fib_base(df, p)
+    _, _, hist = macd(out["Close"], int(_p(p, "macd_fast")), int(_p(p, "macd_slow")),
+                      int(_p(p, "macd_signal")))
+    out["macd_hist"] = hist
+    long, short = _fib_zone_touch(out)
+    return _finalise(out, long & (out["macd_hist"] > 0), short & (out["macd_hist"] < 0))
+
+
+def s_fib_macd(df, p):
+    return _fib_status(df, [("MACD histogram", fmt(safe_last(df["macd_hist"]), 4))])
+
+
+def c_fib_bollinger(df, p):
+    out = _fib_base(df, p)
+    mid, up, lo = bollinger(out["Close"], int(_p(p, "bb_len")), float(_p(p, "bb_mult")))
+    out["bb_mid"], out["bb_up"], out["bb_lo"] = mid, up, lo
+    long, short = _fib_zone_touch(out)
+    inside = (out["Close"] < out["bb_up"]) & (out["Close"] > out["bb_lo"])
+    return _finalise(out, long & inside, short & inside)
+
+
+def s_fib_bollinger(df, p):
+    return _fib_status(df, [("Bollinger mid", fmt(safe_last(df["bb_mid"])))])
+
+
+def c_fib_fvg(df, p):
+    out = _fib_base(df, p)
+    _, _, blo, bhi, selo, sehi = fair_value_gaps(out)
+    out["fvg_bull_lo"], out["fvg_bull_hi"] = blo, bhi
+    out["fvg_bear_lo"], out["fvg_bear_hi"] = selo, sehi
+    long, short = _fib_zone_touch(out)
+    # The imbalance must overlap the retracement zone: two independent reasons
+    # for the same price to matter.
+    long &= (out["fvg_bull_hi"] >= out["fib_golden_lo"]) & (out["fvg_bull_lo"] <= out["fib_golden_hi"])
+    short &= (out["fvg_bear_hi"] >= out["fib_golden_lo"]) & (out["fvg_bear_lo"] <= out["fib_golden_hi"])
+    return _finalise(out, long, short)
+
+
+def s_fib_fvg(df, p):
+    return _fib_status(df, [("Bull FVG", f"{fmt(safe_last(df['fvg_bull_lo']))} - "
+                                         f"{fmt(safe_last(df['fvg_bull_hi']))}"),
+                            ("Bear FVG", f"{fmt(safe_last(df['fvg_bear_lo']))} - "
+                                         f"{fmt(safe_last(df['fvg_bear_hi']))}")])
+
+
+def c_ema_retest_breakout(df, p):
+    """
+    Double EMA crossover -> pullback to the fast EMA -> break of the pre-pullback
+    extreme. The signal prints on the breakout candle and, like every profile
+    here, fills at the NEXT candle's open.
+    """
+    out = df.copy()
+    look = int(_p(p, "breakout_len"))
+    out["ema_fast"] = ema(out["Close"], int(_p(p, "ema_fast")))
+    out["ema_slow"] = ema(out["Close"], int(_p(p, "ema_slow")))
+    bull = out["ema_fast"] > out["ema_slow"]
+
+    crossed_up = cross_over(out["ema_fast"], out["ema_slow"])
+    crossed_dn = cross_under(out["ema_fast"], out["ema_slow"])
+    cross_any = crossed_up | crossed_dn
+    pos = pd.Series(np.arange(len(out)), index=out.index)
+    last_cross = pos.where(cross_any).ffill()
+    out["bars_since_cross"] = (pos - last_cross).fillna(9999)
+
+    pulled_up = (out["Low"] <= out["ema_fast"]).rolling(look, min_periods=1).max().astype(bool)
+    pulled_dn = (out["High"] >= out["ema_fast"]).rolling(look, min_periods=1).max().astype(bool)
+    out["retest_high"] = rolling_high(out["High"], look)
+    out["retest_low"] = rolling_low(out["Low"], look)
+
+    fresh = out["bars_since_cross"] <= look * 2
+    long = bull & fresh & pulled_up & cross_over(out["Close"], out["retest_high"])
+    short = (~bull) & fresh & pulled_dn & cross_under(out["Close"], out["retest_low"])
+    return _finalise(out, long, short)
+
+
+def s_ema_retest_breakout(df, p):
+    c, hi, lo = safe_last(df["Close"]), safe_last(df["retest_high"]), safe_last(df["retest_low"])
+    f, sl_ = safe_last(df["ema_fast"]), safe_last(df["ema_slow"])
+    return _sr(f"Trend is {'UP' if (f or 0) > (sl_ or 0) else 'DOWN'}; "
+               f"{fmt(safe_last(df['bars_since_cross']), 0)} bars since the crossover.",
+               [("Last price", fmt(c)), ("Fast EMA", fmt(f)), ("Slow EMA", fmt(sl_)),
+                ("Breakout high", fmt(hi)),
+                ("Points to long", fmt_signed((hi or 0) - (c or 0))),
+                ("Points to short", fmt_signed((c or 0) - (lo or 0)))],
+               "Bullish cross, pullback to the fast EMA, then a close above the recent high. "
+               "Entry is the next candle's open.",
+               "Bearish cross, pullback to the fast EMA, then a close below the recent low. "
+               "Entry is the next candle's open.")
+
+
+def c_price_action(df, p):
+    """Composite price action: pin bar, engulfing, or inside-bar break at structure."""
+    out = df.copy()
+    look = int(_p(p, "breakout_len"))
+    out["sup"] = rolling_low(out["Low"], look)
+    out["res"] = rolling_high(out["High"], look)
+    body = (out["Close"] - out["Open"]).abs()
+    rng = (out["High"] - out["Low"]).replace(0.0, np.nan)
+    lw = out[["Open", "Close"]].min(axis=1) - out["Low"]
+    uw = out["High"] - out[["Open", "Close"]].max(axis=1)
+    po, pc = out["Open"].shift(1), out["Close"].shift(1)
+
+    bull_pin = (lw >= 2 * body) & (lw / rng > 0.5)
+    bear_pin = (uw >= 2 * body) & (uw / rng > 0.5)
+    bull_eng = (out["Close"] > out["Open"]) & (pc < po) & (out["Close"] >= po) & (out["Open"] <= pc)
+    bear_eng = (out["Close"] < out["Open"]) & (pc > po) & (out["Close"] <= po) & (out["Open"] >= pc)
+    inside = (out["High"] < out["High"].shift(1)) & (out["Low"] > out["Low"].shift(1))
+    ib_up = inside.shift(1).fillna(False) & (out["Close"] > out["High"].shift(1))
+    ib_dn = inside.shift(1).fillna(False) & (out["Close"] < out["Low"].shift(1))
+
+    at_sup = out["Low"] <= out["sup"] * 1.004
+    at_res = out["High"] >= out["res"] * 0.996
+    out["pa_pattern"] = np.where(
+        bull_pin, "bullish pin", np.where(
+            bear_pin, "bearish pin", np.where(
+                bull_eng, "bullish engulfing", np.where(
+                    bear_eng, "bearish engulfing", np.where(
+                        ib_up, "inside-bar break up", np.where(
+                            ib_dn, "inside-bar break down", ""))))))
+    return _finalise(out, ((bull_pin | bull_eng) & at_sup) | ib_up,
+                     ((bear_pin | bear_eng) & at_res) | ib_dn)
+
+
+def s_price_action(df, p):
+    return _sr(f"Latest price action read: {safe_last(df['pa_pattern']) or 'nothing on this bar'}.",
+               [("Last price", fmt(safe_last(df["Close"]))),
+                ("Support", fmt(safe_last(df["sup"]))),
+                ("Resistance", fmt(safe_last(df["res"])))],
+               "Bullish pin or engulfing at support, or an inside-bar break upward.",
+               "Bearish pin or engulfing at resistance, or an inside-bar break downward.")
+
+
+def c_hybrid(df, p):
+    """
+    Combine several profiles under AND / OR.
+
+    AND is strict: every member must point the same way on the SAME candle,
+    which is rare and produces very few trades. OR fires on the first member to
+    signal and therefore inherits the false positives of all of them.
+    """
+    out = df.copy()
+    members = [m for m in (p.get("hybrid_members") or [])
+               if m in STRATEGIES and not STRATEGIES[m].immediate and not m.startswith("43 ")]
+    out["ema_fast"] = ema(out["Close"], int(_p(p, "ema_fast")))
+    out["ema_slow"] = ema(out["Close"], int(_p(p, "ema_slow")))
+    empty = pd.Series(False, index=out.index)
+    if not members:
+        out["hybrid_detail"] = "no members selected"
+        out["hybrid_long_votes"] = 0
+        out["hybrid_short_votes"] = 0
+        out["hybrid_members"] = 0
+        return _finalise(out, empty, empty)
+
+    longs, shorts, names = [], [], []
+    for name in members:
+        try:
+            sig = get_strategy(name).compute(df, p)["signal"]
+        except Exception:                                           # noqa: BLE001
+            continue
+        longs.append(sig == 1)
+        shorts.append(sig == -1)
+        names.append(name.split("\u00b7 ")[-1].strip())
+    if not longs:
+        out["hybrid_detail"] = "members failed to compute"
+        out["hybrid_long_votes"] = 0
+        out["hybrid_short_votes"] = 0
+        out["hybrid_members"] = 0
+        return _finalise(out, empty, empty)
+
+    lf, sf = pd.concat(longs, axis=1), pd.concat(shorts, axis=1)
+    out["hybrid_long_votes"] = lf.sum(axis=1)
+    out["hybrid_short_votes"] = sf.sum(axis=1)
+    out["hybrid_members"] = len(longs)
+    out["hybrid_detail"] = ", ".join(names)
+    if str(p.get("hybrid_logic", HYBRID_LOGIC[0])).startswith("All"):
+        return _finalise(out, lf.all(axis=1), sf.all(axis=1))
+    return _finalise(out, lf.any(axis=1), sf.any(axis=1))
+
+
+def s_hybrid(df, p):
+    logic = str(p.get("hybrid_logic", HYBRID_LOGIC[0]))
+    n = int(safe_last(df["hybrid_members"]) or 0)
+    return _sr(f"{n} member profile(s) combined under: {logic}.",
+               [("Members", str(safe_last(df["hybrid_detail"]) or "none")),
+                ("Long votes", fmt(safe_last(df["hybrid_long_votes"]), 0)),
+                ("Short votes", fmt(safe_last(df["hybrid_short_votes"]), 0)),
+                ("Needed", "all of them" if logic.startswith("All") else "any one")],
+               "Member profiles must agree per the selected logic.",
+               "Member profiles must agree per the selected logic.")
+
+
+# ------------------------------------------ 44-48 Option profiles ------------
+# DIRECTION MAPPING: a LONG signal buys a CALL, a SHORT signal buys a PUT. The
+# engine and the Dhan router both follow that rule, and the leg is recorded on
+# every trade row.
+#
+# DATA HONESTY: open interest and PCR are not available from Yahoo at all, and
+# no free source publishes a usable HISTORY of them. So:
+#   * the OI profiles below are LIVE-ONLY and need Dhan market data. In a
+#     backtest they deliberately produce nothing rather than inventing a series.
+#   * Zero Hero and Gamma Blast are expressed as rules on the UNDERLYING, which
+#     is genuinely backtestable, with the option leg chosen from the direction.
+
+OPTION_OI_PROFILES = {"44 \u00b7 Options: OI Change", "45 \u00b7 Options: OI Change + PCR",
+                      "46 \u00b7 Options: OI Change + Volume"}
+
+
+def _oi_history() -> list[dict]:
+    if st is None:
+        return []
+    try:
+        return list(st.session_state.get("option_metrics_history", []) or [])
+    except Exception:                                               # noqa: BLE001
+        return []
+
+
+def _oi_signal(params: dict) -> tuple[int, dict]:
+    """
+    Read the accumulated option-chain history and return (direction, detail).
+
+    History is built up by the live loop polling Dhan; there is no historical
+    feed to replay, so an empty history means no signal rather than a guess.
+    """
+    hist = _oi_history()
+    detail = {"samples": len(hist)}
+    if len(hist) < 2:
+        return 0, detail
+    now, prev = hist[-1], hist[-2]
+    ce_chg = float(now.get("ce_oi", 0)) - float(prev.get("ce_oi", 0))
+    pe_chg = float(now.get("pe_oi", 0)) - float(prev.get("pe_oi", 0))
+    pcr = float(now.get("pcr", 0) or 0)
+    detail.update(ce_change=ce_chg, pe_change=pe_chg, pcr=pcr,
+                  ce_volume=now.get("ce_volume"), pe_volume=now.get("pe_volume"))
+    threshold = float(params.get("oi_change_threshold", 0.0))
+    if abs(ce_chg - pe_chg) < threshold:
+        return 0, detail
+    # Put writing (PE OI building faster) is the bullish tell; call writing is bearish.
+    direction = 1 if pe_chg > ce_chg else -1
+    if str(params.get("strategy_name", "")).startswith("45 "):
+        lo, hi = float(params.get("pcr_min", 0.8)), float(params.get("pcr_max", 1.2))
+        if direction > 0 and pcr < lo:
+            return 0, detail
+        if direction < 0 and pcr > hi:
+            return 0, detail
+    if str(params.get("strategy_name", "")).startswith("46 "):
+        cev, pev = float(now.get("ce_volume", 0) or 0), float(now.get("pe_volume", 0) or 0)
+        if direction > 0 and pev <= cev:
+            return 0, detail
+        if direction < 0 and cev <= pev:
+            return 0, detail
+    return direction, detail
+
+
+def _c_option_oi(name: str):
+    def build(df, p):
+        out = df.copy()
+        out["ema_fast"] = ema(out["Close"], int(_p(p, "ema_fast")))
+        out["ema_slow"] = ema(out["Close"], int(_p(p, "ema_slow")))
+        params = dict(p)
+        params["strategy_name"] = name
+        direction, detail = _oi_signal(params)
+        out["oi_samples"] = detail.get("samples", 0)
+        out["oi_ce_change"] = detail.get("ce_change", np.nan)
+        out["oi_pe_change"] = detail.get("pe_change", np.nan)
+        out["oi_pcr"] = detail.get("pcr", np.nan)
+        long = pd.Series(False, index=out.index)
+        short = pd.Series(False, index=out.index)
+        # The chain describes NOW, so it can only speak about the newest closed bar.
+        if direction != 0 and len(out) >= 2:
+            (long if direction > 0 else short).iloc[-2] = True
+        return _finalise(out, long, short)
+    return build
+
+
+def _s_option_oi(name: str):
+    def status(df, p):
+        hist = _oi_history()
+        if len(hist) < 2:
+            head = ("No option-chain history yet. These profiles need Dhan market data and "
+                    "build their series live; they cannot be backtested, because no free "
+                    "source publishes historical OI.")
+        else:
+            head = (f"Chain sampled {len(hist)} times. Put writing is the bullish tell, "
+                    f"call writing the bearish one.")
+        return _sr(head,
+                   [("Samples", str(len(hist))),
+                    ("CE OI change", fmt(safe_last(df["oi_ce_change"]), 0)),
+                    ("PE OI change", fmt(safe_last(df["oi_pe_change"]), 0)),
+                    ("PCR", fmt(safe_last(df["oi_pcr"]))),
+                    ("Threshold", fmt(p.get("oi_change_threshold", 0.0), 0))],
+                   "PE open interest must build faster than CE (long -> buy a CALL).",
+                   "CE open interest must build faster than PE (short -> buy a PUT).")
+    return status
+
+
+def c_zero_hero(df, p):
+    """
+    Expiry-day momentum burst on the underlying.
+
+    'Zero hero' is the practice of buying cheap far-OTM options on expiry and
+    needing a large, fast move. The tradable edge, if any, is in the underlying
+    burst, so that is what is modelled here.
+    """
+    out = df.copy()
+    intraday = bool(p.get("intraday", True))
+    out["atr"] = atr(out["High"], out["Low"], out["Close"], int(_p(p, "atr_len")))
+    k = session_key(out.index)
+    sess_open = out["Open"].groupby(k).transform("first") if intraday else out["Open"]
+    out["session_open"] = sess_open
+    out["move_from_open"] = out["Close"] - sess_open
+    mult = float(_p(p, "zero_hero_atr"))
+    weekday = int(_p(p, "expiry_weekday"))
+    is_expiry = pd.Series(pd.DatetimeIndex(out.index).weekday == weekday, index=out.index) \
+        if intraday else pd.Series(True, index=out.index)
+    out["is_expiry_day"] = is_expiry
+    burst_up = out["move_from_open"] >= mult * out["atr"]
+    burst_dn = out["move_from_open"] <= -mult * out["atr"]
+    first_up = burst_up & ~burst_up.groupby(k).shift(1).fillna(False)
+    first_dn = burst_dn & ~burst_dn.groupby(k).shift(1).fillna(False)
+    return _finalise(out, is_expiry & first_up, is_expiry & first_dn)
+
+
+def s_zero_hero(df, p):
+    move, a = safe_last(df["move_from_open"]), safe_last(df["atr"])
+    need = float(_p(p, "zero_hero_atr")) * (a or 0)
+    return _sr(f"{'Expiry day.' if safe_last(df['is_expiry_day']) else 'Not an expiry day.'} "
+               f"Move from the session open is {fmt_signed(move)}; the burst needs {fmt(need)}.",
+               [("Session open", fmt(safe_last(df["session_open"]))),
+                ("Move from open", fmt_signed(move)), ("ATR", fmt(a)),
+                ("Burst threshold", fmt(need)),
+                ("Points to long", fmt_signed(need - (move or 0))),
+                ("Points to short", fmt_signed(-need - (move or 0)))],
+               "On expiry day, price must run the burst distance ABOVE the session open "
+               "(long -> buy a CALL).",
+               "On expiry day, price must run the burst distance BELOW the session open "
+               "(short -> buy a PUT).")
+
+
+def c_gamma_blast(df, p):
+    """
+    Late-session volatility expansion, the setup people call a gamma blast.
+
+    Restricted to the closing stretch of the session, when option gamma is at
+    its most violent, and requires both an ATR expansion and a directional break
+    of the session's own range.
+    """
+    out = df.copy()
+    intraday = bool(p.get("intraday", True))
+    look = int(_p(p, "breakout_len"))
+    out["atr"] = atr(out["High"], out["Low"], out["Close"], int(_p(p, "atr_len")))
+    out["atr_mean"] = sma(out["atr"], look)
+    out["atr_ratio"] = out["atr"] / out["atr_mean"]
+    k = session_key(out.index)
+    bar_no = bar_of_session(out.index, intraday)
+    bars_in_day = bar_no.groupby(k).transform("max")
+    tail_bars = int(_p(p, "gamma_tail_bars"))
+    late = (bars_in_day - bar_no) <= tail_bars if intraday else pd.Series(True, index=out.index)
+    out["is_late_session"] = late
+    out["day_high"] = out["High"].groupby(k).cummax().groupby(k).shift(1)
+    out["day_low"] = out["Low"].groupby(k).cummin().groupby(k).shift(1)
+    expanding = out["atr_ratio"] >= float(_p(p, "squeeze_mult"))
+    return _finalise(out, late & expanding & (out["Close"] > out["day_high"]),
+                     late & expanding & (out["Close"] < out["day_low"]))
+
+
+def s_gamma_blast(df, p):
+    c = safe_last(df["Close"])
+    hi, lo = safe_last(df["day_high"]), safe_last(df["day_low"])
+    return _sr(f"{'In' if safe_last(df['is_late_session']) else 'Outside'} the closing stretch; "
+               f"ATR is {fmt(safe_last(df['atr_ratio']))}x its mean.",
+               [("Last price", fmt(c)), ("Session high", fmt(hi)), ("Session low", fmt(lo)),
+                ("ATR ratio", fmt(safe_last(df["atr_ratio"]))),
+                ("Points to long", fmt_signed((hi or 0) - (c or 0))),
+                ("Points to short", fmt_signed((c or 0) - (lo or 0)))],
+               "Late in the session, with volatility expanding, close above the session high "
+               "(long -> buy a CALL).",
+               "Late in the session, with volatility expanding, close below the session low "
+               "(short -> buy a PUT).")
+
+
 # ------------------------- 30-33 RSI crossover and combination profiles ------
 def _rsi_levels(p):
     return float(_p(p, "rsi_long_level")), float(_p(p, "rsi_short_level"))
@@ -2203,6 +2696,50 @@ _DEFS = [
      c_bb_rsi, s_bb_rsi, ("bb_up", "bb_mid", "bb_lo"), "rsi", False),
     ("S32", "32 · EMA Crossover + RSI", "EMA cross that only counts when RSI agrees.", 60,
      c_ema_rsi, s_ema_rsi, ("ema_fast", "ema_slow"), "rsi", False),
+    ("S34", "34 · Double EMA Pullback + Breakout Retest",
+     "Cross, pullback to the fast EMA, then a break of the pre-pullback extreme.", 60,
+     c_ema_retest_breakout, s_ema_retest_breakout,
+     ("ema_fast", "ema_slow", "retest_high", "retest_low"), None, False),
+    ("S35", "35 · Fibonacci Retracement Zone",
+     "Retracement into the 50-61.8% zone of the last confirmed leg.", 60,
+     c_fib_zone, s_fib_zone, ("fib_golden_hi", "fib_golden_lo", "fib_382", "fib_786"), None, False),
+    ("S36", "36 · Fibonacci + RSI", "Golden-zone retracement confirmed by RSI.", 60,
+     c_fib_rsi, s_fib_rsi, ("fib_golden_hi", "fib_golden_lo"), "rsi", False),
+    ("S37", "37 · Fibonacci + Volume Breakout", "Golden-zone entry on a volume surge.", 60,
+     c_fib_volume, s_fib_volume, ("fib_golden_hi", "fib_golden_lo"), None, False),
+    ("S38", "38 · Fibonacci + VWAP", "Golden-zone entry on the right side of VWAP.", 60,
+     c_fib_vwap, s_fib_vwap, ("fib_golden_hi", "fib_golden_lo", "vwap"), None, False),
+    ("S39", "39 · Fibonacci + MACD", "Golden-zone entry with MACD histogram agreement.", 60,
+     c_fib_macd, s_fib_macd, ("fib_golden_hi", "fib_golden_lo"), None, False),
+    ("S40", "40 · Fibonacci + Bollinger Bands", "Golden-zone entry while inside the bands.", 60,
+     c_fib_bollinger, s_fib_bollinger, ("fib_golden_hi", "fib_golden_lo", "bb_mid"), None, False),
+    ("S41", "41 · Fibonacci + Fair Value Gap",
+     "Golden zone overlapping an unfilled imbalance.", 60,
+     c_fib_fvg, s_fib_fvg, ("fib_golden_hi", "fib_golden_lo"), None, False),
+    ("S42", "42 · Price Action Composite",
+     "Pin bars, engulfings and inside-bar breaks read against structure.", 60,
+     c_price_action, s_price_action, ("sup", "res"), None, False),
+    ("S43", "43 · Hybrid (combine profiles with AND / OR)",
+     "Select several profiles and require all, or any one, to agree.", 60,
+     c_hybrid, s_hybrid, ("ema_fast", "ema_slow"), None, False),
+    ("S44", "44 · Options: OI Change",
+     "Live-only. Open-interest build read from the Dhan option chain.", 30,
+     _c_option_oi("44 · Options: OI Change"), _s_option_oi("44 · Options: OI Change"),
+     ("ema_fast", "ema_slow"), None, False),
+    ("S45", "45 · Options: OI Change + PCR",
+     "Live-only. OI build gated by the put-call ratio.", 30,
+     _c_option_oi("45 · Options: OI Change + PCR"), _s_option_oi("45 · Options: OI Change + PCR"),
+     ("ema_fast", "ema_slow"), None, False),
+    ("S46", "46 · Options: OI Change + Volume",
+     "Live-only. OI build confirmed by option volume.", 30,
+     _c_option_oi("46 · Options: OI Change + Volume"),
+     _s_option_oi("46 · Options: OI Change + Volume"), ("ema_fast", "ema_slow"), None, False),
+    ("S47", "47 · Options: Zero Hero (expiry-day burst)",
+     "Expiry-day momentum burst on the underlying. Long buys a CALL, short a PUT.", 60,
+     c_zero_hero, s_zero_hero, ("session_open",), None, False),
+    ("S48", "48 · Options: Gamma Blast (late-session)",
+     "Late-session volatility expansion breaking the day's range.", 60,
+     c_gamma_blast, s_gamma_blast, ("day_high", "day_low"), None, False),
     ("S33", "33 · Volume Spike + RSI", "Volume confirmation on an RSI crossing.", 60,
      c_vol_rsi, s_vol_rsi, (), "rsi", False),
 ]
@@ -2244,6 +2781,12 @@ def prepare(df: pd.DataFrame, strategy_name: str, params: dict,
     out["prev_swing_high"], out["prev_swing_low"] = psh, psl
     out["prev_high"] = out["High"].shift(1)
     out["prev_low"] = out["Low"].shift(1)
+
+    # Contrarian switch. Applied BEFORE the filters so that an enabled filter
+    # gates the direction actually traded, not the one originally signalled.
+    out["flipped"] = bool(params.get("flip_entries"))
+    if params.get("flip_entries"):
+        out["signal"] = -out["signal"].astype(int)
 
     reports: list[FilterReport] = []
     if filter_cfg and any(v.get("enabled") for v in filter_cfg.values()):
@@ -2636,6 +3179,8 @@ class Position:
     manager: ExitManager
     broker_order_id: str | None = None
     entry_ltp_at_fill: float | None = None
+    entry_bar: dict | None = None          # OHLC of the candle the fill happened on
+    option_leg: str | None = None          # "CE" / "PE" when routed as an option
 
     @property
     def stop_loss(self):
@@ -2719,7 +3264,8 @@ def run_backtest(df: pd.DataFrame, strategy_name: str, params: dict, risk: RiskC
             if exit_price is not None:
                 if reason.endswith("(Gap)"):
                     gap_exits += 1
-                trades.append(_close_trade(pos, float(exit_price), ctx.time, reason))
+                trades.append(_close_trade(pos, float(exit_price), ctx.time, reason,
+                                           _bar_dict(ctx)))
                 fallback_notes.update(mgr.notes)
                 pos, pending_signal_exit, just_exited = None, None, True
             else:
@@ -2737,12 +3283,14 @@ def run_backtest(df: pd.DataFrame, strategy_name: str, params: dict, risk: RiskC
                 pos = Position(strategy=strategy_name, symbol=params.get("symbol", ""),
                                interval=params.get("interval", ""), direction=d,
                                quantity=risk.quantity, entry_price=entry, entry_time=ctx.time,
-                               signal_bar_time=frame.index[i - 1], manager=mgr)
+                               signal_bar_time=frame.index[i - 1], manager=mgr,
+                               entry_bar=_bar_dict(ctx))
                 pending_signal_exit = None
 
     if pos is not None:
         last = bar_ctx(frame, n - 1)
-        trades.append(_close_trade(pos, float(last.close), last.time, "End of Data"))
+        trades.append(_close_trade(pos, float(last.close), last.time, "End of Data",
+                                   _bar_dict(last)))
         fallback_notes.update(pos.manager.notes)
 
     trades_df = pd.DataFrame(trades)
@@ -2766,7 +3314,19 @@ def run_backtest(df: pd.DataFrame, strategy_name: str, params: dict, risk: RiskC
                           warmup_index=start, warnings=warnings, filter_reports=reports)
 
 
-def _close_trade(pos: Position, exit_price: float, exit_time, reason: str) -> dict:
+def _ohlc_cols(prefix: str, bar: dict | None) -> dict:
+    """Flatten a candle into labelled columns for the trade tables."""
+    bar = bar or {}
+    return {f"{prefix} {k}": (None if bar.get(k) is None else round(float(bar[k]), 4))
+            for k in ("Open", "High", "Low", "Close")}
+
+
+def _bar_dict(ctx: BarCtx) -> dict:
+    return {"Open": ctx.open, "High": ctx.high, "Low": ctx.low, "Close": ctx.close}
+
+
+def _close_trade(pos: Position, exit_price: float, exit_time, reason: str,
+                 exit_bar: dict | None = None) -> dict:
     points = round((exit_price - pos.entry_price) * pos.direction, 4)
     mgr = pos.manager
     gross = round(points * pos.quantity, 4)
@@ -2789,6 +3349,8 @@ def _close_trade(pos: Position, exit_price: float, exit_time, reason: str) -> di
         "Costs": cost,
         "PnL": round(gross - cost, 4),
         "Quantity": pos.quantity,
+        **_ohlc_cols("Entry Bar", pos.entry_bar),
+        **_ohlc_cols("Exit Bar", exit_bar),
     }
 
 
@@ -2860,6 +3422,7 @@ def _statistics(trades: pd.DataFrame, equity: pd.Series, risk: RiskConfig) -> di
 # routing real money.
 
 DHAN_BASE = "https://api.dhan.co/v2"
+DEFAULT_DHAN_CLIENT_ID = "1104779876"
 DHAN_SCRIP_URLS = [
     "https://images.dhan.co/api-data/api-scrip-master-detailed.csv",
     "https://images.dhan.co/api-data/api-scrip-master.csv",
@@ -3095,6 +3658,7 @@ _STATE_DEFAULTS = {
     "live_frame_warnings": [], "live_vix": None, "candle_refreshes": 0,
     "ltp_note": None, "screener_results": None, "screener_error": None,
     "last_seen_ltp": None, "last_ltp_change_ts": 0.0, "pending_ticker": None,
+    "last_closed_bar": None, "option_metrics": None,
     "optimizer_results": None, "pattern_results": None, "pending_combo": None,
 }
 
@@ -3292,6 +3856,9 @@ def _live_close(position: Position, exit_price: float, reason: str) -> dict:
                      - mgr.risk.costs.total(position.entry_price, float(exit_price),
                                             position.quantity), 4),
         "Broker Order": position.broker_order_id or "-",
+        "Option Leg": position.option_leg or "-",
+        **_ohlc_cols("Entry Bar", position.entry_bar),
+        **_ohlc_cols("Exit Bar", st.session_state.get("last_closed_bar")),
     }
     record_live_trade(trade)
     return trade
@@ -3358,7 +3925,10 @@ def _open_live_position(cfg: dict, direction: int, price: float, ctx: BarCtx, ba
                         direction=direction, quantity=cfg["risk"].quantity,
                         entry_price=float(price), entry_time=pd.Timestamp.now(),
                         signal_bar_time=bar_time, manager=mgr,
-                        entry_ltp_at_fill=cfg.get("_ltp_at_fill"))
+                        entry_ltp_at_fill=cfg.get("_ltp_at_fill"),
+                        entry_bar=_bar_dict(ctx),
+                        option_leg=("CE" if direction > 0 else "PE")
+                        if (cfg.get("broker") or {}).get("instrument") == "OPTIONS" else None)
     st.session_state.live_position = position
     _maybe_route_broker(cfg, position, closing=False)
     db_save_position(position, cfg)
@@ -3436,6 +4006,7 @@ def run_cycle(cfg: dict) -> None:
     del log[60:]
 
     closed_ctx = bar_ctx(frame, len(frame) - 2)
+    st.session_state.last_closed_bar = _bar_dict(closed_ctx)
     position: Position | None = st.session_state.live_position
     new_bar = st.session_state.live_last_bar != snapshot.last_closed_time
 
@@ -3601,6 +4172,16 @@ def render_sidebar() -> dict:
             st.session_state[f"cfg_sl_v_{combo['sl_type']}"] = float(combo["sl_value"])
         if combo.get("tp_value") is not None:
             st.session_state[f"cfg_tp_v_{combo['tp_type']}"] = float(combo["tp_value"])
+        # The additional entry filters are part of the tested combination, so
+        # they travel with it. Every filter is reset first, otherwise leftovers
+        # from a previous apply silently change what gets traded.
+        for spec in FILTER_SPECS:
+            st.session_state[f"flt_{spec['key']}"] = False
+        chosen = str(combo.get("filter_key") or "")
+        if chosen:
+            st.session_state[f"flt_{chosen}"] = True
+        for key, value in (combo.get("widgets") or {}).items():
+            st.session_state[key] = value
         st.session_state["applied_from_screener"] = combo["strategy"]
 
     pending = st.session_state.pop("pending_ticker", None)
@@ -3792,7 +4373,64 @@ def render_sidebar() -> dict:
                                  ("st_mult", 0.5, 10.0, 0.1)):
             params[key] = st.number_input(key, lo, hi, float(DEFAULT_PARAMS[key]), stp,
                                           disabled=live, key=f"pm_{key}")
-    if strategy.startswith(("30 ", "31 ", "32 ", "33 ")):
+    flip = sb.checkbox(
+        "Flip entries (trade every signal the other way)", value=False, disabled=live,
+        key="cfg_flip",
+        help="Sells on a LONG signal and buys on a SHORT one. Applied before the entry "
+             "filters, so an enabled filter gates the direction actually traded. Note this "
+             "does not turn a losing system into a winner: costs and the stop/target "
+             "asymmetry are paid either way.")
+    params["flip_entries"] = bool(flip)
+    if flip:
+        sb.warning("Entries are INVERTED. Every table and chart reflects the flipped direction.")
+
+    if strategy.startswith("43 "):
+        sb.subheader("Hybrid Members")
+        choices = [n for n in STRATEGY_NAMES
+                   if not STRATEGIES[n].immediate and not n.startswith(("28 ", "29 ", "43 ",
+                                                                        "44 ", "45 ", "46 "))]
+        params["hybrid_members"] = sb.multiselect(
+            "Profiles to combine", choices,
+            default=[c for c in choices if c.startswith(("01 ", "08 "))],
+            disabled=live, key="cfg_hybrid_members")
+        params["hybrid_logic"] = sb.selectbox("Combination logic", HYBRID_LOGIC, disabled=live,
+                                              key="cfg_hybrid_logic")
+        if str(params["hybrid_logic"]).startswith("All"):
+            sb.caption("AND is strict: every member must signal the same way on the SAME candle. "
+                       "Expect very few trades, and check the count before drawing conclusions.")
+        else:
+            sb.caption("OR fires on the first member to signal, so it inherits the false "
+                       "positives of all of them.")
+
+    if strategy.startswith(("44 ", "45 ", "46 ")):
+        sb.subheader("Option Chain Settings")
+        sb.info("These profiles are LIVE-ONLY and need Dhan market data. No free source "
+                "publishes historical open interest, so they produce nothing in a backtest "
+                "rather than inventing a series.")
+        params["oi_change_threshold"] = sb.number_input("Minimum OI change to act on", 0.0,
+                                                        1e9, 0.0, 1000.0, disabled=live,
+                                                        key="cfg_oi_thr")
+        if strategy.startswith("45 "):
+            params["pcr_min"] = sb.number_input("PCR floor for longs", 0.0, 5.0, 0.8, 0.05,
+                                                disabled=live, key="cfg_pcr_min")
+            params["pcr_max"] = sb.number_input("PCR ceiling for shorts", 0.0, 5.0, 1.2, 0.05,
+                                                disabled=live, key="cfg_pcr_max")
+
+    if strategy.startswith("47 "):
+        sb.subheader("Zero Hero Settings")
+        params["zero_hero_atr"] = sb.number_input("Burst size (x ATR from the session open)",
+                                                  0.5, 10.0, 2.0, 0.1, disabled=live,
+                                                  key="cfg_zh_atr")
+        params["expiry_weekday"] = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"].index(
+            sb.selectbox("Expiry weekday", ["Monday", "Tuesday", "Wednesday", "Thursday",
+                                            "Friday"], index=3, disabled=live, key="cfg_expiry_wd"))
+
+    if strategy.startswith("48 "):
+        sb.subheader("Gamma Blast Settings")
+        params["gamma_tail_bars"] = sb.number_input("Closing stretch (candles)", 1, 60, 6, 1,
+                                                    disabled=live, key="cfg_gamma_tail")
+
+    if strategy.startswith(("30 ", "31 ", "32 ", "33 ", "36 ")):
         sb.subheader("RSI Levels")
         params["rsi_long_level"] = sb.number_input("RSI long level", 1.0, 99.0, 40.0, 1.0,
                                                    disabled=live, key="cfg_rsi_long")
@@ -3825,6 +4463,7 @@ def render_sidebar() -> dict:
             "period": eff_period, "requested_period": period, "strategy": strategy,
             "params": params, "risk": risk, "quantity": float(quantity),
             "poll_seconds": float(poll_seconds), "fill_at_ltp": bool(fill_at_ltp),
+            "flip_entries": bool(flip),
             "allow_stale_entries": bool(allow_stale),
             "candle_seconds": float(candle_seconds), "costs": costs,
             "walk_forward": bool(walk_fwd), "wf_folds": int(wf_folds),
@@ -3910,37 +4549,63 @@ def _render_filters(sb, live: bool):
 
 
 def _render_broker(sb, live: bool, symbol: str) -> dict:
-    """Dhan order routing. Disabled by default, dry-run by default even when enabled."""
-    broker = {"enabled": False, "dry_run": True, "contract": None}
-    with sb.expander("Dhan order placement (off by default)"):
-        st.error("Live routing sends REAL orders to your Dhan account. The signals here are built "
-                 "on delayed Yahoo data, which is the wrong input for real execution. Keep dry-run "
-                 "on unless you have replaced the feed and tested thoroughly.")
-        enabled = st.checkbox("Enable Dhan order routing", value=False, disabled=live,
-                              key="brk_enabled")
-        broker["enabled"] = enabled
-        if not enabled:
+    """
+    Dhan integration.
+
+    DATA and ORDERS are independent switches. Wanting real-time prices is not
+    the same as wanting orders sent, so credentials are collected as soon as
+    EITHER is enabled rather than being buried inside the order-routing branch.
+    """
+    broker = {"enabled": False, "dry_run": True, "contract": None, "use_live_ltp": False}
+    with sb.expander("Dhan integration (data and / or orders)"):
+        use_data = st.checkbox(
+            "Use Dhan market data (real-time LTP and option chain)", value=False,
+            key="brk_data",
+            help="Read-only. Replaces Yahoo's delayed candle-close price with Dhan's live "
+                 "quote. Places no orders. Requires a Dhan Data API subscription.")
+        enable_orders = st.checkbox(
+            "Enable Dhan order placement", value=False, disabled=live, key="brk_enabled",
+            help="Separate from the data switch above. Off unless you explicitly want orders "
+                 "transmitted.")
+        broker["use_live_ltp"] = bool(use_data)
+        broker["enabled"] = bool(enable_orders)
+
+        if not (use_data or enable_orders):
+            st.caption("Both switches are off. The app runs entirely on Yahoo data and places "
+                       "no orders.")
             return broker
 
-        broker["dry_run"] = st.checkbox("Dry run (build the payload, transmit nothing)",
-                                        value=True, key="brk_dry")
-        broker["use_live_ltp"] = st.checkbox(
-            "Use Dhan for the live LTP (read-only, places no orders)",
-            value=bool(st.session_state.get("cfg_dhan_data", False)), key="brk_ltp",
-            help="Yahoo's Indian feed is delayed ~15 minutes, so on a 5m chart the LTP can sit "
-                 "unchanged for a quarter of an hour however fast you poll. This replaces it "
-                 "with Dhan's real-time quote. Requires a Dhan Data API subscription.")
-        broker["client_id"] = st.text_input("Dhan client ID", key="brk_cid")
-        broker["access_token"] = st.text_input("Dhan access token", type="password", key="brk_tok")
-        broker["product_type"] = st.selectbox("Product type", DHAN_PRODUCTS, key="brk_prod")
+        # --- credentials: needed by DATA and by ORDERS alike ---
+        st.markdown("**Credentials**")
+        broker["client_id"] = st.text_input("Dhan client ID", value=DEFAULT_DHAN_CLIENT_ID,
+                                            key="brk_cid")
+        broker["access_token"] = st.text_input(
+            "Dhan access token", type="password", key="brk_tok",
+            help="Required for market data as well as for orders. Generated from the Dhan web "
+                 "portal; it expires, so refresh it when quotes start failing.")
+        if not str(broker["access_token"]).strip():
+            st.warning("No access token yet. Dhan data calls will fail and the app will fall "
+                       "back to the Yahoo quote.")
+
+        # --- contract: needed for the LTP feed AND for order routing ---
+        st.markdown("**Contract**")
         instrument = st.selectbox("Instrument", DHAN_INSTRUMENTS, key="brk_inst")
         segment = st.selectbox("Exchange segment", DHAN_SEGMENTS,
                                index=0 if instrument == "EQUITY" else 2, key="brk_seg")
         underlying = st.text_input("Underlying symbol", value=_default_underlying(symbol),
                                    key="brk_under",
                                    help="Dhan's own name, e.g. RELIANCE, NIFTY, BANKNIFTY.")
-        option_type = st.selectbox("Option right", ["CALL", "PUT"], key="brk_right") \
-            if instrument == "OPTIONS" else "CALL"
+        broker["instrument"] = instrument
+        broker["segment"] = segment
+        broker["underlying"] = underlying
+        option_type = "CALL"
+        if instrument == "OPTIONS":
+            broker["auto_right"] = st.checkbox(
+                "Pick the right from the signal (long -> CE, short -> PE)", value=True,
+                key="brk_auto_right")
+            option_type = st.selectbox("Option right (used when auto is off)", ["CALL", "PUT"],
+                                       key="brk_right")
+        broker["option_type"] = option_type
 
         if st.button("Resolve contract", key="brk_resolve"):
             try:
@@ -3970,7 +4635,17 @@ def _render_broker(sb, live: bool, symbol: str) -> dict:
                 st.caption(f"Lot size {contract['lot_size']}. Quantity is sent in units, so set "
                            "the sidebar quantity to a multiple of the lot.")
         else:
-            st.info("Resolve a contract before starting the engine, or entries will be skipped.")
+            st.info("Resolve a contract to enable the Dhan LTP feed and, if switched on, order "
+                    "routing.")
+
+        # --- order-only settings ---
+        if enable_orders:
+            st.markdown("**Order routing**")
+            st.error("Live routing sends REAL orders to your Dhan account. Keep dry-run on until "
+                     "you have tested the whole path.")
+            broker["dry_run"] = st.checkbox("Dry run (build the payload, transmit nothing)",
+                                            value=True, key="brk_dry")
+            broker["product_type"] = st.selectbox("Product type", DHAN_PRODUCTS, key="brk_prod")
     return broker
 
 
@@ -4831,6 +5506,9 @@ def tab_ledger(cfg: dict) -> None:
         st.dataframe(by, width="stretch", hide_index=True)
 
     order = [c for c in ["#", "Exit Time", "Symbol", "Interval", "Strategy", "Direction",
+                         "Option Leg", "Entry Bar Open", "Entry Bar High", "Entry Bar Low",
+                         "Entry Bar Close", "Exit Bar Open", "Exit Bar High", "Exit Bar Low",
+                         "Exit Bar Close",
                          "Quantity", "Entry Time", "Entry Price", "Exit Price", "Initial Stop",
                          "Final Stop", "Target", "Best Price", "Exit Reason", "Points", "PnL",
                          "Broker Order", "Source"] if c in frame.columns]
@@ -4919,7 +5597,11 @@ def tab_optimiser(cfg: dict) -> None:
     if st.button("Apply this combination to the sidebar", type="primary", width="stretch"):
         st.session_state.pending_combo = {
             "strategy": row["Strategy"], "sl_type": row["Stop-Loss"], "sl_value": row["SL Value"],
-            "tp_type": row["Target"], "tp_value": row["TP Value"]}
+            "tp_type": row["Target"], "tp_value": row["TP Value"],
+            # The entry filter is part of the combination that produced these
+            # numbers. Applying the strategy without it would hand back a
+            # different system from the one that was ranked.
+            "filter_key": str(row.get("Filter Key") or "")}
         st.rerun()
     st.caption(f"Rank {pick}: {row['Strategy']} | SL {row['Stop-Loss']} | TGT {row['Target']} | "
                f"filter {row['Filter']} | {row['Trades']} trades | reliability {row['Reliability']}")
@@ -5326,6 +6008,59 @@ def _test_zigzag_and_elliott():
     print(f"   zigzag pivots alternate and confirm late; wave profile fired {fired} times  OK")
 
 
+def _test_new_profiles_and_flip():
+    """Fibonacci family, hybrid logic, option profiles, and the flip switch."""
+    df = _synthetic(900)
+    params = dict(DEFAULT_PARAMS)
+    params["intraday"] = True
+
+    for name in STRATEGY_NAMES:
+        if name.startswith(("34 ", "35 ", "36 ", "37 ", "38 ", "39 ", "40 ", "41 ", "42 ")):
+            out, _ = prepare(df, name, params)
+            assert set(out["signal"].unique()).issubset({-1, 0, 1}), f"{name}: bad domain"
+            assert int((out["signal"] != 0).sum()) > 0, f"{name}: produced nothing at all"
+
+    # Fibonacci levels must sit inside the swing leg and be correctly ordered.
+    fib, _ = prepare(df, "35 \u00b7 Fibonacci Retracement Zone", params)
+    ok = fib[["swing_high", "swing_low", "fib_golden_hi", "fib_golden_lo"]].dropna()
+    assert (ok["fib_golden_hi"] >= ok["fib_golden_lo"]).all(), "golden zone inverted"
+    assert (ok["fib_golden_hi"] <= ok["swing_high"] + 1e-6).all(), "level above the swing high"
+    assert (ok["fib_golden_lo"] >= ok["swing_low"] - 1e-6).all(), "level below the swing low"
+
+    # Hybrid: AND can never fire more often than OR over the same members.
+    members = ["01 \u00b7 Dual EMA Crossover", "08 \u00b7 RSI Centerline 50 Crossing"]
+    p_and = dict(params, hybrid_members=members, hybrid_logic=HYBRID_LOGIC[0])
+    p_or = dict(params, hybrid_members=members, hybrid_logic=HYBRID_LOGIC[1])
+    n_and = int((prepare(df, "43 \u00b7 Hybrid (combine profiles with AND / OR)", p_and)[0]
+                 ["signal"] != 0).sum())
+    n_or = int((prepare(df, "43 \u00b7 Hybrid (combine profiles with AND / OR)", p_or)[0]
+                ["signal"] != 0).sum())
+    assert n_and <= n_or, f"AND ({n_and}) cannot fire more than OR ({n_or})"
+
+    # OI profiles must stay silent without a live chain rather than invent one.
+    for name in ("44 \u00b7 Options: OI Change", "45 \u00b7 Options: OI Change + PCR",
+                 "46 \u00b7 Options: OI Change + Volume"):
+        out, _ = prepare(df, name, params)
+        assert int((out["signal"] != 0).sum()) == 0, f"{name} must not signal without live OI"
+
+    # Flip inverts every signal, exactly.
+    base, _ = prepare(df, "01 \u00b7 Dual EMA Crossover", params)
+    flipped, _ = prepare(df, "01 \u00b7 Dual EMA Crossover", dict(params, flip_entries=True))
+    assert (flipped["signal"] == -base["signal"]).all(), "flip must invert every signal"
+    assert int((base["signal"] != 0).sum()) == int((flipped["signal"] != 0).sum())
+
+    # OHLC of both candles must reach the trade table.
+    risk = RiskConfig("Fixed Points", 30.0, "Fixed Points", 60.0, 1.0)
+    res = run_backtest(df, "01 \u00b7 Dual EMA Crossover", params, risk)
+    for col in ("Entry Bar Open", "Entry Bar High", "Entry Bar Low", "Entry Bar Close",
+                "Exit Bar Open", "Exit Bar High", "Exit Bar Low", "Exit Bar Close"):
+        assert col in res.trades.columns, f"{col} missing from the trade table"
+    t = res.trades.dropna(subset=["Entry Bar High"])
+    assert (t["Entry Bar High"] >= t["Entry Bar Low"]).all(), "entry candle OHLC inconsistent"
+    print(f"   fib levels bounded, hybrid AND {n_and} <= OR {n_or}, OI silent offline, "
+          f"flip exact, OHLC on trades  OK")
+
+
 def _test_fill_semantics():
     """Signal on N must fill at the OPEN of N+1, and the stop is checked before the target."""
     idx = pd.date_range("2024-01-01 09:15", periods=6, freq="5min", tz="Asia/Kolkata")
@@ -5495,6 +6230,7 @@ def run_selftest() -> int:
         _test_liveness_logic()
         _test_zigzag_and_elliott()
         _test_threshold_strategies()
+        _test_new_profiles_and_flip()
         print("-- filters --")
         _test_filters()
         _test_new_filters()
@@ -5757,7 +6493,8 @@ def optimise(df: pd.DataFrame, base_params: dict, quantity: float, costs: CostMo
             "Strategy": strategy, "Stop-Loss": sl_type,
             "SL Value": sl_val if sl_type not in _SL_NO_VALUE else None,
             "Target": tp_type, "TP Value": tp_val if tp_type not in _TP_NO_VALUE else None,
-            "Filter": FILTER_LABELS.get(filt, "none"), "Trades": st_["total_trades"],
+            "Filter": FILTER_LABELS.get(filt, "none"), "Filter Key": filt or "",
+            "Trades": st_["total_trades"],
             "Win %": st_["win_rate"], "Sharpe": st_["sharpe"], "Net PnL": st_["net_pnl"],
             "Expectancy": st_["expectancy"], "Profit Factor": st_["profit_factor"],
             "Max DD": st_["max_drawdown"], "Reliability": st_["reliability"],
