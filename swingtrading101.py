@@ -5413,37 +5413,168 @@ SECTOR_INDICES = {
     "Nifty Fin Service": "NIFTY_FIN_SERVICE.NS", "Nifty Midcap": "^NSMIDCP", "Sensex": "^BSESN",
 }
 
+# NSE publishes its index constituents as plain CSVs. Fetching them beats any
+# list baked into a source file, because membership is reviewed periodically and
+# a hardcoded list starts drifting the day it is written. The bundled snapshots
+# below are only a fallback for when the fetch fails.
+NSE_INDEX_CSV = {
+    "Nifty 50": "https://nsearchives.nseindia.com/content/indices/ind_nifty50list.csv",
+    "Nifty Next 50": "https://nsearchives.nseindia.com/content/indices/ind_niftynext50list.csv",
+    "Nifty 100": "https://nsearchives.nseindia.com/content/indices/ind_nifty100list.csv",
+    "Nifty 200": "https://nsearchives.nseindia.com/content/indices/ind_nifty200list.csv",
+    "Nifty 500": "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv",
+    "Nifty Midcap 150":
+        "https://nsearchives.nseindia.com/content/indices/ind_niftymidcap150list.csv",
+    "Nifty Smallcap 250":
+        "https://nsearchives.nseindia.com/content/indices/ind_niftysmallcap250list.csv",
+    "Nifty Bank": "https://nsearchives.nseindia.com/content/indices/ind_niftybanklist.csv",
+    "Nifty IT": "https://nsearchives.nseindia.com/content/indices/ind_niftyitlist.csv",
+    "Nifty Auto": "https://nsearchives.nseindia.com/content/indices/ind_niftyautolist.csv",
+    "Nifty Pharma": "https://nsearchives.nseindia.com/content/indices/ind_niftypharmalist.csv",
+    "Nifty FMCG": "https://nsearchives.nseindia.com/content/indices/ind_niftyfmcglist.csv",
+    "Nifty Metal": "https://nsearchives.nseindia.com/content/indices/ind_niftymetallist.csv",
+    "Nifty Energy": "https://nsearchives.nseindia.com/content/indices/ind_niftyenergylist.csv",
+    "Nifty Realty": "https://nsearchives.nseindia.com/content/indices/ind_niftyrealtylist.csv",
+    "Nifty Financial Services":
+        "https://nsearchives.nseindia.com/content/indices/ind_niftyfinancelist.csv",
+}
+
 SCREENER_UNIVERSES = [
-    "Nifty 50", "Nifty Next 50", "Nifty 100 (50 + Next 50)",
+    "Nifty 50", "Nifty Next 50", "Nifty 100", "Nifty 200", "Nifty 500",
+    "Nifty Midcap 150", "Nifty Smallcap 250",
+    "Nifty Bank", "Nifty IT", "Nifty Auto", "Nifty Pharma", "Nifty FMCG", "Nifty Metal",
+    "Nifty Energy", "Nifty Realty", "Nifty Financial Services",
+    "All NSE equities (Dhan master)",
     "Broad indices", "Sector indices", "Custom list (paste or upload)",
 ]
 
+# Fallbacks only. Used when NSE cannot be reached, and flagged as stale when they are.
+_FALLBACK_LISTS = {
+    "Nifty 50": None,          # filled in below from the bundled snapshots
+    "Nifty Next 50": None,
+    "Nifty 100": None,
+}
+
+
+def _fetch_nse_constituents(index_name: str, timeout: float = 20.0) -> list[str]:
+    """
+    Download one index's constituent list from NSE.
+
+    NSE rejects unadorned requests, so a browser-ish header set is required. Any
+    failure raises, and the caller decides whether a stale fallback is better
+    than nothing.
+    """
+    import requests
+    from io import StringIO
+
+    url = NSE_INDEX_CSV[index_name]
+    headers = {
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/122.0 Safari/537.36"),
+        "Accept": "text/csv,application/csv,text/plain,*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.nseindia.com/",
+    }
+    session = requests.Session()
+    try:                                    # warm the cookie jar; NSE expects one
+        session.get("https://www.nseindia.com/", headers=headers, timeout=timeout)
+    except Exception:                                               # noqa: BLE001
+        pass
+    resp = session.get(url, headers=headers, timeout=timeout)
+    resp.raise_for_status()
+    frame = pd.read_csv(StringIO(resp.text))
+    col = next((c for c in frame.columns if c.strip().lower() == "symbol"), None)
+    if col is None:
+        raise ValueError(f"unexpected columns from NSE: {list(frame.columns)[:6]}")
+    names = [str(v).strip().upper() for v in frame[col].dropna()]
+    if not names:
+        raise ValueError("NSE returned an empty constituent list")
+    return names
+
+
+def nse_constituents(index_name: str) -> tuple[list[str], str | None]:
+    """Cached constituent lookup. Returns ``(symbols, note)``; never raises."""
+    def _load(name: str):
+        try:
+            return _fetch_nse_constituents(name), None
+        except Exception as exc:                                    # noqa: BLE001
+            return [], f"Could not reach NSE for {name} ({str(exc)[:90]})."
+
+    if st is None:
+        return _load(index_name)
+    if not hasattr(nse_constituents, "_impl"):
+        @st.cache_data(show_spinner=False, ttl=3600, max_entries=32)
+        def _impl(name: str):
+            return _load(name)
+        nse_constituents._impl = _impl
+    return nse_constituents._impl(index_name)
+
 
 def _universe_tickers(choice: str, custom_text: str, uploaded) -> tuple[list[str], str | None]:
-    note = None
-    if choice == "Nifty 50":
-        names, note = NIFTY_50, "Snapshot list; verify against the current NSE factsheet."
-    elif choice == "Nifty Next 50":
-        names, note = NIFTY_NEXT_50, "Snapshot list; verify against the current NSE factsheet."
-    elif choice.startswith("Nifty 100"):
-        names = NIFTY_50 + NIFTY_NEXT_50
-        note = "Snapshot list; verify against the current NSE factsheet."
-    elif choice == "Broad indices":
+    """
+    Resolve a universe choice to Yahoo tickers.
+
+    NSE index universes are fetched live and cached for an hour. Only when that
+    fails do we fall back to a bundled snapshot, and the note says so plainly --
+    a silently stale constituent list means screening companies that left the
+    index and missing the ones that joined.
+    """
+    if choice == "Broad indices":
         return ["^NSEI", "^NSEBANK", "^BSESN", "NIFTY_FIN_SERVICE.NS", "^NSMIDCP"], None
-    elif choice == "Sector indices":
+    if choice == "Sector indices":
         return list(SECTOR_INDICES.values()), None
-    else:
-        raw = ""
-        if uploaded is not None:
-            try:
-                raw = uploaded.getvalue().decode("utf-8", errors="ignore")
-            except Exception:                                       # noqa: BLE001
-                raw = ""
-        raw = (raw + "\n" + (custom_text or "")).replace(",", "\n")
-        names = [x.strip().upper() for x in raw.splitlines() if x.strip()]
-        return [n if ("." in n or n.startswith("^") or "=" in n) else f"{n}.NS"
-                for n in names], None
-    return [f"{n}.NS" for n in names], note
+
+    if choice.startswith("All NSE equities"):
+        # A second source that does not depend on NSE answering. It cannot tell
+        # us index MEMBERSHIP, so it is offered as the whole cash market rather
+        # than dressed up as an index.
+        try:
+            master = st.session_state.get("scrip_master") if st is not None else None
+            if master is None:
+                master = load_scrip_master()
+                if st is not None:
+                    st.session_state.scrip_master = master
+            eq = master[(master["instrument"].str.contains("EQUITY", na=False))
+                        & (master["exchange"].str.startswith("NSE", na=False))]
+            names = sorted({str(v).strip().upper() for v in eq["trading_symbol"].dropna()
+                            if str(v).strip() and str(v).strip().isalnum()})
+            if names:
+                return [f"{n}.NS" for n in names], (
+                    f"{len(names)} NSE cash symbols from the Dhan instrument master. This is the "
+                    "whole market, not an index — narrow it with the Symbols box.")
+        except Exception as exc:                                    # noqa: BLE001
+            return [], f"Could not load the Dhan instrument master ({str(exc)[:90]})."
+        return [], "The Dhan instrument master returned no NSE equities."
+
+    if choice in NSE_INDEX_CSV:
+        names, problem = nse_constituents(choice)
+        if names:
+            return [f"{n}.NS" for n in names], (f"{len(names)} constituents fetched live from "
+                                                f"NSE for {choice}.")
+        fallback = {"Nifty 50": NIFTY_50, "Nifty Next 50": NIFTY_NEXT_50,
+                    "Nifty 100": NIFTY_50 + NIFTY_NEXT_50}.get(choice)
+        if fallback:
+            return [f"{n}.NS" for n in fallback], (
+                f"{problem} Falling back to a bundled snapshot of {choice}, which is stale by "
+                "however long it has been since this file was written. Verify against the "
+                "current NSE factsheet, or paste your own list.")
+        return [], (f"{problem} There is no bundled fallback for {choice}: a 200 or 500 name "
+                    "list baked into a source file would be wrong within weeks, and screening a "
+                    "stale index means missing the joiners and scanning the leavers. Options: "
+                    "retry (NSE often blocks cloud IPs but answers from a home connection), use "
+                    "**All NSE equities (Dhan master)**, or paste your own list under "
+                    "**Custom list**.")
+
+    raw = ""
+    if uploaded is not None:
+        try:
+            raw = uploaded.getvalue().decode("utf-8", errors="ignore")
+        except Exception:                                           # noqa: BLE001
+            raw = ""
+    raw = (raw + "\n" + (custom_text or "")).replace(",", "\n")
+    names = [x.strip().upper() for x in raw.splitlines() if x.strip()]
+    return [n if ("." in n or n.startswith("^") or "=" in n) else f"{n}.NS"
+            for n in names], None
 
 
 def signal_detail(frame: pd.DataFrame, hit_time, direction: int, risk: "RiskConfig | None",
@@ -5610,7 +5741,8 @@ def tab_screener(cfg: dict) -> None:
         uploaded = st.file_uploader("...or upload a CSV / text file of tickers", type=["csv", "txt"],
                                     key="scr_upload")
 
-    tickers, note = _universe_tickers(universe, custom_text, uploaded)
+    with st.spinner(f"Resolving {universe} ..."):
+        tickers, note = _universe_tickers(universe, custom_text, uploaded)
     tickers = tickers[:int(max_names)]
     if note:
         st.warning(f"{note} Index membership is reviewed periodically and this list is baked "
@@ -6872,26 +7004,41 @@ def tab_signal_lab(cfg: dict) -> None:
     max_names = d1.number_input("Max tickers", 1, 200, min(10, len(tickers)), key="lab_max")
     iterations = d2.number_input("Combinations per ticker", 10, 500, 60, 10, key="lab_iters")
     min_trades = d3.number_input("Minimum trades to qualify", 1, 200, 10, key="lab_min")
-    st.markdown("**Quality thresholds** — a combination must clear every gate you set. "
-                "Leave a gate at 0 to ignore it.")
-    g1, g2, g3, g4, g5 = st.columns(5)
-    gates = {
-        "win": g1.number_input("Min win rate %", 0.0, 100.0, 0.0, 5.0, key="lab_g_win"),
-        "sharpe": g2.number_input("Min Sharpe", 0.0, 10.0, 0.0, 0.1, key="lab_g_sharpe"),
-        "expectancy": g3.number_input("Min expectancy", 0.0, 1e6, 0.0, 1.0, key="lab_g_exp"),
-        "pf": g4.number_input("Min profit factor", 0.0, 20.0, 0.0, 0.1, key="lab_g_pf"),
-        "pnl": g5.number_input("Min net PnL", 0.0, 1e9, 0.0, 100.0, key="lab_g_pnl"),
-    }
-    if float(gates.get("win") or 0) >= 80:
-        st.warning("A win rate that high is almost always bought with a bad reward:risk — many "
-                   "small wins funding a few large losses. Check expectancy and profit factor "
-                   "before believing it.")
+    e1, e2 = st.columns(2)
+    use_gates = e1.checkbox(
+        "Apply quality thresholds", value=False, key="lab_use_gates",
+        help="Off by default: the lab simply keeps the top-ranked combination per ticker. On, "
+             "a combination must clear every gate you set before it can be picked.")
+    use_mtf = e2.checkbox(
+        "Search multiple timeframes", value=False, key="lab_use_mtf",
+        help="Off by default: only the sidebar interval is searched. On, each extra timeframe "
+             "multiplies the combinations tried — and the more you try, the more the winner "
+             "owes to luck rather than edge.")
 
-    timeframes = st.multiselect(
-        "Timeframes to search", INTERVALS, default=[cfg["interval"]], key="lab_tfs",
-        help="Searching several timeframes finds more candidates, but it also multiplies the "
-             "number of combinations tried, and the more you try the more the winner owes to "
-             "luck. Periods are clamped automatically to what each interval can serve.")
+    gates: dict = {}
+    if use_gates:
+        st.markdown("**Quality thresholds** — a combination must clear every gate you set. "
+                    "Leave a gate at 0 to ignore it.")
+        g1, g2, g3, g4, g5 = st.columns(5)
+        gates = {
+            "win": g1.number_input("Min win rate %", 0.0, 100.0, 0.0, 5.0, key="lab_g_win"),
+            "sharpe": g2.number_input("Min Sharpe", 0.0, 10.0, 0.0, 0.1, key="lab_g_sharpe"),
+            "expectancy": g3.number_input("Min expectancy", 0.0, 1e6, 0.0, 1.0, key="lab_g_exp"),
+            "pf": g4.number_input("Min profit factor", 0.0, 20.0, 0.0, 0.1, key="lab_g_pf"),
+            "pnl": g5.number_input("Min net PnL", 0.0, 1e9, 0.0, 100.0, key="lab_g_pnl"),
+        }
+        if float(gates.get("win") or 0) >= 80:
+            st.warning("A win rate that high is almost always bought with a bad reward:risk — "
+                       "many small wins funding a few large losses. Check expectancy and profit "
+                       "factor before believing it.")
+
+    if use_mtf:
+        timeframes = st.multiselect(
+            "Timeframes to search", INTERVALS, default=[cfg["interval"]], key="lab_tfs",
+            help="Periods are clamped automatically to what each interval can serve.")
+    else:
+        timeframes = [cfg["interval"]]
+        st.caption(f"Searching the sidebar timeframe only (`{cfg['interval']}`).")
     safe_only = st.checkbox("Backtest-safe exits only (exclude distance trails)", value=True,
                             key="lab_safe",
                             help="Distance trails cannot be simulated faithfully on OHLC bars, "
@@ -7393,6 +7540,69 @@ def _test_live_entry_and_gates():
     print("   catch-up entry window and Signal Lab quality gates  OK")
 
 
+def _reset_constituent_cache() -> None:
+    """Drop both the wrapper and Streamlit's own cache for the constituent lookup."""
+    nse_constituents.__dict__.pop("_impl", None)
+    if st is not None:
+        try:
+            st.cache_data.clear()
+        except Exception:                                           # noqa: BLE001
+            pass
+
+
+def _test_universe_resolution():
+    """
+    Index membership must come from a live source, and a failure must be loud.
+
+    A constituent list baked into a source file is wrong within weeks: you screen
+    the companies that left the index and miss the ones that joined. So the NSE
+    fetch is primary, the bundled snapshot is a flagged fallback, and the large
+    indices have no fallback at all rather than a quietly stale one.
+    """
+    fake_master = pd.DataFrame({
+        "security_id": ["1", "2", "3", "4"],
+        "trading_symbol": ["RELIANCE", "TCS", "NIFTYFUT", "INFY"],
+        "custom_symbol": [""] * 4, "name": [""] * 4,
+        "exchange": ["NSE", "NSE", "NSE", "BSE"], "segment": ["E", "E", "D", "E"],
+        "instrument": ["EQUITY", "EQUITY", "FUTIDX", "EQUITY"],
+        "expiry": [None] * 4, "strike": [None] * 4, "option_type": [""] * 4,
+        "lot_size": [1, 1, 50, 1]})
+
+    g = globals()
+    real_fetch, real_master = g["_fetch_nse_constituents"], g["load_scrip_master"]
+    try:
+        g["_fetch_nse_constituents"] = lambda name, timeout=20.0: ["RELIANCE", "HDFCBANK", "ITC"]
+        _reset_constituent_cache()
+        for index_name in ("Nifty 200", "Nifty 500", "Nifty 50"):
+            tickers, note = _universe_tickers(index_name, "", None)
+            assert tickers == ["RELIANCE.NS", "HDFCBANK.NS", "ITC.NS"], f"{index_name}: bad list"
+            assert "live from NSE" in (note or ""), f"{index_name}: provenance not stated"
+
+        def _boom(name, timeout=20.0):
+            raise RuntimeError("blocked")
+        g["_fetch_nse_constituents"] = _boom
+        _reset_constituent_cache()
+        tickers, note = _universe_tickers("Nifty 50", "", None)
+        assert len(tickers) == 50, "the Nifty 50 snapshot fallback must still return a list"
+        assert "bundled snapshot" in (note or "") and "stale" in (note or "").lower(), \
+            f"the fallback must admit it is stale, got: {note}"
+        tickers, note = _universe_tickers("Nifty 500", "", None)
+        assert tickers == [] and "Custom list" in (note or ""), \
+            "a large index must fail loudly rather than serve a stale list"
+
+        g["load_scrip_master"] = lambda: fake_master
+        tickers, note = _universe_tickers("All NSE equities (Dhan master)", "", None)
+        assert tickers == ["RELIANCE.NS", "TCS.NS"], f"NSE cash filter wrong: {tickers}"
+    finally:
+        g["_fetch_nse_constituents"] = real_fetch
+        g["load_scrip_master"] = real_master
+        _reset_constituent_cache()
+
+    tickers, _ = _universe_tickers("Custom list (paste or upload)", "reliance, ^NSEI\nTCS", None)
+    assert tickers == ["RELIANCE.NS", "^NSEI", "TCS.NS"], f"custom parsing wrong: {tickers}"
+    print("   universe resolution: live NSE, flagged fallback, loud failure  OK")
+
+
 def _test_signal_detail():
     """
     The enriched signal columns must reconcile with each other exactly.
@@ -7652,6 +7862,7 @@ def run_selftest() -> int:
         _test_pattern_library()
         _test_signal_detail()
         _test_live_entry_and_gates()
+        _test_universe_resolution()
         print("-- filters --")
         _test_filters()
         _test_new_filters()
