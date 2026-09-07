@@ -1414,20 +1414,90 @@ def fetch_data(ticker, interval, period):
     return normalize_index_to_ist(fetch_data_yf(ticker, interval, period), ticker)
 
 
-def dhan_get_ltp(security_id, segment):
-    """Zero-delay live LTP straight from Dhan's market-quote endpoint."""
+@st.cache_data(ttl=3, show_spinner=False)
+def _dhan_ltp_cached(security_id, segment, _token_fp):
+    """
+    One LTP call, cached for 3 seconds.
+
+    The cache exists because Dhan rate-limits this endpoint and the app can
+    otherwise hit it many times per cycle: the entry blocker checks a premium,
+    the leg resolver reads it again, the exit check reads it, and the position
+    panel refreshes every 2s. Those duplicate calls were themselves triggering
+    throttling, and a throttled response is indistinguishable from "no price"
+    unless the error is captured — which is why an entry could be blocked with
+    "premium could not be read" during market hours.
+
+    Returns (price, error_message).
+    """
     try:
         resp = requests.post(f"{DHAN_API_BASE}/marketfeed/ltp", headers=_dhan_headers(),
                              json={segment: [int(security_id)]}, timeout=10)
-        resp.raise_for_status()
-        data = resp.json().get("data", {})
-        seg = data.get(segment, {})
+        if resp.status_code == 429:
+            return None, "Dhan rate-limited the price request (HTTP 429) — too many calls in a short window."
+        if resp.status_code in (401, 403):
+            return None, f"Dhan rejected the credentials (HTTP {resp.status_code}) — check the Access Token."
+        if resp.status_code != 200:
+            return None, f"Dhan returned HTTP {resp.status_code} for the price request."
+        body = resp.json() or {}
+        seg = (body.get("data") or {}).get(segment, {}) or {}
         entry = seg.get(str(security_id)) or (next(iter(seg.values())) if seg else None)
-        if entry and "last_price" in entry:
-            return float(entry["last_price"])
+        if entry and entry.get("last_price") is not None:
+            px = float(entry["last_price"])
+            if px > 0:
+                return px, None
+            return None, "Dhan returned a last price of 0 — the contract has not traded."
+        return None, "Dhan returned no price for this contract."
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {str(exc)[:90]}"
+
+
+def dhan_get_ltp(security_id, segment, return_error=False):
+    """Live LTP, with the failure reason preserved rather than swallowed."""
+    if not security_id:
+        return (None, "No security ID.") if return_error else None
+    _, token = _dhan_creds()
+    px, err = _dhan_ltp_cached(str(security_id), segment, hash(str(token)) % 10_000_019)
+    if err:
+        st.session_state["last_ltp_error"] = err
+    return (px, err) if return_error else px
+
+
+def option_premium_now(cfg, security_id, leg=None, strike=None, return_source=False):
+    """
+    The current premium for an option leg, from the best source available.
+
+    Tries the live LTP endpoint first. If that fails — rate limit, a transient
+    error, or a contract that simply has not ticked — it falls back to the
+    LAST TRADED PRICE ALREADY PRESENT IN THE OPTION CHAIN SNAPSHOT, which this
+    app fetches anyway and caches for 60s. That fallback is the difference
+    between "we cannot price this" and "we have a slightly older price", and
+    blocking an entry over the former when the latter is available was wrong.
+    """
+    pc = (cfg or {}).get("product_cfg") or {}
+    seg = pc.get("exchange_segment", "NSE_FNO")
+    px, err = dhan_get_ltp(security_id, seg, return_error=True)
+    if px:
+        return (px, "live LTP") if return_source else px
+
+    # ---- fallback: the chain snapshot we already hold ----
+    try:
+        snap = get_zero_hero_snapshot() if (pc.get("zero_hero_mode")) else get_oi_snapshot()
+        strikes = (snap or {}).get("strikes") or {}
+        key = "ce_ltp" if (leg or "").upper() == "CE" else "pe_ltp"
+        if strike is not None:
+            row = strikes.get(float(strike))
+            if row and row.get(key):
+                return (float(row[key]), "chain snapshot") if return_source else float(row[key])
+        # No strike given: locate the contract by its security id is not possible
+        # from the chain, so fall back to the configured strike for this leg.
+        cfg_strike = pc.get("ce_strike") if (leg or "").upper() == "CE" else pc.get("pe_strike")
+        if cfg_strike is not None:
+            row = strikes.get(float(cfg_strike))
+            if row and row.get(key):
+                return (float(row[key]), "chain snapshot") if return_source else float(row[key])
     except Exception:
         pass
-    return None
+    return (None, err or "unavailable") if return_source else None
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -9531,10 +9601,14 @@ def option_entry_blocker(full_cfg, direction, strategy=None):
         return ("option premiums come from Dhan and there is no Access Token set. Option prices are not "
                 "available from yfinance at all, so an options position cannot be priced — not even on paper. "
                 "Add the token under 🔐 Dhan Account.")
-    prem = dhan_get_ltp(sec, pc.get("exchange_segment", "NSE_FNO"))
+    strike = pc.get("ce_strike") if direction == 1 else pc.get("pe_strike")
+    prem, source = option_premium_now(full_cfg, sec, leg, strike, return_source=True)
     if prem is None or float(prem) <= 0:
-        return (f"the live premium for the {leg} leg (security {sec}) could not be read. This is usual outside "
-                "market hours, and can also mean the contract is illiquid or the expiry has passed.")
+        detail = st.session_state.get("last_ltp_error") or source or "unknown reason"
+        return (f"no premium could be obtained for the {leg} leg (security {sec}) from EITHER the live price "
+                f"endpoint or the cached option chain. Reported cause: {detail}. Common explanations: the market "
+                "is closed, the contract is illiquid and has not traded, the expiry has passed, or Dhan is "
+                "rate-limiting the price endpoint.")
     return None
 
 
@@ -9545,7 +9619,8 @@ def option_leg_for(full_cfg, direction):
     sec = pc.get("ce_security_id") if direction == 1 else pc.get("pe_security_id")
     if not sec:
         return leg, None, None
-    prem = dhan_get_ltp(sec, pc.get("exchange_segment", "NSE_FNO"))
+    strike = pc.get("ce_strike") if direction == 1 else pc.get("pe_strike")
+    prem = option_premium_now(full_cfg, sec, leg, strike)
     return leg, sec, (float(prem) if prem is not None else None)
 
 
@@ -9577,11 +9652,11 @@ def check_option_premium_exit(cfg, pos):
     sec = pos.get("opt_security_id")
     if not sec:
         return False, None, None
-    now_prem = dhan_get_ltp(sec, pc.get("exchange_segment", "NSE_FNO"))
+    leg = pos.get("opt_leg", "option")
+    now_prem = option_premium_now(cfg, sec, leg, pos.get("opt_strike"))
     if now_prem is None:
         return False, None, None
     now_prem = float(now_prem)
-    leg = pos.get("opt_leg", "option")
     sl, tgt = pos.get("sl"), pos.get("target")
     if sl is not None and now_prem <= float(sl):
         return True, now_prem, (f"{leg} premium stop (₹{now_prem:.2f} ≤ ₹{float(sl):.2f}, "
@@ -9993,8 +10068,13 @@ def evaluate_live_signal(ticker, interval, period, strategy, params, filters, sl
                 _leg, _sec, _prem = option_leg_for(full_cfg, last_sig)
                 if _prem and _prem > 0:
                     _osl, _otgt = option_premium_levels(_prem, params, full_cfg)
+                    _pc_now = (full_cfg or {}).get("product_cfg") or {}
                     new_pos.update({
                         "trade_instrument": "OPTION", "opt_leg": _leg, "opt_security_id": _sec,
+                        # Kept so the chain-snapshot fallback can locate this
+                        # contract if the live price endpoint is unavailable later.
+                        "opt_strike": (_pc_now.get("ce_strike") if last_sig == 1
+                                       else _pc_now.get("pe_strike")),
                         "opt_entry_premium": _prem, "underlying_entry": entry_price,
                         "entry_price": _prem, "sl": _osl, "target": _otgt,
                         "initial_sl": _osl, "initial_target": _otgt,
