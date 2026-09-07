@@ -3658,7 +3658,7 @@ _STATE_DEFAULTS = {
     "live_frame_warnings": [], "live_vix": None, "candle_refreshes": 0,
     "ltp_note": None, "screener_results": None, "screener_error": None,
     "last_seen_ltp": None, "last_ltp_change_ts": 0.0, "pending_ticker": None,
-    "last_closed_bar": None, "option_metrics": None,
+    "last_closed_bar": None, "option_metrics": None, "live_last_signal_time": None,
     "optimizer_results": None, "pattern_results": None, "pending_combo": None,
     "pattern_rows": None, "pattern_frames": None, "pattern_hits": None,
     "pattern_errors": None, "lab_results": None,
@@ -3703,6 +3703,7 @@ def live_ledger_frame() -> pd.DataFrame:
 def reset_live_runtime() -> None:
     st.session_state.live_position = None
     st.session_state.live_last_bar = None
+    st.session_state.live_last_signal_time = None
     st.session_state.live_snapshot = None
     st.session_state.live_error = None
     st.session_state.live_poll_count = 0
@@ -3741,6 +3742,9 @@ class LiveSnapshot:
     feed_age_seconds: float = 0.0
     stale: bool = False                     # candles are lagging (signals may be old)
     quote_live: bool = True                 # the PRICE is moving (the venue is open)
+    recent_signal: int = 0                  # most recent signal on ANY closed candle
+    recent_signal_time: Any = None
+    recent_signal_bars_ago: int | None = None
     ltp_source: str = "Yahoo (delayed candle close)"
 
     @property
@@ -3826,6 +3830,18 @@ def build_snapshot(cfg: dict, frame: pd.DataFrame, reports, warnings, vix,
     else:
         quote_live = since_change <= QUOTE_LIVE_WINDOW
 
+    # The screener reports signals from a WINDOW of recent candles, so the live
+    # panel must be able to talk about the same thing. Without this the engine
+    # can only ever see the newest closed bar, and a signal that fired two bars
+    # ago looks like nothing happened at all.
+    closed_sig = frame["signal"].iloc[:-1]
+    recent = closed_sig[closed_sig != 0]
+    r_sig, r_time, r_ago = 0, None, None
+    if len(recent):
+        r_time = recent.index[-1]
+        r_sig = int(recent.iloc[-1])
+        r_ago = int(len(frame) - 2 - frame.index.get_loc(r_time))
+
     return LiveSnapshot(
         frame=frame, ltp=ltp, next_open=float(frame["Open"].iloc[-1]),
         last_closed_time=frame.index[closed],
@@ -3834,7 +3850,8 @@ def build_snapshot(cfg: dict, frame: pd.DataFrame, reports, warnings, vix,
         status=strat.status(frame.iloc[:len(frame) + closed + 1], cfg["params"]),
         filter_reports=reports, fetched_at=pd.Timestamp.now(), bars=len(frame),
         data_warnings=warnings, vix=vix, feed_age_seconds=age, stale=stale,
-        quote_live=quote_live, ltp_source=ltp_source)
+        quote_live=quote_live, ltp_source=ltp_source,
+        recent_signal=r_sig, recent_signal_time=r_time, recent_signal_bars_ago=r_ago)
 
 
 def _live_close(position: Position, exit_price: float, reason: str) -> dict:
@@ -4049,16 +4066,40 @@ def run_cycle(cfg: dict) -> None:
         st.session_state.live_last_bar = snapshot.last_closed_time
         return
 
-    already_seen = not new_bar
     st.session_state.live_last_bar = snapshot.last_closed_time
-    if already_seen or snapshot.last_closed_signal == 0:
+    direction = int(snapshot.last_closed_signal)
+    signal_time = snapshot.last_closed_time
+    catch_up = False
+
+    if direction == 0:
+        # Catch-up: the screener reports a signal from a window of candles, and
+        # the engine used to see only the newest one. With a lookback set we can
+        # still act on a slightly older signal -- but the N+1 open is long gone,
+        # so the fill is the CURRENT price and the row says so.
+        lookback = int(cfg.get("entry_lookback", 0) or 0)
+        if (lookback > 0 and snapshot.recent_signal != 0
+                and snapshot.recent_signal_bars_ago is not None
+                and 0 < snapshot.recent_signal_bars_ago <= lookback):
+            direction = int(snapshot.recent_signal)
+            signal_time = snapshot.recent_signal_time
+            catch_up = True
+
+    if direction == 0:
         return
+    if st.session_state.get("live_last_signal_time") == signal_time:
+        return                                   # this exact signal was already traded
+    st.session_state.live_last_signal_time = signal_time
 
     # Signal on candle N -> fill at the OPEN of candle N+1 (already printed).
-    fill = snapshot.ltp if cfg.get("fill_at_ltp") else snapshot.next_open
+    if catch_up:
+        fill = snapshot.ltp
+        log_event(f"Catch-up entry: the signal fired {snapshot.recent_signal_bars_ago} candle(s) "
+                  f"ago, so the N+1 open has passed. Filling at the current price "
+                  f"{fmt(fill)} instead.", "warn")
+    else:
+        fill = snapshot.ltp if cfg.get("fill_at_ltp") else snapshot.next_open
     cfg["_ltp_at_fill"] = snapshot.ltp
-    _open_live_position(cfg, snapshot.last_closed_signal, fill, closed_ctx,
-                        snapshot.last_closed_time)
+    _open_live_position(cfg, direction, fill, closed_ctx, signal_time)
 
 
 def should_poll(cfg: dict) -> bool:
@@ -4291,6 +4332,18 @@ def render_sidebar() -> dict:
                    "requests a minute. Quotes are small, but Yahoo still throttles: if you start "
                    "seeing backoff messages, ease this up. The heavy candle download runs on its "
                    "own slower cadence below and is unaffected.")
+    entry_lookback = sb.number_input(
+        "Live: act on a signal up to N candles old", min_value=0, max_value=20, value=0, step=1,
+        disabled=live, key="cfg_entry_look",
+        help="0 keeps the strict rule: only a signal on the newest CLOSED candle is taken, "
+             "filled at the next candle's open. Raise it to catch a signal the screener "
+             "reported a few candles ago — but the N+1 open has passed by then, so the fill is "
+             "the current price and the trade row says so.")
+    square_off_on_stop = sb.checkbox(
+        "Square off the open position when the engine stops", value=False, disabled=live,
+        key="cfg_sq_stop",
+        help="Off by default: stopping the engine leaves the position open. Be aware that "
+             "nothing is then watching its stop-loss.")
     allow_stale = sb.checkbox("Live: allow entries on a frozen feed", value=False,
                               disabled=live, key="cfg_stale",
                               help="Off by default. When the venue is closed the LTP is just an "
@@ -4467,6 +4520,8 @@ def render_sidebar() -> dict:
             "poll_seconds": float(poll_seconds), "fill_at_ltp": bool(fill_at_ltp),
             "flip_entries": bool(flip),
             "allow_stale_entries": bool(allow_stale),
+            "entry_lookback": int(entry_lookback),
+            "square_off_on_stop": bool(square_off_on_stop),
             "candle_seconds": float(candle_seconds), "costs": costs,
             "walk_forward": bool(walk_fwd), "wf_folds": int(wf_folds),
             "use_dhan_data": bool(use_dhan_data), "email": email_cfg,
@@ -4876,36 +4931,31 @@ def tab_live(cfg: dict) -> None:
     st.subheader("Live Sandbox Operations Panel")
     st.caption("Signals are read from closed candles and filled at the next candle's open. "
                "Stop and target are then checked against the LTP on every poll, stop first.")
-    _live_controls(cfg)
-    st.divider()
     if st.session_state.live_running:
+        # The controls are rendered INSIDE the fragment. Left outside, they only
+        # redraw on a full app rerun, so the square-off button stayed greyed out
+        # for as long as the fragment was quietly opening and closing positions.
         _mount_live_fragment(float(st.session_state.live_config.get("poll_seconds", 5.0)))
     else:
+        _live_controls(cfg)
+        st.divider()
         _idle_panel(cfg)
 
 
 def _live_controls(cfg: dict) -> None:
+    """
+    The three operator actions.
+
+    Rendered inside the live fragment while running, so the square-off button
+    reflects the position as it actually is on this tick rather than as it was
+    at the last full page render.
+    """
     running = bool(st.session_state.live_running)
     position = st.session_state.live_position
     c1, c2, c3 = st.columns(3)
 
-    saved = db_load_position() if st.session_state.live_position is None else None
-    if saved:
-        st.warning(f"An open {('LONG' if saved['direction'] > 0 else 'SHORT')} position on "
-                   f"`{saved['symbol']}` was saved at {saved.get('saved_at', '?')[:19]} and never "
-                   "closed. Its trailed stop and target are restored exactly as they were -- "
-                   "recomputing them would hand back risk the trade had already locked away.")
-        rc1, rc2 = st.columns(2)
-        if rc1.button("Resume saved position", type="primary", width="stretch"):
-            st.session_state.live_position = restore_position(saved)
-            log_event(f"Resumed the saved {saved['symbol']} position from the database.", "warn")
-            st.rerun()
-        if rc2.button("Discard saved position", width="stretch"):
-            db_clear_position()
-            log_event("Discarded the saved position without booking a trade.", "warn")
-            st.rerun()
-
-    if c1.button("Start Live Automation Core", type="primary", disabled=running, width="stretch"):
+    if c1.button("Start Live Automation Core", type="primary", disabled=running,
+                 width="stretch"):
         reset_live_runtime()
         st.session_state.live_config = dict(cfg)
         st.session_state.live_running = True
@@ -4913,25 +4963,34 @@ def _live_controls(cfg: dict) -> None:
         st.session_state.live_last_poll = 0.0
         log_event(f"Core started :: {cfg['symbol']} | {cfg['interval']} | {cfg['strategy']} | "
                   f"{cfg['risk'].as_summary()} | poll {fmt(cfg['poll_seconds'],1)}s", "success")
-        st.rerun()
+        st.rerun(scope="app")
 
     if c2.button("Stop Live Processing Engine", disabled=not running, width="stretch"):
-        # Stopping the engine flattens the book. Leaving an untracked position
-        # open after the monitor is switched off is how a stop-loss silently
-        # stops existing.
-        trade = square_off("Squared Off on Engine Stop")
+        squared = None
+        if st.session_state.live_position is not None and cfg.get("square_off_on_stop"):
+            squared = square_off("Squared Off on Engine Stop")
         st.session_state.live_running = False
-        if trade:
-            st.toast(f"Position squared off at {fmt(trade['Exit Price'])} "
-                     f"for {fmt_signed(trade['PnL'])} and written to the ledger.")
+        if squared:
+            st.toast(f"Position squared off at {fmt(squared['Exit Price'])} "
+                     f"for {fmt_signed(squared['PnL'])} and written to the ledger.")
+        elif st.session_state.live_position is not None:
+            log_event("Engine stopped with a position still OPEN. Its stop-loss and target are "
+                      "no longer being monitored by anything.", "warn")
         log_event("Core stopped.", "info")
-        st.rerun()
+        st.rerun(scope="app")
 
-    if c3.button("Manual Emergency Square-Off", disabled=position is None, width="stretch"):
+    if c3.button("Manual Square-Off", disabled=position is None, width="stretch",
+                 help="Closes the tracked position now and writes it to the ledger. The engine "
+                      "keeps running and will take the next qualifying signal."):
         trade = square_off("Manual Square-Off")
         if trade:
-            st.toast(f"Closed at {fmt(trade['Exit Price'])} for {fmt_signed(trade['PnL'])}.")
-        st.rerun()
+            st.toast(f"Closed at {fmt(trade['Exit Price'])} for {fmt_signed(trade['PnL'])}. "
+                     "The engine is still running.")
+        st.rerun(scope="app")
+
+    if running and st.session_state.live_position is None:
+        st.caption("Flat and scanning. A manual square-off does not stop the engine; it will "
+                   "enter again on the next qualifying signal.")
 
 
 def _idle_panel(cfg: dict) -> None:
@@ -4956,8 +5015,13 @@ def _live_body() -> None:
     if not cfg:
         st.error("Live configuration was lost. Stop and restart the engine.")
         return
+    # Poll FIRST, then draw the controls. Rendering them beforehand meant the
+    # square-off button described the position as it was one tick ago, so it sat
+    # greyed out on the very tick that opened a trade.
     if should_poll(cfg):
         run_cycle(cfg)
+    _live_controls(cfg)
+    st.divider()
 
     if st.session_state.live_error:
         st.error(f"Live feed issue: {st.session_state.live_error}")
@@ -5134,6 +5198,26 @@ def _searching_widget(cfg: dict, snapshot: LiveSnapshot) -> None:
     else:
         st.info(f"**Searching for Signal** :: {snapshot.status.headline}")
 
+    lookback = int(cfg.get("entry_lookback", 0) or 0)
+    ago = snapshot.recent_signal_bars_ago
+    if snapshot.last_closed_signal != 0:
+        st.success(f"**Signal on the newest closed candle** "
+                   f"({'LONG' if snapshot.last_closed_signal > 0 else 'SHORT'}). The next tick "
+                   f"will take it unless a filter or the feed check blocks it.")
+    elif snapshot.recent_signal != 0 and ago is not None:
+        side = "LONG" if snapshot.recent_signal > 0 else "SHORT"
+        if lookback >= ago > 0:
+            st.info(f"**A {side} signal fired {ago} candle(s) ago** and catch-up is set to "
+                    f"{lookback}, so the next tick will take it at the current price.")
+        else:
+            st.warning(
+                f"**A {side} signal fired {ago} candle(s) ago, and it will NOT be taken.** The "
+                f"engine only acts on the newest closed candle, which is why a screener hit from "
+                f"a few candles back does not become a trade. Either wait for a fresh signal, or "
+                f"raise *Live: act on a signal up to N candles old* in the sidebar to at least "
+                f"{ago}. The catch-up fill is the current price, not the original next-candle "
+                f"open.")
+
     metrics = [("Live LTP", fmt(snapshot.ltp))] + list(snapshot.status.metrics)
     cols = st.columns(min(len(metrics), 5))
     for i, (label, value) in enumerate(metrics):
@@ -5185,6 +5269,26 @@ def _strategy_status_panel(cfg: dict, snapshot: LiveSnapshot) -> None:
     """
     st.markdown("#### Strategy & Filter Status")
     st.info(f"**{cfg['strategy']}** :: {snapshot.status.headline}")
+    lookback = int(cfg.get("entry_lookback", 0) or 0)
+    ago = snapshot.recent_signal_bars_ago
+    if snapshot.last_closed_signal != 0:
+        st.success(f"**Signal on the newest closed candle** "
+                   f"({'LONG' if snapshot.last_closed_signal > 0 else 'SHORT'}). The next tick "
+                   f"will take it unless a filter or the feed check blocks it.")
+    elif snapshot.recent_signal != 0 and ago is not None:
+        side = "LONG" if snapshot.recent_signal > 0 else "SHORT"
+        if lookback >= ago > 0:
+            st.info(f"**A {side} signal fired {ago} candle(s) ago** and catch-up is set to "
+                    f"{lookback}, so the next tick will take it at the current price.")
+        else:
+            st.warning(
+                f"**A {side} signal fired {ago} candle(s) ago, and it will NOT be taken.** The "
+                f"engine only acts on the newest closed candle, which is why a screener hit from "
+                f"a few candles back does not become a trade. Either wait for a fresh signal, or "
+                f"raise *Live: act on a signal up to N candles old* in the sidebar to at least "
+                f"{ago}. The catch-up fill is the current price, not the original next-candle "
+                f"open.")
+
     metrics = [("Live LTP", fmt(snapshot.ltp))] + list(snapshot.status.metrics)
     cols = st.columns(min(len(metrics), 5))
     for i, (label, value) in enumerate(metrics):
@@ -6632,8 +6736,26 @@ def tab_patterns(cfg: dict) -> None:
 # =============================================================================
 # SECTION 19c -- SIGNAL LAB  (optimiser + live screener in one pass)
 # =============================================================================
+def _meets_thresholds(row, gates: dict) -> bool:
+    """Every gate the operator set must hold. An unset gate is not a gate."""
+    checks = (("Win %", gates.get("win")), ("Sharpe", gates.get("sharpe")),
+              ("Expectancy", gates.get("expectancy")), ("Profit Factor", gates.get("pf")),
+              ("Net PnL", gates.get("pnl")))
+    for col, floor in checks:
+        if floor in (None, 0.0):
+            continue
+        try:
+            value = float(row[col])
+        except (TypeError, ValueError, KeyError):
+            return False
+        if not np.isfinite(value) or value < float(floor):
+            return False
+    return True
+
+
 def run_signal_lab(tickers: list[str], cfg: dict, objective: str, iterations: int,
                    min_trades: int, signal_window: int, safe_only: bool,
+                   timeframes: list[str] | None = None, gates: dict | None = None,
                    progress=None) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     For each ticker: search for the best configuration on its own history, then
@@ -6646,29 +6768,42 @@ def run_signal_lab(tickers: list[str], cfg: dict, objective: str, iterations: in
     """
     rows, errors = [], []
     costs = cfg.get("costs") or CostModel()
-    for i, ticker in enumerate(tickers):
+    gates = gates or {}
+    timeframes = timeframes or [cfg["interval"]]
+    jobs = [(t, tf) for t in tickers for tf in timeframes]
+    for i, (ticker, interval) in enumerate(jobs):
         if progress is not None:
-            progress.progress((i + 1) / max(1, len(tickers)), text=f"Optimising {ticker} ...")
+            progress.progress((i + 1) / max(1, len(jobs)),
+                              text=f"Optimising {ticker} · {interval} ...")
+        period, _ = sanitize_period(interval, cfg["period"])
         try:
-            bundle = load_market_data(ticker, cfg["period"], cfg["interval"],
+            bundle = load_market_data(ticker, period, interval,
                                       freshness_seconds=300, min_bars=WARMUP_BARS + 40)
         except Exception as exc:                                    # noqa: BLE001
-            errors.append({"Ticker": ticker, "Problem": str(exc)[:140]})
+            errors.append({"Ticker": ticker, "Timeframe": interval, "Problem": str(exc)[:140]})
             continue
 
         params = dict(cfg["params"])
-        params["symbol"], params["interval"] = ticker, cfg["interval"]
+        params["symbol"], params["interval"] = ticker, interval
+        params["intraday"] = interval in INTRADAY_INTERVALS
         try:
             table = optimise(bundle.frame, params, cfg["quantity"], costs, objective,
                              min_trades, iterations, seed=11, safe_exits_only=safe_only)
         except Exception as exc:                                    # noqa: BLE001
-            errors.append({"Ticker": ticker, "Problem": f"optimiser: {str(exc)[:120]}"})
+            errors.append({"Ticker": ticker, "Timeframe": interval,
+                           "Problem": f"optimiser: {str(exc)[:120]}"})
             continue
         if table.empty:
-            errors.append({"Ticker": ticker, "Problem": "no combination met the minimum trades"})
+            errors.append({"Ticker": ticker, "Timeframe": interval,
+                           "Problem": "no combination met the minimum trades"})
             continue
 
-        best = table.iloc[0]
+        qualified = table[table.apply(lambda r: _meets_thresholds(r, gates), axis=1)]
+        if qualified.empty:
+            errors.append({"Ticker": ticker, "Timeframe": interval,
+                           "Problem": "no combination met the quality thresholds"})
+            continue
+        best = qualified.iloc[0]
         fcfg = default_filter_config()
         fkey = str(best.get("Filter Key") or "")
         if fkey:
@@ -6676,7 +6811,8 @@ def run_signal_lab(tickers: list[str], cfg: dict, objective: str, iterations: in
         try:
             frame, _ = prepare(bundle.frame, best["Strategy"], params, fcfg, {})
         except Exception as exc:                                    # noqa: BLE001
-            errors.append({"Ticker": ticker, "Problem": f"signal check: {str(exc)[:120]}"})
+            errors.append({"Ticker": ticker, "Timeframe": interval,
+                           "Problem": f"signal check: {str(exc)[:120]}"})
             continue
 
         window = frame["signal"].iloc[-(signal_window + 1):-1]
@@ -6686,7 +6822,7 @@ def run_signal_lab(tickers: list[str], cfg: dict, objective: str, iterations: in
             when, side = "no signal", "-"
             detail = {"Price Now": round(float(frame["Close"].iloc[-1]), 2),
                       "Last Candle": pd.Timestamp(frame.index[-1]),
-                      "Scanned At": pd.Timestamp.now(), "Interval": cfg["interval"]}
+                      "Scanned At": pd.Timestamp.now(), "Interval": interval}
         else:
             sig_time = fired.index[-1]
             direction = int(fired.iloc[-1])
@@ -6698,10 +6834,10 @@ def run_signal_lab(tickers: list[str], cfg: dict, objective: str, iterations: in
                                       float(best["SL Value"] or 0.0), best["Target"],
                                       float(best["TP Value"] or 0.0), cfg["quantity"])
             detail = signal_detail(frame, sig_time, direction, risk_for_row, ticker,
-                                   cfg["interval"])
+                                   interval)
 
         rows.append({
-            "Ticker": ticker, "Signal": side, "When": when, **detail,
+            "Ticker": ticker, "Timeframe": interval, "Signal": side, "When": when, **detail,
             "Best Strategy": best["Strategy"],
             "Stop-Loss": best["Stop-Loss"], "SL Value": best["SL Value"],
             "Target": best["Target"], "TP Value": best["TP Value"],
@@ -6736,6 +6872,26 @@ def tab_signal_lab(cfg: dict) -> None:
     max_names = d1.number_input("Max tickers", 1, 200, min(10, len(tickers)), key="lab_max")
     iterations = d2.number_input("Combinations per ticker", 10, 500, 60, 10, key="lab_iters")
     min_trades = d3.number_input("Minimum trades to qualify", 1, 200, 10, key="lab_min")
+    st.markdown("**Quality thresholds** — a combination must clear every gate you set. "
+                "Leave a gate at 0 to ignore it.")
+    g1, g2, g3, g4, g5 = st.columns(5)
+    gates = {
+        "win": g1.number_input("Min win rate %", 0.0, 100.0, 0.0, 5.0, key="lab_g_win"),
+        "sharpe": g2.number_input("Min Sharpe", 0.0, 10.0, 0.0, 0.1, key="lab_g_sharpe"),
+        "expectancy": g3.number_input("Min expectancy", 0.0, 1e6, 0.0, 1.0, key="lab_g_exp"),
+        "pf": g4.number_input("Min profit factor", 0.0, 20.0, 0.0, 0.1, key="lab_g_pf"),
+        "pnl": g5.number_input("Min net PnL", 0.0, 1e9, 0.0, 100.0, key="lab_g_pnl"),
+    }
+    if float(gates.get("win") or 0) >= 80:
+        st.warning("A win rate that high is almost always bought with a bad reward:risk — many "
+                   "small wins funding a few large losses. Check expectancy and profit factor "
+                   "before believing it.")
+
+    timeframes = st.multiselect(
+        "Timeframes to search", INTERVALS, default=[cfg["interval"]], key="lab_tfs",
+        help="Searching several timeframes finds more candidates, but it also multiplies the "
+             "number of combinations tried, and the more you try the more the winner owes to "
+             "luck. Periods are clamped automatically to what each interval can serve.")
     safe_only = st.checkbox("Backtest-safe exits only (exclude distance trails)", value=True,
                             key="lab_safe",
                             help="Distance trails cannot be simulated faithfully on OHLC bars, "
@@ -6743,17 +6899,21 @@ def tab_signal_lab(cfg: dict) -> None:
                                  "backtest is systematically optimistic.")
 
     tickers = tickers[:int(max_names)]
+    timeframes = timeframes or [cfg["interval"]]
     if note:
         st.warning(note)
-    est = len(tickers) * int(iterations) * 0.05 + len(tickers) * 1.2
-    st.caption(f"{len(tickers)} ticker(s) x {int(iterations)} combinations = "
-               f"{len(tickers) * int(iterations):,} backtests. Rough estimate {est:0.0f}s.")
+    jobs = len(tickers) * len(timeframes)
+    est = jobs * int(iterations) * 0.05 + jobs * 1.2
+    st.caption(f"{len(tickers)} ticker(s) x {len(timeframes)} timeframe(s) x {int(iterations)} "
+               f"combinations = {jobs * int(iterations):,} backtests. Rough estimate "
+               f"{est:0.0f}s.")
 
     if st.button("Run Signal Lab", type="primary", width="stretch"):
         bar = st.progress(0.0, text="Starting ...")
         try:
             results, errors = run_signal_lab(tickers, cfg, objective, int(iterations),
-                                             int(min_trades), int(signal_window), safe_only, bar)
+                                             int(min_trades), int(signal_window), safe_only,
+                                             timeframes, gates, bar)
             st.session_state.lab_results = (results, errors)
         except Exception as exc:                                    # noqa: BLE001
             st.session_state.lab_results = None
@@ -6774,20 +6934,28 @@ def tab_signal_lab(cfg: dict) -> None:
 
     signalling = results[results["Signal"] != "-"]
     a, b, c = st.columns(3)
-    a.metric("Tickers optimised", len(results))
+    a.metric("Ticker/timeframe pairs", len(results))
     b.metric("Signalling now", len(signalling))
     c.metric("Backtest-safe configs", int((results["Reliability"] == "Backtest-safe").sum()))
 
     show_only = st.checkbox("Show only tickers that are signalling", value=True, key="lab_filter")
     table = signalling if show_only else results
     table = table.sort_values(["Signal", "Score"], ascending=[True, False]).reset_index(drop=True)
+    front = [c for c in ["Ticker", "Timeframe", "Signal", "When", "Bars Ago", "Signal Time",
+                         "Price at Signal", "Fill Price (next open)", "Price Now",
+                         "Move in Favour", "R Multiple Now", "Best Strategy", "Stop-Loss",
+                         "SL Value", "Target", "TP Value", "Filter", "Trades", "Win %",
+                         "Sharpe", "Expectancy", "Profit Factor", "Net PnL", "Reliability",
+                         "Score"] if c in table.columns]
+    table = table[front + [c for c in table.columns if c not in front]]
     if table.empty:
         st.info("No ticker is signalling right now on its own optimised configuration.")
         return
 
     st.dataframe(table.drop(columns=["Filter Key"]), width="stretch", hide_index=True)
-    pick = st.selectbox("Apply which ticker's setup?", table["Ticker"].tolist(), key="lab_pick")
-    row = table[table["Ticker"] == pick].iloc[0]
+    labels = [f"{r['Ticker']} · {r.get('Timeframe', '')}" for _, r in table.iterrows()]
+    pick = st.selectbox("Apply which setup?", labels, key="lab_pick")
+    row = table.iloc[labels.index(pick)]
     if st.button("Apply this ticker and its configuration to the sidebar", type="primary",
                  width="stretch"):
         st.session_state.pending_combo = {
@@ -6795,6 +6963,8 @@ def tab_signal_lab(cfg: dict) -> None:
             "sl_value": row["SL Value"], "tp_type": row["Target"], "tp_value": row["TP Value"],
             "filter_key": str(row["Filter Key"] or ""), "widgets": {}}
         st.session_state.pending_ticker = row["Ticker"]
+        if row.get("Timeframe"):
+            st.session_state.pending_combo["widgets"] = {"cfg_interval": row["Timeframe"]}
         st.rerun()
     st.caption(f"{pick}: {row['Best Strategy']} | SL {row['Stop-Loss']} | TGT {row['Target']} | "
                f"filter {row['Filter']} | {row['Trades']} trades | {row['Reliability']}")
@@ -7183,6 +7353,46 @@ def _test_new_profiles_and_flip():
           f"flip exact, OHLC on trades  OK")
 
 
+def _test_live_entry_and_gates():
+    """
+    Two behaviours worth locking down.
+
+    1. The screener reports signals from a WINDOW of candles while the live
+       engine only ever looked at the newest closed one. That mismatch is why an
+       applied screener hit produced no trade, so the catch-up path now covers it.
+    2. Signal Lab quality gates must be hard filters, not preferences.
+    """
+    class Snap:
+        def __init__(self, last, recent, ago):
+            self.last_closed_signal = last
+            self.recent_signal = recent
+            self.recent_signal_bars_ago = ago
+
+    def would_enter(snap, lookback):
+        d = int(snap.last_closed_signal)
+        if d == 0 and lookback > 0 and snap.recent_signal != 0 \
+                and snap.recent_signal_bars_ago is not None \
+                and 0 < snap.recent_signal_bars_ago <= lookback:
+            return int(snap.recent_signal), True
+        return d, False
+
+    assert would_enter(Snap(1, 1, 0), 0) == (1, False), "a fresh signal must always be taken"
+    assert would_enter(Snap(0, -1, 3), 0) == (0, False), "strict mode must ignore an old signal"
+    assert would_enter(Snap(0, -1, 3), 5) == (-1, True), "catch-up must take a signal in range"
+    assert would_enter(Snap(0, -1, 9), 5) == (0, False), "catch-up must respect its lookback"
+
+    row = {"Win %": 55.0, "Sharpe": 1.2, "Expectancy": 3.0, "Profit Factor": 1.8,
+           "Net PnL": 500.0}
+    assert _meets_thresholds(row, {}), "no gates set means nothing is filtered"
+    assert _meets_thresholds(row, {"win": 50.0, "sharpe": 1.0})
+    assert not _meets_thresholds(row, {"win": 60.0}), "a failing gate must reject the row"
+    assert not _meets_thresholds(row, {"pf": 2.0})
+    assert not _meets_thresholds({"Win %": float("nan"), "Sharpe": 1.0, "Expectancy": 1.0,
+                                  "Profit Factor": 1.0, "Net PnL": 1.0}, {"win": 10.0}), \
+        "an unmeasurable metric cannot pass a gate"
+    print("   catch-up entry window and Signal Lab quality gates  OK")
+
+
 def _test_signal_detail():
     """
     The enriched signal columns must reconcile with each other exactly.
@@ -7441,6 +7651,7 @@ def run_selftest() -> int:
         _test_new_profiles_and_flip()
         _test_pattern_library()
         _test_signal_detail()
+        _test_live_entry_and_gates()
         print("-- filters --")
         _test_filters()
         _test_new_filters()
