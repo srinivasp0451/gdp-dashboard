@@ -3660,6 +3660,8 @@ _STATE_DEFAULTS = {
     "last_seen_ltp": None, "last_ltp_change_ts": 0.0, "pending_ticker": None,
     "last_closed_bar": None, "option_metrics": None,
     "optimizer_results": None, "pattern_results": None, "pending_combo": None,
+    "pattern_rows": None, "pattern_frames": None, "pattern_hits": None,
+    "pattern_errors": None, "lab_results": None,
 }
 
 
@@ -5340,6 +5342,89 @@ def _universe_tickers(choice: str, custom_text: str, uploaded) -> tuple[list[str
     return [f"{n}.NS" for n in names], note
 
 
+def signal_detail(frame: pd.DataFrame, hit_time, direction: int, risk: "RiskConfig | None",
+                  ticker: str, interval: str) -> dict:
+    """
+    Everything worth knowing about a signal that has already fired.
+
+    Two things deserve care here. First, the FILL price is the open of the candle
+    AFTER the signal, not the signal candle's close -- that is the rule both
+    engines follow, and quoting the close would flatter every row. Second, raw
+    percentage move is signed by the market, so a profitable SHORT shows a
+    negative one; "Move in Favour" restates it from the trade's point of view.
+    """
+    idx = frame.index
+    pos = int(idx.get_loc(hit_time))
+    last = len(frame) - 1
+    price_signal = float(frame["Close"].iloc[pos])
+    fill = float(frame["Open"].iloc[pos + 1]) if pos + 1 <= last else float("nan")
+    price_now = float(frame["Close"].iloc[last])
+
+    move_abs = price_now - price_signal
+    move_pct = (move_abs / price_signal * 100.0) if price_signal else float("nan")
+    fav_abs = (price_now - fill) * direction if np.isfinite(fill) else float("nan")
+    fav_pct = (fav_abs / fill * 100.0) if (np.isfinite(fill) and fill) else float("nan")
+
+    after = frame.iloc[pos + 1:]
+    best = worst = float("nan")
+    if len(after):
+        if direction > 0:
+            best = float(after["High"].max()) - fill
+            worst = float(after["Low"].min()) - fill
+        else:
+            best = fill - float(after["Low"].min())
+            worst = fill - float(after["High"].max())
+
+    a = float(frame["atr"].iloc[last]) if "atr" in frame else float("nan")
+    stop = target = risk_pts = r_now = None
+    if risk is not None and np.isfinite(fill):
+        try:
+            ctx = bar_ctx(frame, min(pos + 1, last))
+            mgr = ExitManager(risk, fill, direction, ctx)
+            stop = mgr.sl
+            target = mgr.tp
+            risk_pts = mgr.risk_points
+            if risk_pts:
+                r_now = fav_abs / risk_pts
+        except Exception:                                           # noqa: BLE001
+            pass
+
+    last_ts = pd.Timestamp(idx[last])
+    now = pd.Timestamp.now(tz=last_ts.tz) if last_ts.tz is not None else pd.Timestamp.now()
+    vol_ratio = None
+    if "Volume" in frame and float(frame["Volume"].tail(50).abs().sum()) > 0:
+        vma = float(sma(frame["Volume"], 20).iloc[last])
+        if vma:
+            vol_ratio = float(frame["Volume"].iloc[last]) / vma
+
+    return {
+        "Signal Time": pd.Timestamp(hit_time),
+        "Bars Ago": int(last - 1 - pos),
+        "Price at Signal": round(price_signal, 2),
+        "Fill Price (next open)": None if not np.isfinite(fill) else round(fill, 2),
+        "Price Now": round(price_now, 2),
+        "Move Abs": round(move_abs, 2),
+        "Move %": round(move_pct, 3),
+        "Move in Favour": None if not np.isfinite(fav_abs) else round(fav_abs, 2),
+        "Favour %": None if not np.isfinite(fav_pct) else round(fav_pct, 3),
+        "Best Since": None if not np.isfinite(best) else round(best, 2),
+        "Worst Since": None if not np.isfinite(worst) else round(worst, 2),
+        "Suggested Stop": None if stop is None else round(float(stop), 2),
+        "Suggested Target": None if target is None else round(float(target), 2),
+        "Risk Points": None if risk_pts is None else round(float(risk_pts), 2),
+        "R Multiple Now": None if r_now is None else round(float(r_now), 2),
+        "Distance to Stop": None if stop is None else round(abs(price_now - float(stop)), 2),
+        "Distance to Target": None if target is None else round(abs(float(target) - price_now), 2),
+        "ATR": None if not np.isfinite(a) else round(a, 2),
+        "ATR %": None if not (np.isfinite(a) and price_now) else round(a / price_now * 100, 3),
+        "Volume x Avg": None if vol_ratio is None else round(vol_ratio, 2),
+        "Last Candle": last_ts,
+        "Candle Age": _human_age(float((now - last_ts).total_seconds())),
+        "Scanned At": pd.Timestamp.now(),
+        "Interval": interval,
+    }
+
+
 def screen_universe(tickers: list[str], cfg: dict, lookback_bars: int, progress=None):
     """
     Run the sidebar configuration across a list of tickers and report signals.
@@ -5366,7 +5451,10 @@ def screen_universe(tickers: list[str], cfg: dict, lookback_bars: int, progress=
             errors.append({"Ticker": ticker, "Problem": str(exc)[:140]})
             continue
 
-        window = frame.iloc[-(lookback_bars + 1):]
+        # CLOSED candles only. Including the forming bar made it look like a
+        # confirmed hit, which left the row with no fill price (there is no next
+        # open yet) and a nonsensical "-1 bars ago".
+        window = frame.iloc[-(lookback_bars + 1):-1]
         fired = window[window["signal"] != 0]
         forming = int(frame["signal"].iloc[-1])
         last_closed_pos = len(frame) - 2
@@ -5382,17 +5470,18 @@ def screen_universe(tickers: list[str], cfg: dict, lookback_bars: int, progress=
         else:
             hit_time, direction, when = frame.index[-1], forming, "Forming candle (unconfirmed)"
 
+        detail = signal_detail(frame, hit_time, direction, cfg.get("risk"), ticker,
+                               cfg["interval"])
         rows.append({
             "Ticker": ticker,
             "Signal": "LONG" if direction > 0 else "SHORT",
             "When": when,
-            "Signal Time": pd.Timestamp(hit_time),
-            "Close": round(float(frame["Close"].iloc[-1]), 2),
+            **detail,
             "Fast EMA": round(float(frame["ema_fast"].iloc[-1]), 2)
             if "ema_fast" in frame else None,
             "Slow EMA": round(float(frame["ema_slow"].iloc[-1]), 2)
             if "ema_slow" in frame else None,
-            "ATR": round(float(frame["atr"].iloc[-1]), 2) if "atr" in frame else None,
+            "Strategy": cfg["strategy"],
         })
     return pd.DataFrame(rows), pd.DataFrame(errors)
 
@@ -5453,7 +5542,33 @@ def tab_screener(cfg: dict) -> None:
     else:
         results = results.sort_values(["When", "Signal Time"], ascending=[True, False])
         st.success(f"{len(results)} ticker(s) signalling.")
-        st.dataframe(results, width="stretch", hide_index=True)
+        order = [c for c in [
+            "Ticker", "Signal", "When", "Bars Ago", "Signal Time", "Interval",
+            "Price at Signal", "Fill Price (next open)", "Price Now",
+            "Move Abs", "Move %", "Move in Favour", "Favour %", "R Multiple Now",
+            "Best Since", "Worst Since",
+            "Suggested Stop", "Suggested Target", "Risk Points",
+            "Distance to Stop", "Distance to Target",
+            "ATR", "ATR %", "Volume x Avg", "Fast EMA", "Slow EMA",
+            "Last Candle", "Candle Age", "Scanned At", "Strategy",
+        ] if c in results.columns]
+        st.dataframe(results[order], width="stretch", hide_index=True,
+                     column_config={
+                         "Signal Time": st.column_config.DatetimeColumn(
+                             format="YYYY-MM-DD HH:mm:ss"),
+                         "Last Candle": st.column_config.DatetimeColumn(
+                             format="YYYY-MM-DD HH:mm:ss"),
+                         "Scanned At": st.column_config.DatetimeColumn(
+                             format="YYYY-MM-DD HH:mm:ss"),
+                     })
+        st.caption(
+            "**Fill Price** is the open of the candle AFTER the signal, which is the rule both "
+            "engines actually follow — quoting the signal candle's close would flatter every "
+            "row. **Move %** is signed by the market, so a profitable SHORT shows a negative "
+            "one; **Move in Favour** and **R Multiple Now** restate it from the trade's point "
+            "of view. Stop and target come from your current sidebar risk settings applied at "
+            "that fill. **Best / Worst Since** are the extremes reached after the fill, in the "
+            "trade's favour and against it.")
 
         pick = st.selectbox("Select a ticker", results["Ticker"].tolist(), key="scr_pick")
         a, b = st.columns([1, 3])
@@ -5476,6 +5591,639 @@ def tab_screener(cfg: dict) -> None:
 
 # =============================================================================
 # SECTION 15 -- TAB 3: LIVE TRADE LOG LEDGER
+
+# =============================================================================
+# SECTION 19 -- CHART PATTERN LIBRARY
+# =============================================================================
+# Every detector returns the bar on which the pattern was CONFIRMED, never the
+# bar where it started. Geometric patterns are built on zigzag pivots, and a
+# pivot is only knowable `right` bars after it printed, so a hit can never be
+# reported earlier than it could actually have been seen.
+#
+# Honest framing: pattern recognition is subjective. Two analysts disagree about
+# roughly half of these. Each hit therefore carries its own historical record on
+# that instrument, which is the only evidence worth acting on.
+
+PATTERN_FAMILIES = ["Candlestick", "Reversal", "Continuation", "Level"]
+
+
+@dataclass
+class PatternHit:
+    pattern: str
+    family: str
+    bias: str                     # "bullish" | "bearish" | "either"
+    index: int                    # bar position of CONFIRMATION
+    time: Any
+    entry: float
+    stop: float
+    geometry: list = field(default_factory=list)
+    measured: float | None = None      # classic measured-move objective
+    note: str = ""
+
+
+def _pattern_frame(df: pd.DataFrame, params: dict) -> pd.DataFrame:
+    """Candle anatomy plus the context every detector shares."""
+    out = df.copy()
+    out["atr"] = atr(out["High"], out["Low"], out["Close"], int(_p(params, "atr_len")))
+    out["ema20"] = ema(out["Close"], 20)
+    out["body"] = (out["Close"] - out["Open"]).abs()
+    out["range"] = (out["High"] - out["Low"]).replace(0.0, np.nan)
+    out["upper_wick"] = out["High"] - out[["Open", "Close"]].max(axis=1)
+    out["lower_wick"] = out[["Open", "Close"]].min(axis=1) - out["Low"]
+    out["bull"] = out["Close"] > out["Open"]
+    out["uptrend"] = out["Close"] > out["ema20"]
+    return out
+
+
+def _fit_line(xs, ys):
+    """Least-squares slope/intercept, tolerant of degenerate input."""
+    xs = np.asarray(xs, float)
+    ys = np.asarray(ys, float)
+    if xs.size < 2 or np.ptp(xs) == 0:
+        return 0.0, float(ys.mean()) if ys.size else 0.0
+    slope, intercept = np.polyfit(xs, ys, 1)
+    return float(slope), float(intercept)
+
+
+def _line_geo(x_idx, i0, i1, p0, p1, label="Trendline"):
+    return {"type": "line", "x0": x_idx[i0], "y0": float(p0),
+            "x1": x_idx[i1], "y1": float(p1), "label": label}
+
+
+def _band_geo(x_idx, i0, i1, label=""):
+    return {"type": "band", "x0": x_idx[max(i0, 0)], "x1": x_idx[i1], "label": label}
+
+
+def _pivot_geo(x_idx, idxs, prices):
+    return [{"type": "pivot", "x": x_idx[i], "y": float(p)} for i, p in zip(idxs, prices)]
+
+
+# --------------------------------------------------------------------------- #
+# Candlestick detectors
+# --------------------------------------------------------------------------- #
+def _candlestick_masks(f: pd.DataFrame) -> dict[str, tuple[str, pd.Series, int]]:
+    """name -> (bias, boolean mask, bars the pattern spans)."""
+    o, h, l, c = f["Open"], f["High"], f["Low"], f["Close"]
+    body, rng, uw, lw, bull = f["body"], f["range"], f["upper_wick"], f["lower_wick"], f["bull"]
+    po, pc = o.shift(1), c.shift(1)
+    pbody = (pc - po).abs()
+    down, up = f["Close"] < f["ema20"], f["Close"] > f["ema20"]
+
+    small_body = body <= 0.35 * rng
+    m: dict[str, tuple[str, pd.Series, int]] = {}
+
+    m["Hammer"] = ("bullish", (lw >= 2 * body) & (uw <= body) & small_body & down, 1)
+    m["Inverted hammer"] = ("bullish", (uw >= 2 * body) & (lw <= body) & small_body & down, 1)
+    m["Hanging man"] = ("bearish", (lw >= 2 * body) & (uw <= body) & small_body & up, 1)
+    m["Shooting star"] = ("bearish", (uw >= 2 * body) & (lw <= body) & small_body & up, 1)
+    m["Doji"] = ("either", body <= 0.1 * rng, 1)
+    m["Bullish marubozu"] = ("bullish", bull & (body >= 0.9 * rng), 1)
+    m["Bearish marubozu"] = ("bearish", (~bull) & (body >= 0.9 * rng), 1)
+
+    m["Bullish engulfing"] = ("bullish",
+                              bull & (pc < po) & (c >= po) & (o <= pc) & (body > pbody), 2)
+    m["Bearish engulfing"] = ("bearish",
+                              (~bull) & (pc > po) & (c <= po) & (o >= pc) & (body > pbody), 2)
+    m["Bullish harami"] = ("bullish",
+                           bull & (pc < po) & (c <= po) & (o >= pc) & (body < pbody), 2)
+    m["Bearish harami"] = ("bearish",
+                           (~bull) & (pc > po) & (c >= po) & (o <= pc) & (body < pbody), 2)
+    m["Piercing line"] = ("bullish", bull & (pc < po) & (o < pc) & (c > (po + pc) / 2) & (c < po), 2)
+    m["Dark cloud cover"] = ("bearish",
+                             (~bull) & (pc > po) & (o > pc) & (c < (po + pc) / 2) & (c > po), 2)
+    m["Tweezer bottom"] = ("bullish", (l - l.shift(1)).abs() <= 0.1 * rng.shift(1), 2)
+    m["Tweezer top"] = ("bearish", (h - h.shift(1)).abs() <= 0.1 * rng.shift(1), 2)
+
+    harami_bull = bull & (pc < po) & (c <= po) & (o >= pc)
+    harami_bear = (~bull) & (pc > po) & (c >= po) & (o <= pc)
+    m["Three inside up"] = ("bullish", harami_bull.shift(1).fillna(False) & bull & (c > c.shift(1)), 3)
+    m["Three inside down"] = ("bearish",
+                              harami_bear.shift(1).fillna(False) & (~bull) & (c < c.shift(1)), 3)
+
+    o2, c2 = o.shift(2), c.shift(2)
+    m["Morning star"] = ("bullish",
+                         (c2 < o2) & (pbody <= 0.4 * (o2 - c2).abs()) & bull
+                         & (c > (o2 + c2) / 2), 3)
+    m["Evening star"] = ("bearish",
+                         (c2 > o2) & (pbody <= 0.4 * (c2 - o2).abs()) & (~bull)
+                         & (c < (o2 + c2) / 2), 3)
+
+    # Five-bar continuation: a long bar, three small counter bars inside it, then
+    # a close beyond the first bar's extreme.
+    h4, l4, c4, o4 = h.shift(4), l.shift(4), c.shift(4), o.shift(4)
+    inside3 = ((h.shift(3) < h4) & (l.shift(3) > l4) & (h.shift(2) < h4) & (l.shift(2) > l4)
+               & (h.shift(1) < h4) & (l.shift(1) > l4))
+    m["Rising three methods"] = ("bullish", (c4 > o4) & inside3 & bull & (c > h4), 5)
+    m["Falling three methods"] = ("bearish", (c4 < o4) & inside3 & (~bull) & (c < l4), 5)
+    return m
+
+
+# --------------------------------------------------------------------------- #
+# Geometric detectors (pivot based)
+# --------------------------------------------------------------------------- #
+def _geometric_hits(f: pd.DataFrame, pivots: list, wanted: set[str], tol: float) -> list[PatternHit]:
+    hits: list[PatternHit] = []
+    if not pivots:
+        return hits
+    x = f.index
+    close = f["Close"].to_numpy(float)
+    high = f["High"].to_numpy(float)
+    low = f["Low"].to_numpy(float)
+    atr_v = f["atr"].to_numpy(float)
+    n = len(f)
+
+    def add(name, family, bias, i, entry, stop, geo, measured=None, note=""):
+        if not (0 <= i < n) or name not in wanted:
+            return
+        if not (np.isfinite(entry) and np.isfinite(stop)) or entry == stop:
+            return
+        hits.append(PatternHit(name, family, bias, i, x[i], float(entry), float(stop),
+                               geo, measured, note))
+
+    highs = [(pi, pp, ci) for pi, pp, k, ci in pivots if k == 1]
+    lows = [(pi, pp, ci) for pi, pp, k, ci in pivots if k == -1]
+
+    # ---- double top / bottom : two comparable extremes around one counter pivot
+    for seq, name, bias in ((highs, "Double top", "bearish"), (lows, "Double bottom", "bullish")):
+        for a, b in zip(seq, seq[1:]):
+            (ia, pa, _), (ib, pb, cb) = a, b
+            if abs(pa - pb) > tol * max(abs(pa), 1e-9):
+                continue
+            mid = [p for p in pivots if ia < p[0] < ib and p[2] != (1 if bias == "bearish" else -1)]
+            if not mid:
+                continue
+            neck = mid[-1][1]
+            conf = next((j for j in range(cb, n)
+                         if (close[j] < neck if bias == "bearish" else close[j] > neck)), None)
+            if conf is None:
+                continue
+            geo = _pivot_geo(x, [ia, ib], [pa, pb]) + [
+                _line_geo(x, ia, ib, pa, pb, name), _line_geo(x, ia, conf, neck, neck, "Neckline"),
+                _band_geo(x, conf - 1, conf, name)]
+            add(name, "Reversal", bias, conf, close[conf], max(pa, pb) if bias == "bearish"
+                else min(pa, pb), geo, measured=abs(max(pa, pb) - neck))
+
+    # ---- head and shoulders : five pivots, middle extreme dominant
+    for seq, name, bias in ((highs, "Head and shoulders", "bearish"),
+                            (lows, "Inverse head and shoulders", "bullish")):
+        for a, b, c_ in zip(seq, seq[1:], seq[2:]):
+            (ia, pa, _), (ib, pb, _), (ic, pc_, cc) = a, b, c_
+            dominant = pb > max(pa, pc_) if bias == "bearish" else pb < min(pa, pc_)
+            if not dominant or abs(pa - pc_) > 2 * tol * max(abs(pa), 1e-9):
+                continue
+            mids = [p[1] for p in pivots if ia < p[0] < ic
+                    and p[2] != (1 if bias == "bearish" else -1)]
+            if len(mids) < 2:
+                continue
+            neck = float(np.mean(mids[-2:]))
+            conf = next((j for j in range(cc, n)
+                         if (close[j] < neck if bias == "bearish" else close[j] > neck)), None)
+            if conf is None:
+                continue
+            geo = _pivot_geo(x, [ia, ib, ic], [pa, pb, pc_]) + [
+                _line_geo(x, ia, ic, neck, neck, "Neckline"), _band_geo(x, conf - 1, conf, name)]
+            add(name, "Reversal", bias, conf, close[conf], pb, geo, measured=abs(pb - neck))
+
+    # ---- broadening / wedges / diamonds : slope relationship of the two envelopes
+    for k in range(3, len(highs)):
+        hi3 = highs[k - 3:k + 1]
+        if len(hi3) < 3:
+            continue
+        lo3 = [p for p in lows if hi3[0][0] <= p[0] <= hi3[-1][0]]
+        if len(lo3) < 3:
+            continue
+        hs, hi_c = _fit_line([p[0] for p in hi3], [p[1] for p in hi3])
+        ls, lo_c = _fit_line([p[0] for p in lo3], [p[1] for p in lo3])
+        i0, i1 = hi3[0][0], hi3[-1][0]
+        conf = max(hi3[-1][2], lo3[-1][2])
+        if conf >= n:
+            continue
+        width0 = (hs * i0 + hi_c) - (ls * i0 + lo_c)
+        width1 = (hs * i1 + hi_c) - (ls * i1 + lo_c)
+        if width0 <= 0 or width1 <= 0:
+            continue
+        geo = [_line_geo(x, i0, i1, hs * i0 + hi_c, hs * i1 + hi_c, "Upper"),
+               _line_geo(x, i0, i1, ls * i0 + lo_c, ls * i1 + lo_c, "Lower"),
+               _band_geo(x, conf - 1, conf)]
+        widening = width1 > width0 * 1.3
+        narrowing = width1 < width0 * 0.7
+        stop_up = hs * i1 + hi_c
+        stop_dn = ls * i1 + lo_c
+        if widening:
+            if hs > 0 and ls > 0:
+                add("Broadening top", "Reversal", "bearish", conf, close[conf], stop_up, geo)
+            elif hs < 0 and ls < 0:
+                add("Broadening bottom", "Reversal", "bullish", conf, close[conf], stop_dn, geo)
+            else:
+                add("Broadening top", "Reversal", "either", conf, close[conf], stop_up, geo)
+        elif narrowing:
+            if hs > 0 and ls > 0:
+                add("Rising wedge", "Reversal", "bearish", conf, close[conf], stop_up, geo)
+            elif hs < 0 and ls < 0:
+                add("Falling wedge", "Reversal", "bullish", conf, close[conf], stop_dn, geo)
+            else:
+                add("Pennant", "Continuation", "either", conf, close[conf],
+                    stop_dn if close[conf] > stop_dn else stop_up, geo)
+            if width0 > 0 and k >= 4:
+                prev_w = width0
+                if prev_w > width1 * 1.6:
+                    add("Diamond top" if hs > 0 else "Diamond bottom", "Reversal",
+                        "bearish" if hs > 0 else "bullish", conf, close[conf],
+                        stop_up if hs > 0 else stop_dn, geo)
+
+    # ---- three drives : three successive extremes in the same direction
+    for seq, name, bias in ((highs, "Three drives", "bearish"), (lows, "Three drives", "bullish")):
+        for a, b, c_ in zip(seq, seq[1:], seq[2:]):
+            (ia, pa, _), (ib, pb, _), (ic, pc_, cc) = a, b, c_
+            rising = pa < pb < pc_
+            falling = pa > pb > pc_
+            if not (rising if bias == "bearish" else falling):
+                continue
+            if cc >= n:
+                continue
+            geo = _pivot_geo(x, [ia, ib, ic], [pa, pb, pc_]) + [
+                _line_geo(x, ia, ic, pa, pc_, "Drives"), _band_geo(x, cc - 1, cc, name)]
+            add(name, "Reversal", bias, cc, close[cc], pc_, geo)
+
+    # ---- trendline breakout / breakdown, with and without the retest
+    for seq, up in ((lows, True), (highs, False)):
+        if len(seq) < 3:
+            continue
+        for k in range(2, len(seq)):
+            pts = seq[k - 2:k + 1]
+            slope, intercept = _fit_line([p[0] for p in pts], [p[1] for p in pts])
+            start, ready = pts[0][0], pts[-1][2]
+            broke = None
+            for j in range(ready, min(n, ready + 60)):
+                line = slope * j + intercept
+                if (up and close[j] < line) or ((not up) and close[j] > line):
+                    broke = j
+                    break
+            if broke is None:
+                continue
+            name = "Trendline breakdown" if up else "Trendline breakout"
+            bias = "bearish" if up else "bullish"
+            geo = _pivot_geo(x, [p[0] for p in pts], [p[1] for p in pts]) + [
+                _line_geo(x, start, broke, slope * start + intercept, slope * broke + intercept),
+                _band_geo(x, broke - 1, broke, name)]
+            stop = max(high[broke - 2:broke + 1]) if up else min(low[broke - 2:broke + 1])
+            add(name, "Level", bias, broke, close[broke], stop, geo)
+
+            # retest: price returns to the broken line and is rejected by it
+            for j in range(broke + 1, min(n, broke + 20)):
+                line = slope * j + intercept
+                touched = (high[j] >= line) if up else (low[j] <= line)
+                rejected = (close[j] < line) if up else (close[j] > line)
+                if touched and rejected:
+                    rname = name + " + retest"
+                    rgeo = geo[:-1] + [
+                        _line_geo(x, start, j, slope * start + intercept, slope * j + intercept),
+                        {"type": "star", "x": x[j], "y": float(close[j]), "label": rname},
+                        _band_geo(x, j - 1, j, rname)]
+                    rstop = high[j] if up else low[j]
+                    add(rname, "Level", bias, j, close[j], rstop, rgeo)
+                    break
+
+    # ---- parallel channel break
+    if len(highs) >= 3 and len(lows) >= 3:
+        hs, hc = _fit_line([p[0] for p in highs[-3:]], [p[1] for p in highs[-3:]])
+        ls, lc = _fit_line([p[0] for p in lows[-3:]], [p[1] for p in lows[-3:]])
+        if abs(hs - ls) <= abs(hs) * 0.5 + 1e-9:
+            start = min(highs[-3][0], lows[-3][0])
+            ready = max(highs[-1][2], lows[-1][2])
+            for j in range(ready, n):
+                up_line, dn_line = hs * j + hc, ls * j + lc
+                if close[j] > up_line or close[j] < dn_line:
+                    rising = hs > 0
+                    name = "Ascending channel break" if rising else "Descending channel break"
+                    geo = [_line_geo(x, start, j, hs * start + hc, up_line, "Channel top"),
+                           _line_geo(x, start, j, ls * start + lc, dn_line, "Channel base"),
+                           _band_geo(x, j - 1, j, name)]
+                    add(name, "Continuation", "either", j, close[j],
+                        dn_line if close[j] > up_line else up_line, geo)
+                    break
+
+    # ---- rounding top / bottom : quadratic fit over a trailing window
+    win = 40
+    for j in range(win, n, 5):
+        seg = close[j - win:j]
+        if not np.isfinite(seg).all():
+            continue
+        coef = np.polyfit(np.arange(win), seg, 2)
+        curv, slope = coef[0], 2 * coef[0] * (win - 1) + coef[1]
+        scale = np.nanmean(atr_v[j - win:j]) or 1.0
+        strength = abs(curv) * win * win / max(scale, 1e-9)
+        if strength < 1.5:
+            continue
+        fitted = np.polyval(coef, np.arange(win))
+        geo = [{"type": "curve", "x": list(x[j - win:j]), "y": [float(v) for v in fitted],
+                "label": "Rounding"}, _band_geo(x, j - 1, j)]
+        if curv < 0 and slope < 0:
+            add("Rounding top", "Reversal", "bearish", j, close[j],
+                float(np.max(high[j - win:j])), geo)
+        elif curv > 0 and slope > 0:
+            add("Rounding bottom", "Reversal", "bullish", j, close[j],
+                float(np.min(low[j - win:j])), geo)
+
+    # ---- island reversal : a gap out and a gap back within a few bars
+    prev_h, prev_l = np.r_[np.nan, high[:-1]], np.r_[np.nan, low[:-1]]
+    gap_up = low > prev_h
+    gap_dn = high < prev_l
+    for j in range(2, n):
+        for back in range(1, 6):
+            if j - back < 1:
+                break
+            if gap_up[j - back] and gap_dn[j]:
+                geo = [_band_geo(x, j - back, j, "Island"),
+                       {"type": "star", "x": x[j], "y": float(close[j]), "label": "Island top"}]
+                add("Island reversal top", "Reversal", "bearish", j, close[j],
+                    float(np.max(high[j - back:j + 1])), geo)
+                break
+            if gap_dn[j - back] and gap_up[j]:
+                geo = [_band_geo(x, j - back, j, "Island"),
+                       {"type": "star", "x": x[j], "y": float(close[j]), "label": "Island bottom"}]
+                add("Island reversal bottom", "Reversal", "bullish", j, close[j],
+                    float(np.min(low[j - back:j + 1])), geo)
+                break
+
+    # ---- volatility contraction : each pullback shallower than the last
+    rng_ma = pd.Series(high - low).rolling(10).mean().to_numpy(float)
+    for j in range(60, n):
+        a, b, c_ = rng_ma[j - 40], rng_ma[j - 20], rng_ma[j]
+        if not np.isfinite([a, b, c_]).all() or a <= 0:
+            continue
+        if c_ < b * 0.75 and b < a * 0.75 and close[j] > np.nanmax(high[j - 20:j]):
+            geo = [_band_geo(x, j - 40, j, "Contraction"),
+                   {"type": "star", "x": x[j], "y": float(close[j]), "label": "VCP breakout"}]
+            add("Volatility contraction (VCP)", "Continuation", "bullish", j, close[j],
+                float(np.nanmin(low[j - 20:j])), geo)
+
+    # ---- flag : sharp impulse then a shallow counter drift
+    for j in range(30, n):
+        pole = close[j - 10] - close[j - 20]
+        drift = close[j] - close[j - 10]
+        scale = np.nanmean(atr_v[j - 20:j]) or 1.0
+        if abs(pole) < 4 * scale or abs(drift) > abs(pole) * 0.5:
+            continue
+        if pole > 0 and drift < 0 and close[j] > np.nanmax(high[j - 5:j]):
+            geo = [_band_geo(x, j - 20, j, "Flag"),
+                   _line_geo(x, j - 20, j - 10, close[j - 20], close[j - 10], "Pole")]
+            add("Bull flag", "Continuation", "bullish", j, close[j],
+                float(np.nanmin(low[j - 10:j])), geo)
+        elif pole < 0 and drift > 0 and close[j] < np.nanmin(low[j - 5:j]):
+            geo = [_band_geo(x, j - 20, j, "Flag"),
+                   _line_geo(x, j - 20, j - 10, close[j - 20], close[j - 10], "Pole")]
+            add("Bear flag", "Continuation", "bearish", j, close[j],
+                float(np.nanmax(high[j - 10:j])), geo)
+    return hits
+
+
+def _fvg_hits(f: pd.DataFrame, wanted: set[str]) -> list[PatternHit]:
+    hits: list[PatternHit] = []
+    bull, bear, blo, bhi, selo, sehi = fair_value_gaps(f)
+    x = f.index
+    for name, mask, bias in (("Fair value gap (bullish)", bull, "bullish"),
+                             ("Fair value gap (bearish)", bear, "bearish")):
+        if name not in wanted:
+            continue
+        for j in np.where(mask.to_numpy())[0]:
+            lo = float(blo.iloc[j] if bias == "bullish" else selo.iloc[j])
+            hi = float(bhi.iloc[j] if bias == "bullish" else sehi.iloc[j])
+            if not np.isfinite([lo, hi]).all():
+                continue
+            geo = [{"type": "zone", "x0": x[max(j - 2, 0)], "x1": x[j], "y0": lo, "y1": hi,
+                    "label": name}]
+            hits.append(PatternHit(name, "Level", bias, int(j), x[j], float(f["Close"].iloc[j]),
+                                   lo if bias == "bullish" else hi, geo, abs(hi - lo)))
+    return hits
+
+
+PATTERN_CATALOG: dict[str, str] = {}
+
+
+def _build_catalog() -> dict[str, str]:
+    idx = pd.date_range("2024-01-01", periods=10, freq="D")
+    probe = pd.DataFrame({"Open": 1.0, "High": 1.0, "Low": 1.0, "Close": 1.0, "Volume": 1.0},
+                         index=idx)
+    cat = {name: "Candlestick" for name in _candlestick_masks(_pattern_frame(probe, DEFAULT_PARAMS))}
+    for name in ("Double top", "Double bottom", "Head and shoulders",
+                 "Inverse head and shoulders", "Broadening top", "Broadening bottom",
+                 "Rising wedge", "Falling wedge", "Diamond top", "Diamond bottom",
+                 "Three drives", "Rounding top", "Rounding bottom",
+                 "Island reversal top", "Island reversal bottom"):
+        cat[name] = "Reversal"
+    for name in ("Pennant", "Bull flag", "Bear flag", "Volatility contraction (VCP)",
+                 "Ascending channel break", "Descending channel break"):
+        cat[name] = "Continuation"
+    for name in ("Trendline breakout", "Trendline breakout + retest", "Trendline breakdown",
+                 "Trendline breakdown + retest", "Fair value gap (bullish)",
+                 "Fair value gap (bearish)"):
+        cat[name] = "Level"
+    return dict(sorted(cat.items()))
+
+
+PATTERN_CATALOG = _build_catalog()
+PATTERN_NAMES = list(PATTERN_CATALOG)
+
+
+def detect_patterns(df: pd.DataFrame, wanted: list[str] | None = None,
+                    params: dict | None = None) -> list[PatternHit]:
+    """Run every requested detector over one OHLC frame."""
+    params = params or dict(DEFAULT_PARAMS)
+    wanted_set = set(wanted or PATTERN_NAMES)
+    f = _pattern_frame(df, params)
+    hits: list[PatternHit] = []
+
+    masks = _candlestick_masks(f)
+    x = f.index
+    close = f["Close"].to_numpy(float)
+    high = f["High"].to_numpy(float)
+    low = f["Low"].to_numpy(float)
+    for name, (bias, mask, span) in masks.items():
+        if name not in wanted_set:
+            continue
+        for j in np.where(mask.fillna(False).to_numpy())[0]:
+            j = int(j)
+            lo = float(np.nanmin(low[max(j - span + 1, 0):j + 1]))
+            hi = float(np.nanmax(high[max(j - span + 1, 0):j + 1]))
+            stop = lo if bias == "bullish" else hi
+            if bias == "either":
+                stop = lo if close[j] > f["Open"].iloc[j] else hi
+            geo = [_band_geo(x, max(j - span + 1, 0), j, name),
+                   {"type": "star", "x": x[j], "y": float(close[j]), "label": name}]
+            hits.append(PatternHit(name, "Candlestick", bias, j, x[j], float(close[j]), stop,
+                                   geo, abs(hi - lo)))
+
+    thr = _auto_zigzag_threshold(f, _p(params, "zigzag_pct"), int(_p(params, "atr_len")))
+    pivots = zigzag_pivot_table(f["Close"], thr)
+    hits += _geometric_hits(f, pivots, wanted_set, tol=0.02)
+    hits += _fvg_hits(f, wanted_set)
+    hits.sort(key=lambda h: h.index)
+    return hits
+
+
+# --------------------------------------------------------------------------- #
+# Levels and the historical record behind them
+# --------------------------------------------------------------------------- #
+def pattern_levels(f: pd.DataFrame, hit: PatternHit, rr: float, atr_mult: float) -> dict:
+    """
+    Turn a hit into an actionable plan.
+
+    The stop is the structure the pattern is built on. When that structure is
+    unusably far away (or on the wrong side), an ATR-scaled stop stands in, and
+    the panel says which one is being used.
+    """
+    a = float(f["atr"].iloc[hit.index]) if "atr" in f else float("nan")
+    entry = float(hit.entry)
+    stop = float(hit.stop)
+    direction = 1 if hit.bias == "bullish" else (-1 if hit.bias == "bearish" else
+                                                 (1 if stop < entry else -1))
+    fallback = False
+    if not np.isfinite(stop) or (direction > 0 and stop >= entry) or \
+            (direction < 0 and stop <= entry):
+        stop = entry - direction * atr_mult * (a if np.isfinite(a) else entry * 0.005)
+        fallback = True
+    risk = abs(entry - stop)
+    target = entry + direction * rr * risk
+    measured = None
+    if hit.measured and np.isfinite(hit.measured):
+        measured = entry + direction * float(hit.measured)
+    return {"direction": direction, "entry": entry, "stop": stop, "target": target,
+            "risk": risk, "atr": a, "measured": measured, "fallback_stop": fallback,
+            "atr_multiple": (risk / a) if (np.isfinite(a) and a > 0) else None}
+
+
+def pattern_track_record(f: pd.DataFrame, hits: list[PatternHit], rr: float,
+                         atr_mult: float) -> dict:
+    """
+    Replay this exact rule on this instrument.
+
+    Entry at the next bar's open, stop and target from the same recipe, stop
+    assumed to trigger first when a bar spans both. This is the only evidence
+    that separates a pattern worth taking from a shape someone named.
+    """
+    o = f["Open"].to_numpy(float)
+    h = f["High"].to_numpy(float)
+    l = f["Low"].to_numpy(float)
+    n = len(f)
+    results = []
+    for hit in hits:
+        i = hit.index + 1
+        if i >= n:
+            continue
+        plan = pattern_levels(f, hit, rr, atr_mult)
+        d = plan["direction"]
+        entry = float(o[i])
+        risk = plan["risk"]
+        if risk <= 0:
+            continue
+        stop = entry - d * risk
+        target = entry + d * rr * risk
+        outcome = None
+        for j in range(i, min(n, i + 200)):
+            if d > 0:
+                if l[j] <= stop:
+                    outcome = -risk
+                    break
+                if h[j] >= target:
+                    outcome = rr * risk
+                    break
+            else:
+                if h[j] >= stop:
+                    outcome = -risk
+                    break
+                if l[j] <= target:
+                    outcome = rr * risk
+                    break
+        if outcome is not None:
+            results.append(outcome)
+
+    trades = len(results)
+    if trades == 0:
+        return {"trades": 0, "hit_rate": 0.0, "expectancy": 0.0, "profit_factor": 0.0,
+                "net_points": 0.0, "verdict": "No completed occurrences in this window, so "
+                                              "there is nothing to judge the pattern on."}
+    wins = [r for r in results if r > 0]
+    losses = [r for r in results if r <= 0]
+    hit_rate = len(wins) / trades * 100.0
+    gross_win, gross_loss = sum(wins), -sum(losses)
+    breakeven = 100.0 / (1.0 + rr)
+    # Wilson lower bound: what the win rate could plausibly be given this few trades.
+    z = 1.96
+    ph = len(wins) / trades
+    denom = 1 + z * z / trades
+    centre = ph + z * z / (2 * trades)
+    margin = z * math.sqrt(max(ph * (1 - ph) / trades + z * z / (4 * trades * trades), 0.0))
+    pessimistic = max(0.0, (centre - margin) / denom) * 100.0
+
+    notes = []
+    if gross_loss > 0 and gross_win / gross_loss < 1:
+        notes.append(f"wins are {gross_win / gross_loss:.2f}x losses")
+    if trades < 20:
+        notes.append("thin sample")
+    if pessimistic < breakeven:
+        notes.append(f"pessimistic win rate {pessimistic:.0f}% is below the {breakeven:.0f}% "
+                     "needed to break even, so the sample cannot rule out a losing setup")
+    else:
+        notes.append(f"even the pessimistic win rate {pessimistic:.0f}% clears the "
+                     f"{breakeven:.0f}% break-even")
+    return {"trades": trades, "hit_rate": round(hit_rate, 1),
+            "expectancy": round(float(np.mean(results)), 2),
+            "profit_factor": round(gross_win / gross_loss, 2) if gross_loss > 0 else float("inf"),
+            "net_points": round(float(np.sum(results)), 2),
+            "breakeven": round(breakeven, 1), "pessimistic": round(pessimistic, 1),
+            "verdict": "Same pattern, same stop and target rule, applied to every occurrence in "
+                       "this window. " + "; ".join(notes) + "."}
+
+
+def draw_pattern(f: pd.DataFrame, hit: PatternHit, pad: int = 60):
+    """Candles around the hit with the pattern's own geometry drawn on top."""
+    import plotly.graph_objects as go
+
+    lo = max(0, hit.index - pad)
+    hi = min(len(f), hit.index + pad // 3)
+    data = f.iloc[lo:hi]
+    fig = go.Figure(go.Candlestick(
+        x=data.index, open=data["Open"], high=data["High"], low=data["Low"],
+        close=data["Close"], name="Price", increasing_line_color=_UP,
+        decreasing_line_color=_DOWN, increasing_fillcolor=_UP, decreasing_fillcolor=_DOWN))
+
+    for g in hit.geometry:
+        kind = g.get("type")
+        if kind == "line":
+            fig.add_trace(go.Scatter(x=[g["x0"], g["x1"]], y=[g["y0"], g["y1"]], mode="lines",
+                                     line=dict(color="#4f9df7", width=2),
+                                     name=g.get("label", "line"), showlegend=False))
+            fig.add_annotation(x=g["x1"], y=g["y1"], text=g.get("label", ""), showarrow=False,
+                               font=dict(size=10, color="#4f9df7"), xanchor="left")
+        elif kind == "curve":
+            fig.add_trace(go.Scatter(x=g["x"], y=g["y"], mode="lines",
+                                     line=dict(color="#4f9df7", width=2, dash="dot"),
+                                     showlegend=False))
+        elif kind == "pivot":
+            fig.add_trace(go.Scatter(x=[g["x"]], y=[g["y"]], mode="markers",
+                                     marker=dict(symbol="circle-open", size=12,
+                                                 color="#4dd0e1", line=dict(width=2)),
+                                     showlegend=False))
+        elif kind == "star":
+            fig.add_trace(go.Scatter(x=[g["x"]], y=[g["y"]], mode="markers+text",
+                                     marker=dict(symbol="star", size=15, color="#ffb300"),
+                                     text=[g.get("label", "")], textposition="top right",
+                                     textfont=dict(color="#ffb300", size=10), showlegend=False))
+        elif kind == "band":
+            fig.add_vrect(x0=g["x0"], x1=g["x1"], fillcolor="#ffb300", opacity=0.18, line_width=0)
+        elif kind == "zone":
+            fig.add_shape(type="rect", x0=g["x0"], x1=g["x1"], y0=g["y0"], y1=g["y1"],
+                          fillcolor="#4f9df7", opacity=0.2, line=dict(width=0))
+
+    fig.update_layout(
+        title=dict(text=f"{hit.pattern} — {fmt_time(hit.time)}", x=0.01, xanchor="left",
+                   font=dict(size=14)),
+        height=460, margin=dict(l=10, r=10, t=44, b=10), xaxis_rangeslider_visible=False,
+        hovermode="x unified", showlegend=False, dragmode="pan")
+    return fig
+
+
 # =============================================================================
 def tab_ledger(cfg: dict) -> None:
     st.subheader("Live Trade Log Ledger")
@@ -5609,82 +6357,454 @@ def tab_optimiser(cfg: dict) -> None:
                        "optimiser_results.csv", "text/csv")
 
 
+# =============================================================================
+# SECTION 19b -- CHART PATTERN SCANNER TAB
+# =============================================================================
+PATTERN_TIMEFRAMES = ["5m", "15m", "30m", "60m", "4h", "1d", "1wk"]
+
+
+def _pattern_period_for(interval: str) -> str:
+    return {"5m": "1mo", "15m": "3mo", "30m": "3mo", "60m": "6mo",
+            "4h": "1y", "1d": "2y", "1wk": "5y"}.get(interval, "1y")
+
+
+def scan_patterns(tickers: list[str], timeframes: list[str], wanted: list[str],
+                  direction: str, lookback: int, params: dict, progress=None):
+    """
+    Scan every ticker x timeframe and return recent hits plus the frames needed
+    to draw them. Sequential, because every download carries the API guards.
+    """
+    rows: list[dict] = []
+    frames: dict[tuple[str, str], pd.DataFrame] = {}
+    hits_by_key: dict[tuple[str, str], list] = {}
+    errors: list[dict] = []
+    total = max(1, len(tickers) * len(timeframes))
+    done = 0
+
+    for ticker in tickers:
+        for tf in timeframes:
+            done += 1
+            if progress is not None:
+                progress.progress(done / total, text=f"{ticker} · {tf}")
+            try:
+                bundle = load_market_data(ticker, _pattern_period_for(tf), tf,
+                                          freshness_seconds=300, min_bars=80)
+            except Exception as exc:                                # noqa: BLE001
+                errors.append({"Ticker": ticker, "Timeframe": tf, "Problem": str(exc)[:120]})
+                continue
+            frame = _pattern_frame(bundle.frame, params)
+            try:
+                hits = detect_patterns(bundle.frame, wanted, params)
+            except Exception as exc:                                # noqa: BLE001
+                errors.append({"Ticker": ticker, "Timeframe": tf, "Problem": str(exc)[:120]})
+                continue
+
+            key = (ticker, tf)
+            frames[key] = frame
+            hits_by_key[key] = hits
+            n = len(frame)
+            closes = frame["Close"].to_numpy(float)
+            highs = frame["High"].to_numpy(float)
+            lows = frame["Low"].to_numpy(float)
+
+            for h_i, hit in enumerate(hits):
+                bars_ago = n - 1 - hit.index
+                if bars_ago > lookback:
+                    continue
+                if direction == "Bullish only" and hit.bias == "bearish":
+                    continue
+                if direction == "Bearish only" and hit.bias == "bullish":
+                    continue
+                base = closes[hit.index]
+                after_h = highs[hit.index + 1:]
+                after_l = lows[hit.index + 1:]
+                move = (closes[-1] - base) / base * 100.0 if base else 0.0
+                best = ((after_h.max() - base) / base * 100.0) if after_h.size else 0.0
+                worst = ((after_l.min() - base) / base * 100.0) if after_l.size else 0.0
+                plan = pattern_levels(frame, hit, 2.0, 1.5)
+                rows.append({
+                    "Symbol": ticker, "Timeframe": tf, "Pattern": hit.pattern, "Bias": hit.bias,
+                    "Formed on": pd.Timestamp(hit.time), "Bars ago": int(bars_ago),
+                    "Move since %": round(move, 2), "Best move since %": round(best, 2),
+                    "Worst move since %": round(worst, 2),
+                    "Entry": round(plan["entry"], 2), "Stop": round(plan["stop"], 2),
+                    "Target": round(plan["target"], 2),
+                    "Chart": False, "Levels": False, "Sidebar": False,
+                    "Family": hit.family, "Fired at": pd.Timestamp(hit.time),
+                    "_key": f"{ticker}|{tf}", "_hit": h_i,
+                })
+    return pd.DataFrame(rows), frames, hits_by_key, pd.DataFrame(errors)
+
+
+def _pattern_dialog_chart(frame, hit):
+    st.plotly_chart(draw_pattern(frame, hit), width="stretch", config={"scrollZoom": True})
+    st.caption("The shaded band marks the confirming candle. Circles are the confirmed pivots "
+               "the geometry was fitted to; a pivot is only knowable some bars after it prints, "
+               "which is why a hit is never dated earlier than it could have been seen.")
+
+
+def _pattern_dialog_levels(frame, hit, hits_same_pattern, symbol, tf):
+    st.markdown("#### Recommended levels")
+    c1, c2 = st.columns(2)
+    rr = c1.slider("Reward : risk", 0.5, 6.0, 2.0, 0.25, key="pl_rr")
+    atr_mult = c2.slider("ATR multiple for the fallback stop", 0.5, 5.0, 1.5, 0.25, key="pl_atr")
+
+    plan = pattern_levels(frame, hit, rr, atr_mult)
+    side = "long" if plan["direction"] > 0 else "short"
+    st.markdown(f"**{hit.pattern} · {symbol} · {tf} · {side}**")
+
+    m = st.columns(4)
+    m[0].metric("Entry", fmt(plan["entry"]))
+    m[1].metric("Stop", fmt(plan["stop"]), f"{fmt(plan['risk'])} risk")
+    m[2].metric(f"Target at {fmt(rr, 2)}R", fmt(plan["target"]))
+    m[3].metric("Measured move", fmt(plan["measured"]) if plan["measured"] else "n/a")
+
+    bullets = [
+        "Entry is the close of the bar that confirmed the pattern. In practice you fill at the "
+        "next bar's open, which is what the record below assumes.",
+        f"Stop sits at **{fmt(plan['stop'])}**, "
+        + ("an ATR-scaled fallback, because the pattern's own structure was unusable or on the "
+           "wrong side of entry." if plan["fallback_stop"]
+           else "the structure the pattern is built on."),
+    ]
+    if plan["atr_multiple"]:
+        bullets.append(f"ATR here is {fmt(plan['atr'])}, so the stop is "
+                       f"{fmt(plan['atr_multiple'])} x ATR away.")
+    if plan["measured"]:
+        bullets.append("Measured move target: the pattern's own height projected from the break.")
+    for b in bullets:
+        st.markdown(f"- {b}")
+
+    st.markdown("**What this exact rule has done here before**")
+    rec = pattern_track_record(frame, hits_same_pattern, rr, atr_mult)
+    r = st.columns(5)
+    r[0].metric("Trades", rec["trades"])
+    r[1].metric("Hit rate", f"{fmt(rec['hit_rate'], 1)}%")
+    r[2].metric("Expectancy", fmt(rec["expectancy"]))
+    pf = rec["profit_factor"]
+    r[3].metric("Profit factor", "inf" if pf == float("inf") else fmt(pf))
+    r[4].metric("Net points", fmt(rec["net_points"]))
+    st.caption(rec["verdict"])
+    st.info("These are levels the pattern implies, not advice. The record above is the only "
+            "reason to take them seriously, and it is a small sample on one instrument.")
+
+    if st.button("Send this whole setup to the sidebar", type="primary", width="stretch",
+                 key="pl_send"):
+        st.session_state.pending_combo = {
+            "strategy": "42 \u00b7 Price Action Composite",
+            "sl_type": "Fixed Points", "sl_value": round(plan["risk"], 2),
+            "tp_type": "Risk : Reward Multiple", "tp_value": float(rr),
+            "filter_key": "", "widgets": {},
+        }
+        st.session_state.pending_ticker = symbol
+        st.rerun()
+
+
 def tab_patterns(cfg: dict) -> None:
     st.subheader("Chart Pattern Scanner")
-    st.caption("Rule-of-thumb geometric detection on confirmed zigzag pivots and candle shapes. "
-               "Two analysts would disagree about half of these, so treat a hit as worth a look "
-               "rather than a verdict.")
+    st.caption("Geometric and candlestick detection on confirmed pivots. Pattern reading is "
+               "subjective — two analysts would disagree about half of these — so every hit "
+               "carries its own historical record on that instrument. That record, not the "
+               "shape, is the reason to act. Beware of repeating textbook win rates.")
 
-    c1, c2, c3 = st.columns(3)
-    universe = c1.selectbox("Universe", SCREENER_UNIVERSES + ["Current sidebar ticker"],
-                            index=len(SCREENER_UNIVERSES), key="pat_universe")
-    sensitivity = c2.number_input("Zigzag sensitivity (%)", 0.1, 10.0, 0.6, 0.1, key="pat_zz",
-                                  help="Smaller finds more, and noisier, structures.")
-    max_names = c3.number_input("Max tickers", 1, 200, 25, key="pat_max")
+    c1, c2 = st.columns(2)
+    universe = c1.selectbox("Universe", SCREENER_UNIVERSES, key="pat_universe")
+    timeframes = c2.multiselect("Timeframes", PATTERN_TIMEFRAMES, default=["1d"], key="pat_tfs")
 
     custom_text, uploaded = "", None
     if universe.startswith("Custom"):
-        custom_text = st.text_area("Tickers", "RELIANCE\nTCS\nINFY", key="pat_custom")
-        uploaded = st.file_uploader("...or upload a list", type=["csv", "txt"], key="pat_upload")
+        custom_text = c1.text_area("Tickers", "RELIANCE\nTCS\nINFY", key="pat_custom")
+    all_tickers, note = _universe_tickers(universe, custom_text, uploaded)
 
-    if universe == "Current sidebar ticker":
-        tickers = [cfg["symbol"]]
-    else:
-        tickers, _ = _universe_tickers(universe, custom_text, uploaded)
-    tickers = tickers[:int(max_names)]
+    symbols = c1.multiselect("Symbols", all_tickers, default=all_tickers, key="pat_symbols")
+    families = c2.multiselect("Pattern families", PATTERN_FAMILIES, default=PATTERN_FAMILIES,
+                              key="pat_families")
+    direction = c2.radio("Direction", ["Any", "Bullish only", "Bearish only"], horizontal=True,
+                         key="pat_dir")
+    max_names = c1.number_input(f"Test at most (of {len(symbols)} listed)", 1,
+                                max(1, len(all_tickers)), min(25, max(1, len(symbols))),
+                                key="pat_max")
+
+    catalog = [p for p, fam in PATTERN_CATALOG.items() if fam in families]
+    patterns = st.multiselect("Patterns", catalog, default=catalog, key="pat_patterns")
+    lookback = st.number_input("Only show patterns formed within the last N candles", 1, 200, 10,
+                               key="pat_look")
+
+    tickers = symbols[:int(max_names)]
+    if note:
+        st.warning(note + " Index membership drifts; use a custom list when accuracy matters.")
+    st.caption(f"{len(tickers)} symbol(s) x {len(timeframes)} timeframe(s) = "
+               f"{len(tickers) * max(1, len(timeframes))} downloads, each carrying the "
+               f"{API_GUARD_DELAY}s guard on both sides.")
 
     if st.button("Scan for Patterns", type="primary", width="stretch"):
-        bar = st.progress(0.0, text="Scanning ...")
-        found, frames = [], {}
-        for i, ticker in enumerate(tickers):
-            bar.progress((i + 1) / max(1, len(tickers)), text=f"Scanning {ticker} ...")
-            try:
-                bundle = load_market_data(ticker, cfg["period"], cfg["interval"], 300.0,
-                                          min_bars=40)
-            except Exception:                                       # noqa: BLE001
-                continue
-            frames[ticker] = bundle.frame
-            for hit in detect_patterns(bundle.frame, float(sensitivity)):
-                found.append({"Ticker": ticker, **hit})
+        if not tickers or not timeframes or not patterns:
+            st.error("Pick at least one symbol, timeframe and pattern.")
+        else:
+            bar = st.progress(0.0, text="Starting ...")
+            rows, frames, hits, errors = scan_patterns(tickers, timeframes, patterns, direction,
+                                                       int(lookback), cfg["params"], bar)
+            bar.empty()
+            st.session_state.pattern_rows = rows
+            st.session_state.pattern_frames = frames
+            st.session_state.pattern_hits = hits
+            st.session_state.pattern_errors = errors
+
+    rows = st.session_state.get("pattern_rows")
+    if rows is None:
+        st.info("Choose a universe and scan.")
+        return
+    if rows.empty:
+        st.info("No patterns matched inside the lookback window.")
+        return
+
+    st.success(f"{len(rows)} hit(s).")
+    st.caption("Tick a box in any row to act on it. **Chart** draws the pattern on the candles, "
+               "**Levels** opens the full plan with its historical record, **Sidebar** loads the "
+               "whole setup ready to backtest. Ticks clear themselves after firing.")
+
+    display_cols = ["Symbol", "Timeframe", "Pattern", "Bias", "Formed on", "Bars ago",
+                    "Move since %", "Best move since %", "Worst move since %",
+                    "Entry", "Stop", "Target", "Chart", "Levels", "Sidebar", "Family", "Fired at"]
+    edited = st.data_editor(
+        rows[display_cols], hide_index=True, width="stretch", key="pat_editor",
+        disabled=[c for c in display_cols if c not in ("Chart", "Levels", "Sidebar")],
+        column_config={
+            "Chart": st.column_config.CheckboxColumn("Chart", default=False),
+            "Levels": st.column_config.CheckboxColumn("Levels", default=False),
+            "Sidebar": st.column_config.CheckboxColumn("Sidebar", default=False),
+            "Formed on": st.column_config.DatetimeColumn(format="YYYY-MM-DD HH:mm"),
+            "Fired at": st.column_config.DatetimeColumn(format="YYYY-MM-DD HH:mm"),
+        })
+
+    st.download_button("Download hits as CSV", rows[display_cols].to_csv(index=False).encode(),
+                       f"patterns_{pd.Timestamp.now():%Y%m%d_%H%M}.csv", "text/csv")
+
+    action, row_idx = None, None
+    for col in ("Chart", "Levels", "Sidebar"):
+        ticked = edited.index[edited[col].fillna(False)].tolist()
+        if ticked:
+            action, row_idx = col, ticked[0]
+            break
+    if action is None:
+        return
+
+    # Clear the tick immediately so the action fires once, not on every rerun.
+    st.session_state.pattern_rows.loc[row_idx, action] = False
+    row = st.session_state.pattern_rows.loc[row_idx]
+    key = tuple(str(row["_key"]).split("|"))
+    frame = (st.session_state.get("pattern_frames") or {}).get(key)
+    hit_list = (st.session_state.get("pattern_hits") or {}).get(key) or []
+    if frame is None or int(row["_hit"]) >= len(hit_list):
+        st.error("The scan data for that row is no longer in memory. Re-run the scan.")
+        return
+    hit = hit_list[int(row["_hit"])]
+
+    if action == "Sidebar":
+        plan = pattern_levels(frame, hit, 2.0, 1.5)
+        st.session_state.pending_combo = {
+            "strategy": "42 \u00b7 Price Action Composite",
+            "sl_type": "Fixed Points", "sl_value": round(plan["risk"], 2),
+            "tp_type": "Risk : Reward Multiple", "tp_value": 2.0,
+            "filter_key": "", "widgets": {}}
+        st.session_state.pending_ticker = row["Symbol"]
+        st.rerun()
+
+    same = [h for h in hit_list if h.pattern == hit.pattern]
+    if hasattr(st, "dialog"):
+        if action == "Chart":
+            @st.dialog("Pattern detail", width="large")
+            def _chart_dialog():
+                _pattern_dialog_chart(frame, hit)
+            _chart_dialog()
+        else:
+            @st.dialog("Recommended levels", width="large")
+            def _levels_dialog():
+                _pattern_dialog_levels(frame, hit, same, row["Symbol"], row["Timeframe"])
+            _levels_dialog()
+    else:                                                            # pragma: no cover
+        if action == "Chart":
+            _pattern_dialog_chart(frame, hit)
+        else:
+            _pattern_dialog_levels(frame, hit, same, row["Symbol"], row["Timeframe"])
+
+
+# =============================================================================
+# SECTION 19c -- SIGNAL LAB  (optimiser + live screener in one pass)
+# =============================================================================
+def run_signal_lab(tickers: list[str], cfg: dict, objective: str, iterations: int,
+                   min_trades: int, signal_window: int, safe_only: bool,
+                   progress=None) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    For each ticker: search for the best configuration on its own history, then
+    ask whether that winning configuration is signalling right now.
+
+    The two halves answer different questions. The optimiser says what WOULD have
+    worked; the live check says whether it is triggering. A ticker only earns
+    attention when both line up -- and even then the optimiser's caveat stands:
+    the more combinations searched, the more the winner owes to luck.
+    """
+    rows, errors = [], []
+    costs = cfg.get("costs") or CostModel()
+    for i, ticker in enumerate(tickers):
+        if progress is not None:
+            progress.progress((i + 1) / max(1, len(tickers)), text=f"Optimising {ticker} ...")
+        try:
+            bundle = load_market_data(ticker, cfg["period"], cfg["interval"],
+                                      freshness_seconds=300, min_bars=WARMUP_BARS + 40)
+        except Exception as exc:                                    # noqa: BLE001
+            errors.append({"Ticker": ticker, "Problem": str(exc)[:140]})
+            continue
+
+        params = dict(cfg["params"])
+        params["symbol"], params["interval"] = ticker, cfg["interval"]
+        try:
+            table = optimise(bundle.frame, params, cfg["quantity"], costs, objective,
+                             min_trades, iterations, seed=11, safe_exits_only=safe_only)
+        except Exception as exc:                                    # noqa: BLE001
+            errors.append({"Ticker": ticker, "Problem": f"optimiser: {str(exc)[:120]}"})
+            continue
+        if table.empty:
+            errors.append({"Ticker": ticker, "Problem": "no combination met the minimum trades"})
+            continue
+
+        best = table.iloc[0]
+        fcfg = default_filter_config()
+        fkey = str(best.get("Filter Key") or "")
+        if fkey:
+            fcfg[fkey]["enabled"] = True
+        try:
+            frame, _ = prepare(bundle.frame, best["Strategy"], params, fcfg, {})
+        except Exception as exc:                                    # noqa: BLE001
+            errors.append({"Ticker": ticker, "Problem": f"signal check: {str(exc)[:120]}"})
+            continue
+
+        window = frame["signal"].iloc[-(signal_window + 1):-1]
+        fired = window[window != 0]
+        detail: dict = {}
+        if fired.empty:
+            when, side = "no signal", "-"
+            detail = {"Price Now": round(float(frame["Close"].iloc[-1]), 2),
+                      "Last Candle": pd.Timestamp(frame.index[-1]),
+                      "Scanned At": pd.Timestamp.now(), "Interval": cfg["interval"]}
+        else:
+            sig_time = fired.index[-1]
+            direction = int(fired.iloc[-1])
+            side = "LONG" if direction > 0 else "SHORT"
+            when_bars = int(len(frame) - 2 - frame.index.get_loc(sig_time))
+            when = ("Just now (last closed candle)" if when_bars <= 0
+                    else f"Just before ({when_bars} candles ago)")
+            risk_for_row = RiskConfig(best["Stop-Loss"],
+                                      float(best["SL Value"] or 0.0), best["Target"],
+                                      float(best["TP Value"] or 0.0), cfg["quantity"])
+            detail = signal_detail(frame, sig_time, direction, risk_for_row, ticker,
+                                   cfg["interval"])
+
+        rows.append({
+            "Ticker": ticker, "Signal": side, "When": when, **detail,
+            "Best Strategy": best["Strategy"],
+            "Stop-Loss": best["Stop-Loss"], "SL Value": best["SL Value"],
+            "Target": best["Target"], "TP Value": best["TP Value"],
+            "Filter": best["Filter"], "Filter Key": fkey,
+            "Trades": best["Trades"], "Win %": best["Win %"], "Sharpe": best["Sharpe"],
+            "Expectancy": best["Expectancy"], "Net PnL": best["Net PnL"],
+            "Profit Factor": best["Profit Factor"], "Reliability": best["Reliability"],
+            "Score": best["Score"], "Close": round(float(frame["Close"].iloc[-1]), 2),
+        })
+    return pd.DataFrame(rows), pd.DataFrame(errors)
+
+
+def tab_signal_lab(cfg: dict) -> None:
+    st.subheader("Signal Lab — optimise, then screen")
+    st.error("**Two compounding ways to fool yourself, in one tab.** Searching many "
+             "combinations per ticker and keeping the winner overstates what any of them will "
+             "do next; running that search across many tickers and keeping the best tickers "
+             "overstates it again. Treat the output as a shortlist to validate on a different "
+             "period, never as a result.")
+
+    c1, c2, c3 = st.columns(3)
+    universe = c1.selectbox("Universe", SCREENER_UNIVERSES, key="lab_universe")
+    objective = c2.selectbox("Optimise for", OPTIMISER_OBJECTIVES, key="lab_obj")
+    signal_window = c3.number_input("Signal window (candles)", 1, 20, 3, key="lab_window")
+
+    custom_text = ""
+    if universe.startswith("Custom"):
+        custom_text = st.text_area("Tickers", "RELIANCE\nTCS\nINFY", key="lab_custom")
+    tickers, note = _universe_tickers(universe, custom_text, None)
+
+    d1, d2, d3 = st.columns(3)
+    max_names = d1.number_input("Max tickers", 1, 200, min(10, len(tickers)), key="lab_max")
+    iterations = d2.number_input("Combinations per ticker", 10, 500, 60, 10, key="lab_iters")
+    min_trades = d3.number_input("Minimum trades to qualify", 1, 200, 10, key="lab_min")
+    safe_only = st.checkbox("Backtest-safe exits only (exclude distance trails)", value=True,
+                            key="lab_safe",
+                            help="Distance trails cannot be simulated faithfully on OHLC bars, "
+                                 "so including them lets an optimiser pick a configuration whose "
+                                 "backtest is systematically optimistic.")
+
+    tickers = tickers[:int(max_names)]
+    if note:
+        st.warning(note)
+    est = len(tickers) * int(iterations) * 0.05 + len(tickers) * 1.2
+    st.caption(f"{len(tickers)} ticker(s) x {int(iterations)} combinations = "
+               f"{len(tickers) * int(iterations):,} backtests. Rough estimate {est:0.0f}s.")
+
+    if st.button("Run Signal Lab", type="primary", width="stretch"):
+        bar = st.progress(0.0, text="Starting ...")
+        try:
+            results, errors = run_signal_lab(tickers, cfg, objective, int(iterations),
+                                             int(min_trades), int(signal_window), safe_only, bar)
+            st.session_state.lab_results = (results, errors)
+        except Exception as exc:                                    # noqa: BLE001
+            st.session_state.lab_results = None
+            st.error(f"Signal Lab failed: {exc}")
         bar.empty()
-        st.session_state.pattern_results = (pd.DataFrame(found), frames)
 
-    payload = st.session_state.pattern_results
+    payload = st.session_state.get("lab_results")
     if payload is None:
-        st.info("Pick a universe and scan.")
+        st.info("Pick a universe and run the lab.")
         return
-    results, frames = payload
+    results, errors = payload
     if results.empty:
-        st.info("No patterns detected on this configuration. Lower the zigzag sensitivity to "
-                "find more structures.")
+        st.info("Nothing qualified. Lower the minimum trades, widen the period, or raise the "
+                "combination count.")
+        if not errors.empty:
+            st.dataframe(errors, width="stretch", hide_index=True)
         return
 
-    bias = st.multiselect("Show", ["Bullish", "Bearish", "Neutral"],
-                          default=["Bullish", "Bearish"], key="pat_bias")
-    view = results[results["Bias"].isin(bias)] if bias else results
-    st.dataframe(view.sort_values("At", ascending=False), width="stretch", hide_index=True)
+    signalling = results[results["Signal"] != "-"]
+    a, b, c = st.columns(3)
+    a.metric("Tickers optimised", len(results))
+    b.metric("Signalling now", len(signalling))
+    c.metric("Backtest-safe configs", int((results["Reliability"] == "Backtest-safe").sum()))
 
-    if not view.empty:
-        pick = st.selectbox("Plot which ticker?", sorted(view["Ticker"].unique()), key="pat_pick")
-        frame = frames.get(pick)
-        if frame is not None:
-            plot = frame.copy()
-            plot["ema_fast"] = ema(plot["Close"], int(_p(cfg["params"], "ema_fast")))
-            plot["ema_slow"] = ema(plot["Close"], int(_p(cfg["params"], "ema_slow")))
-            fig = price_chart(plot, f"{pick} | {cfg['interval']} | detected patterns",
-                              tail=200, hide_weekends=cfg.get("hide_weekends", True))
-            for _, hit in view[view["Ticker"] == pick].iterrows():
-                colour = {"Bullish": "#26a69a", "Bearish": "#ef5350"}.get(hit["Bias"], "#8d99ae")
-                fig.add_vline(x=hit["At"], line=dict(width=1, dash="dot", color=colour),
-                              annotation_text=hit["Pattern"], annotation_position="top")
-            st.plotly_chart(fig, width="stretch", config={"scrollZoom": True})
-        st.download_button("Download patterns (CSV)", view.to_csv(index=False).encode(),
-                           "chart_patterns.csv", "text/csv")
+    show_only = st.checkbox("Show only tickers that are signalling", value=True, key="lab_filter")
+    table = signalling if show_only else results
+    table = table.sort_values(["Signal", "Score"], ascending=[True, False]).reset_index(drop=True)
+    if table.empty:
+        st.info("No ticker is signalling right now on its own optimised configuration.")
+        return
+
+    st.dataframe(table.drop(columns=["Filter Key"]), width="stretch", hide_index=True)
+    pick = st.selectbox("Apply which ticker's setup?", table["Ticker"].tolist(), key="lab_pick")
+    row = table[table["Ticker"] == pick].iloc[0]
+    if st.button("Apply this ticker and its configuration to the sidebar", type="primary",
+                 width="stretch"):
+        st.session_state.pending_combo = {
+            "strategy": row["Best Strategy"], "sl_type": row["Stop-Loss"],
+            "sl_value": row["SL Value"], "tp_type": row["Target"], "tp_value": row["TP Value"],
+            "filter_key": str(row["Filter Key"] or ""), "widgets": {}}
+        st.session_state.pending_ticker = row["Ticker"]
+        st.rerun()
+    st.caption(f"{pick}: {row['Best Strategy']} | SL {row['Stop-Loss']} | TGT {row['Target']} | "
+               f"filter {row['Filter']} | {row['Trades']} trades | {row['Reliability']}")
+    st.download_button("Download lab results (CSV)", results.to_csv(index=False).encode(),
+                       "signal_lab.csv", "text/csv")
+    if not errors.empty:
+        with st.expander(f"Tickers that could not be processed ({len(errors)})"):
+            st.dataframe(errors, width="stretch", hide_index=True)
 
 
-# =============================================================================
-# SECTION 16 -- MAIN
-# =============================================================================
 def main() -> None:
     st.set_page_config(page_title="Algo Trading Platform", layout="wide",
                        initial_sidebar_state="expanded")
@@ -5697,9 +6817,9 @@ def main() -> None:
     (status.success if st.session_state.live_running else status.info)(
         "LIVE CORE: RUNNING" if st.session_state.live_running else "LIVE CORE: IDLE")
 
-    t1, t2, t3, t4, t5, t6 = st.tabs(
+    t1, t2, t3, t4, t5, t6, t7 = st.tabs(
         ["Backtesting Engine Studio", "Live Sandbox Operations", "Live Trade Log Ledger",
-         "Signal Screener", "Strategy Optimiser", "Chart Patterns"])
+         "Signal Screener", "Strategy Optimiser", "Signal Lab", "Chart Patterns"])
     with t1:
         tab_backtest(cfg)
     with t2:
@@ -5711,6 +6831,8 @@ def main() -> None:
     with t5:
         tab_optimiser(cfg)
     with t6:
+        tab_signal_lab(cfg)
+    with t7:
         tab_patterns(cfg)
 
 
@@ -6061,6 +7183,92 @@ def _test_new_profiles_and_flip():
           f"flip exact, OHLC on trades  OK")
 
 
+def _test_signal_detail():
+    """
+    The enriched signal columns must reconcile with each other exactly.
+
+    Also a regression guard: the screener used to treat the FORMING candle as a
+    confirmed hit, which left rows with no fill price and "-1 bars ago".
+    """
+    df = _synthetic(600, seed=11)
+    params = dict(DEFAULT_PARAMS)
+    params["intraday"] = True
+    frame, _ = prepare(df, "01 \u00b7 Dual EMA Crossover", params)
+    fired = frame.iloc[:-1]
+    fired = fired[fired["signal"] != 0]
+    assert not fired.empty, "no signal to inspect"
+
+    risk = RiskConfig("Fixed Points", 30.0, "Fixed Points", 60.0, 1.0)
+    for when in (fired.index[-1], fired.index[0]):
+        direction = int(frame.loc[when, "signal"])
+        d = signal_detail(frame, when, direction, risk, "TEST", "5m")
+        assert d["Bars Ago"] >= 0, "a confirmed signal cannot be in the future"
+        assert d["Fill Price (next open)"] is not None, "confirmed signals must have a fill"
+        assert abs((d["Price Now"] - d["Price at Signal"]) - d["Move Abs"]) < 0.02
+        fav = (d["Price Now"] - d["Fill Price (next open)"]) * direction
+        assert abs(fav - d["Move in Favour"]) < 0.02, "favour must be signed by direction"
+        assert abs(d["Move in Favour"] / d["Risk Points"] - d["R Multiple Now"]) < 0.02
+        assert abs(abs(d["Fill Price (next open)"] - d["Suggested Stop"])
+                   - d["Risk Points"]) < 0.02
+        assert d["Best Since"] >= d["Worst Since"], "best excursion below the worst"
+        assert d["Scanned At"] is not None and d["Last Candle"] is not None
+
+    # A short must report favour with the opposite sign to the raw market move.
+    shorts = frame.iloc[:-1]
+    shorts = shorts[shorts["signal"] == -1]
+    if not shorts.empty:
+        d = signal_detail(frame, shorts.index[-1], -1, risk, "TEST", "5m")
+        if d["Move Abs"] != 0:
+            assert np.sign(d["Move %"]) != np.sign(d["Favour %"]), \
+                "a short's favour must invert the raw move"
+    print("   signal detail columns reconcile; fills come from the next open  OK")
+
+
+def _test_pattern_library():
+    """Detectors fire across all four families, and never before confirmation."""
+    df = _synthetic(1500, seed=11)
+    params = dict(DEFAULT_PARAMS)
+    hits = detect_patterns(df, params=params)
+    assert len(hits) > 50, f"detector library found almost nothing ({len(hits)})"
+
+    families = {h.family for h in hits}
+    assert {"Candlestick", "Reversal", "Level"} <= families, f"missing families: {families}"
+    names = {h.pattern for h in hits}
+    for expected in ("Trendline breakout", "Trendline breakdown", "Double top", "Rounding top"):
+        assert expected in names, f"{expected} never fired"
+
+    n = len(df)
+    for h in hits:
+        assert 0 <= h.index < n, "hit outside the frame"
+        assert h.bias in ("bullish", "bearish", "either"), f"bad bias {h.bias}"
+        assert np.isfinite(h.entry) and np.isfinite(h.stop), f"{h.pattern}: unusable levels"
+        assert h.geometry, f"{h.pattern}: nothing to draw"
+        assert PATTERN_CATALOG.get(h.pattern) == h.family, f"{h.pattern}: family mismatch"
+
+    # Levels must put the stop on the correct side of entry for the stated bias.
+    frame = _pattern_frame(df, params)
+    for h in hits[:400]:
+        plan = pattern_levels(frame, h, 2.0, 1.5)
+        d = plan["direction"]
+        assert (plan["stop"] - plan["entry"]) * d < 0, f"{h.pattern}: stop on the wrong side"
+        assert (plan["target"] - plan["entry"]) * d > 0, f"{h.pattern}: target on the wrong side"
+        assert abs(plan["target"] - plan["entry"]) > abs(plan["stop"] - plan["entry"]) * 1.9, \
+            f"{h.pattern}: 2R target is not two times the risk"
+
+    # The track record must reconcile: expectancy is the mean of the outcomes.
+    by = {}
+    for h in hits:
+        by.setdefault(h.pattern, []).append(h)
+    pat = max(by, key=lambda k: len(by[k]))
+    rec = pattern_track_record(frame, by[pat], 2.0, 1.5)
+    assert rec["trades"] > 0 and 0 <= rec["hit_rate"] <= 100
+    assert rec["breakeven"] > 0 and rec["pessimistic"] <= rec["hit_rate"] + 1e-6, \
+        "the pessimistic bound must sit at or below the observed win rate"
+    assert "applied to every occurrence" in rec["verdict"]
+    print(f"   {len(hits)} hits across {len(families)} families; levels and track record "
+          f"reconcile ({pat}: {rec['trades']} trades)  OK")
+
+
 def _test_fill_semantics():
     """Signal on N must fill at the OPEN of N+1, and the stop is checked before the target."""
     idx = pd.date_range("2024-01-01 09:15", periods=6, freq="5min", tz="Asia/Kolkata")
@@ -6231,6 +7439,8 @@ def run_selftest() -> int:
         _test_zigzag_and_elliott()
         _test_threshold_strategies()
         _test_new_profiles_and_flip()
+        _test_pattern_library()
+        _test_signal_detail()
         print("-- filters --")
         _test_filters()
         _test_new_filters()
@@ -6507,81 +7717,6 @@ def optimise(df: pd.DataFrame, base_params: dict, quantity: float, costs: CostMo
     frame = frame.sort_values("Score", ascending=False).reset_index(drop=True)
     frame.insert(0, "Rank", range(1, len(frame) + 1))
     return frame
-
-
-# --------------------------------------------------------------------------- #
-# CHART PATTERNS
-# --------------------------------------------------------------------------- #
-def detect_patterns(df: pd.DataFrame, zigzag_pct: float = 0.6) -> list[dict]:
-    """
-    Classic chart patterns from confirmed zigzag pivots plus candle geometry.
-
-    Every pattern is a rule-of-thumb approximation with tolerances chosen by
-    hand. Two analysts would disagree about half of these; treat a hit as
-    "worth a look", never as a verdict.
-    """
-    out: list[dict] = []
-    piv = zigzag_pivot_table(df["Close"], zigzag_pct)
-    n = len(df)
-    if n < 20:
-        return out
-
-    def add(name, bias, idx, note):
-        out.append({"Pattern": name, "Bias": bias, "At": df.index[min(idx, n - 1)], "Note": note})
-
-    # ---- pivot-based structures ----
-    if len(piv) >= 4:
-        (_, a, ka, _), (_, b, kb, _), (_, c, kc, _), (_, d, kd, ci) = piv[-4:]
-        if (ka, kb, kc, kd) == (1, -1, 1, -1) and abs(a - c) / max(a, 1e-9) < 0.02:
-            add("Double Top", "Bearish", ci, f"Two highs within 2%: {fmt(a)} / {fmt(c)}")
-        if (ka, kb, kc, kd) == (-1, 1, -1, 1) and abs(a - c) / max(a, 1e-9) < 0.02:
-            add("Double Bottom", "Bullish", ci, f"Two lows within 2%: {fmt(a)} / {fmt(c)}")
-    if len(piv) >= 5:
-        highs = [(v, i) for _, v, k, i in piv[-5:] if k == 1]
-        lows = [(v, i) for _, v, k, i in piv[-5:] if k == -1]
-        if len(highs) >= 3:
-            h1, h2, h3 = highs[-3][0], highs[-2][0], highs[-1][0]
-            if h2 > h1 and h2 > h3 and abs(h1 - h3) / max(h1, 1e-9) < 0.03:
-                add("Head & Shoulders", "Bearish", highs[-1][1],
-                    f"Head {fmt(h2)} between shoulders {fmt(h1)} / {fmt(h3)}")
-        if len(lows) >= 3:
-            l1, l2, l3 = lows[-3][0], lows[-2][0], lows[-1][0]
-            if l2 < l1 and l2 < l3 and abs(l1 - l3) / max(l1, 1e-9) < 0.03:
-                add("Inverse Head & Shoulders", "Bullish", lows[-1][1],
-                    f"Head {fmt(l2)} between shoulders {fmt(l1)} / {fmt(l3)}")
-        hs = [v for _, v, k, _ in piv[-5:] if k == 1]
-        ls = [v for _, v, k, _ in piv[-5:] if k == -1]
-        if len(hs) >= 2 and len(ls) >= 2:
-            if hs[-1] < hs[-2] and ls[-1] > ls[-2]:
-                add("Symmetrical Triangle", "Neutral", n - 1, "Lower highs into higher lows")
-            elif abs(hs[-1] - hs[-2]) / max(hs[-2], 1e-9) < 0.01 and ls[-1] > ls[-2]:
-                add("Ascending Triangle", "Bullish", n - 1, "Flat highs, rising lows")
-            elif abs(ls[-1] - ls[-2]) / max(ls[-2], 1e-9) < 0.01 and hs[-1] < hs[-2]:
-                add("Descending Triangle", "Bearish", n - 1, "Flat lows, falling highs")
-
-    # ---- recent candle geometry ----
-    tail = df.tail(6)
-    o, h, l_, c = (tail["Open"], tail["High"], tail["Low"], tail["Close"])
-    body = (c - o).abs()
-    rng = (h - l_).replace(0.0, np.nan)
-    lower = tail[["Open", "Close"]].min(axis=1) - l_
-    upper = h - tail[["Open", "Close"]].max(axis=1)
-    for i in range(1, len(tail)):
-        if body.iloc[i] > 0 and lower.iloc[i] >= 2 * body.iloc[i] and \
-                (lower.iloc[i] / rng.iloc[i]) > 0.5:
-            add("Hammer / Pin Bar", "Bullish", n - len(tail) + i, "Long lower rejection wick")
-        if body.iloc[i] > 0 and upper.iloc[i] >= 2 * body.iloc[i] and \
-                (upper.iloc[i] / rng.iloc[i]) > 0.5:
-            add("Shooting Star", "Bearish", n - len(tail) + i, "Long upper rejection wick")
-        if c.iloc[i] > o.iloc[i] and c.iloc[i - 1] < o.iloc[i - 1] and \
-                c.iloc[i] >= o.iloc[i - 1] and o.iloc[i] <= c.iloc[i - 1]:
-            add("Bullish Engulfing", "Bullish", n - len(tail) + i, "Body engulfs the prior candle")
-        if c.iloc[i] < o.iloc[i] and c.iloc[i - 1] > o.iloc[i - 1] and \
-                c.iloc[i] <= o.iloc[i - 1] and o.iloc[i] >= c.iloc[i - 1]:
-            add("Bearish Engulfing", "Bearish", n - len(tail) + i, "Body engulfs the prior candle")
-        if h.iloc[i] < h.iloc[i - 1] and l_.iloc[i] > l_.iloc[i - 1]:
-            add("Inside Bar", "Neutral", n - len(tail) + i, "Coil inside the prior range")
-    return out
 
 
 if __name__ == "__main__":
