@@ -4770,6 +4770,57 @@ def futures_volume_series(uinfo, interval, period, target_index):
         return None
 
 
+def futures_ohlcv_series(uinfo, interval, period, target_index):
+    """
+    Futures Close and Volume aligned to the underlying's candle index.
+
+    Needed because a coherent VWAP requires PRICE AND VOLUME FROM THE SAME
+    INSTRUMENT. Weighting index prices by futures volumes would be
+    meaningless — the weights would describe trades that never occurred at
+    those prices — so when futures are chosen as the VWAP source, the futures
+    price series is used as well, and the breakout is compared against the
+    futures VWAP. Returns None if it cannot be built.
+    """
+    if not uinfo:
+        return None
+    _, token = _dhan_creds()
+    if not str(token or "").strip():
+        return None
+    try:
+        exps = dhan_get_expiries(uinfo["underlying"], uinfo["fut_instrument"], uinfo["exchange"])
+        if not exps:
+            return None
+        info = dhan_lookup_future(uinfo["underlying"], exps[0], uinfo["fut_instrument"], uinfo["exchange"])
+        if not info:
+            return None
+        base = interval if interval in DHAN_INTERVAL_CODE else "5m"
+        fut = _dhan_fetch_candles_cached(info["security_id"], f"{uinfo['exchange']}_FNO",
+                                         uinfo["fut_instrument"], base, period,
+                                         hash(token) % 10_000_019)
+        if fut is None or fut.empty:
+            return None
+        fut = normalize_index_to_ist(fut, "")
+        right = pd.DataFrame({
+            "t": _norm_ts(pd.Series(fut.index)).values,
+            "High": pd.to_numeric(fut.get("High"), errors="coerce").values,
+            "Low": pd.to_numeric(fut.get("Low"), errors="coerce").values,
+            "Close": pd.to_numeric(fut["Close"], errors="coerce").values,
+            "Volume": pd.to_numeric(fut.get("Volume", 0), errors="coerce").values,
+        }).dropna(subset=["Close"]).sort_values("t")
+        if right.empty:
+            return None
+        tgt = pd.DataFrame({"t": _norm_ts(pd.Series(target_index))}).sort_values("t")
+        merged = pd.merge_asof(tgt, right, on="t", direction="nearest",
+                               tolerance=pd.Timedelta(minutes=5))
+        out = pd.DataFrame({
+            "High": merged["High"].values, "Low": merged["Low"].values,
+            "Close": merged["Close"].values, "Volume": merged["Volume"].values,
+        }, index=target_index)
+        return out if out["Close"].notna().sum() > len(out) * 0.3 else None
+    except Exception:
+        return None
+
+
 def entries_taken_today(strategy=None):
     """
     How many positions were ACTUALLY OPENED today.
@@ -4840,6 +4891,17 @@ def _zero_hero_expiry_mask(index, params):
     return mask, note
 
 
+def _infer_interval(idx):
+    """Bar size inferred from the index spacing, so any caller gets matching
+    futures candles without having to thread the timeframe through."""
+    try:
+        step = pd.Series(pd.DatetimeIndex(idx)).diff().dt.total_seconds().median()
+        return {60: "1m", 120: "2m", 180: "3m", 300: "5m", 600: "10m",
+                900: "15m", 1800: "30m", 3600: "1h"}.get(int(step or 60), "5m")
+    except Exception:
+        return "5m"
+
+
 def zero_hero_state(df, params):
     """Evaluate every Zero Hero condition, returning boolean Series per rule
     plus a diagnostic dict for the status board."""
@@ -4887,13 +4949,43 @@ def zero_hero_state(df, params):
     out["break_dn"] = (close < out["ref_low"] - buf).fillna(False)
 
     # 4 ── VWAP agreement
+    #
+    # Price and volume MUST come from the same instrument. With the futures
+    # source the futures price is compared against the futures VWAP; mixing
+    # index prices with futures volume, or comparing an index price against a
+    # futures VWAP, is wrong by the basis (tens of points on Nifty) which is
+    # often larger than the signal itself.
+    vwap_src = params.get("zh_vwap_source", "Auto")
+    out["vwap_instrument"] = "underlying"
+    out["vwap_price"] = close
     if params.get("zh_use_vwap", True):
-        v = vwap(df)
+        use_fut = str(vwap_src).startswith("Futures") or (
+            str(vwap_src).startswith("Auto") and params.get("zh_kind", "Index") == "Index"
+            and vwap_basis(df) != "volume")
+        fut_df = None
+        if use_fut:
+            _uinfo_v = resolve_chain_underlying(params.get("zh_kind", "Index"),
+                                                params.get("zh_underlying") or "Nifty50")
+            fut_df = futures_ohlcv_series(_uinfo_v, params.get("_interval") or _infer_interval(idx),
+                                          params.get("_period", "5d"), idx)
+        if fut_df is not None and float(pd.to_numeric(fut_df["Volume"], errors="coerce").fillna(0).sum()) > 0:
+            v = vwap(fut_df)
+            price_ref = pd.to_numeric(fut_df["Close"], errors="coerce")
+            out["vwap_instrument"] = "futures"
+            out["vwap_price"] = price_ref
+        else:
+            v = vwap(df)
+            price_ref = close
+            out["vwap_instrument"] = ("underlying_fallback" if use_fut else "underlying")
+            out["vwap_price"] = close
         out["vwap"] = v
-        out["vwap_up"] = (close > v).fillna(False)
-        out["vwap_dn"] = (close < v).fillna(False)
+        out["vwap_basis"] = vwap_basis(fut_df if out["vwap_instrument"] == "futures" else df)
+        out["vwap_up"] = (price_ref > v).fillna(False)
+        out["vwap_dn"] = (price_ref < v).fillna(False)
     else:
         out["vwap"] = pd.Series(np.nan, index=idx)
+        out["vwap_price"] = close
+        out["vwap_basis"] = "off"
         out["vwap_up"] = out["vwap_dn"] = pd.Series(True, index=idx)
 
     # 5 ── thrust relative to ATR (real displacement, not drift)
@@ -4926,15 +5018,8 @@ def zero_hero_state(df, params):
         # Infer the bar size from the data when the caller did not pass it, so
         # the futures candles are fetched at a matching interval no matter
         # which code path asked (signal generation, live loop, status board).
-        _iv = params.get("_interval")
-        if not _iv:
-            try:
-                _step = pd.Series(pd.DatetimeIndex(idx)).diff().dt.total_seconds().median()
-                _iv = {60: "1m", 180: "3m", 300: "5m", 900: "15m", 1800: "30m",
-                       3600: "1h"}.get(int(_step or 60), "5m")
-            except Exception:
-                _iv = "5m"
-        series = futures_volume_series(uinfo, _iv, params.get("_period", "5d"), idx)
+        series = futures_volume_series(uinfo, params.get("_interval") or _infer_interval(idx),
+                                       params.get("_period", "5d"), idx)
         used = "futures" if series is not None else "futures_unavailable"
 
     if series is None and used in ("none", "futures_unavailable"):
@@ -5017,6 +5102,39 @@ def zero_hero_state(df, params):
 
     out["long"], out["short"] = long_ok, short_ok
     out["max_per_day"] = max_per_day
+
+    # ---- raw values, for checking against TradingView ----
+    # Every condition's underlying number is exposed so it can be compared
+    # against a chart directly, rather than only its pass/fail verdict.
+    try:
+        _last = -1
+        a_last = float(a.iloc[_last]) if pd.notna(a.iloc[_last]) else None
+        mv = float(move.iloc[_last]) if pd.notna(move.iloc[_last]) else None
+        out["tv"] = {
+            "bar_time": str(idx[_last]),
+            "close": float(close.iloc[_last]),
+            "range_high": float(out["ref_high"].iloc[_last]) if pd.notna(out["ref_high"].iloc[_last]) else None,
+            "range_low": float(out["ref_low"].iloc[_last]) if pd.notna(out["ref_low"].iloc[_last]) else None,
+            "vwap": float(out["vwap"].iloc[_last]) if pd.notna(out["vwap"].iloc[_last]) else None,
+            "vwap_price_ref": float(pd.Series(out["vwap_price"]).iloc[_last])
+                              if pd.notna(pd.Series(out["vwap_price"]).iloc[_last]) else None,
+            "vwap_instrument": out.get("vwap_instrument"),
+            "vwap_basis": out.get("vwap_basis"),
+            "atr14": a_last,
+            "thrust_points": mv,
+            "thrust_atr": (mv / a_last) if (a_last and mv is not None) else None,
+            "thrust_bars": k,
+            "volume": (float(series.iloc[_last]) if series is not None
+                       and pd.notna(series.iloc[_last]) else None),
+            "volume_avg": (float(series.rolling(vw).mean().iloc[_last]) if series is not None
+                           and pd.notna(series.rolling(vw).mean().iloc[_last]) else None),
+            "volume_ratio": (float(out["vol_ratio"].iloc[_last])
+                             if pd.notna(out["vol_ratio"].iloc[_last]) else None),
+            "volume_source": out.get("vol_source_used"),
+            "volume_window": vw,
+        }
+    except Exception:
+        out["tv"] = {}
     return out
 
 
@@ -7578,10 +7696,21 @@ def render_config_controls(ui, prefix="sb"):
                                              step=0.1, prefix=prefix)
         params["zh_thrust_bars"] = cfg_number(c2, "Thrust measured over (bars)", "zh_thrust_bars",
                                               3, 1, 50, is_int=True, prefix=prefix)
+        params["zh_vwap_source"] = cfg_selectbox(
+            ui, "VWAP source", "zh_vwap_source",
+            ["Auto (futures for indices, underlying for stocks)",
+             "Futures contract (price AND volume from futures)",
+             "Underlying candles"],
+            default="Auto (futures for indices, underlying for stocks)", prefix=prefix)
+        ui.caption("VWAP needs price and volume from the SAME instrument. With futures selected, the futures "
+                   "price is compared against the futures VWAP — mixing index prices with futures volume, or "
+                   "comparing an index price to a futures VWAP, is wrong by the basis (tens of points on Nifty), "
+                   "which is often bigger than the signal itself. Auto uses futures for indices only when the "
+                   "index feed has no usable volume of its own.")
         params["zh_vol_source"] = cfg_selectbox(
             ui, "Volume source", "zh_vol_source",
-            ["Underlying candles", "Futures contract (recommended for indices)", "Off (skip the check)"],
-            default="Underlying candles", prefix=prefix)
+            ["Futures contract (recommended for indices)", "Underlying candles", "Off (skip the check)"],
+            default="Futures contract (recommended for indices)", prefix=prefix)
         if str(params["zh_vol_source"]).startswith("Underlying"):
             ui.warning("⚠️ **An index has no volume of its own.** Nobody trades 'one unit of Nifty' — it is a "
                        "calculated number, not an instrument — so whatever your feed reports for ^NSEI is a "
@@ -9011,15 +9140,25 @@ def describe_signal_status(df, strategy, params, filters):
             else:
                 lines.append("   3. Breakout range: not formed yet for this session.")
             if params.get("zh_use_vwap", True) and pd.notna(zh["vwap"].iloc[_i]):
-                _vb = vwap_basis(df)
+                _vinst = zh.get("vwap_instrument", "underlying")
+                _vb = zh.get("vwap_basis", "typical")
+                _vprice = float(pd.Series(zh["vwap_price"]).iloc[_i])
+                _vval = float(zh["vwap"].iloc[_i])
+                _iname = {"futures": "FUTURES", "underlying": "underlying",
+                          "underlying_fallback": "underlying (futures unavailable)"}.get(_vinst, _vinst)
                 _vlabel = ("VWAP (volume-weighted)" if _vb == "volume"
-                           else "Session typical-price average (no volume on this feed)")
-                lines.append(f"   4. {_vlabel} {float(zh['vwap'].iloc[_i]):.2f}: "
+                           else "Session typical-price average (no usable volume)")
+                lines.append(f"   4. {_vlabel} = **{_vval:,.2f}** on {_iname} · compared against "
+                             f"{_iname} price **{_vprice:,.2f}** (difference {_vprice - _vval:+,.2f}): "
                              f"LONG {_mark(zh['vwap_up'].iloc[_i])} · SHORT {_mark(zh['vwap_dn'].iloc[_i])}")
-                if _vb != "volume":
-                    lines.append("        ↳ A cash index has no traded volume of its own, so a true VWAP is not "
-                                 "possible here. This line is the session-anchored average of the typical price "
-                                 "(VWAP with equal weights) — a fair reference, but not the same statistic.")
+                if _vinst == "futures":
+                    lines.append("        ↳ Both the price and the volume come from the futures contract, so this "
+                                 "is a genuine VWAP. To match it on TradingView, chart the NIFTY **futures** "
+                                 "symbol with the session-anchored VWAP — not the spot index.")
+                elif _vb != "volume":
+                    lines.append("        ↳ No usable volume, so this is the session-anchored average of the "
+                                 "typical price (VWAP with equal weights) — a fair reference, but not the same "
+                                 "statistic as a true VWAP.")
             _tv = zh["thrust_val"].iloc[_i]
             if pd.notna(_tv):
                 lines.append(f"   5. Thrust {float(_tv):+.2f}× ATR over {int(params.get('zh_thrust_bars', 3))} bars "
@@ -9116,6 +9255,27 @@ def describe_signal_status(df, strategy, params, filters):
             lines.append("   ➡️ Verdict: " + ("🟢 LONG — buy the CE leg" if _verdict == 1 else
                                               ("🔴 SHORT — buy the PE leg" if _verdict == -1 else
                                                f"⚪ no trade ({_why})")))
+            _tv = zh.get("tv") or {}
+            if _tv:
+                _fmt = lambda v, d=2: ("n/a" if v is None else f"{v:,.{d}f}")
+                lines.append("   📐 **Values to check against TradingView** (last closed bar "
+                             f"{_tv.get('bar_time', '')}):")
+                lines.append(f"        • Close: {_fmt(_tv.get('close'))} · "
+                             f"{_tv.get('vwap_instrument', 'underlying')} VWAP: {_fmt(_tv.get('vwap'))} "
+                             f"(basis: {_tv.get('vwap_basis')})")
+                lines.append(f"        • Opening-range high/low: {_fmt(_tv.get('range_high'))} / "
+                             f"{_fmt(_tv.get('range_low'))}")
+                lines.append(f"        • ATR(14): {_fmt(_tv.get('atr14'))} · thrust over "
+                             f"{_tv.get('thrust_bars')} bars: {_fmt(_tv.get('thrust_points'))} points "
+                             f"= {_fmt(_tv.get('thrust_atr'))}× ATR")
+                lines.append(f"        • Volume: {_fmt(_tv.get('volume'), 0)} vs "
+                             f"{_tv.get('volume_window')}-bar average {_fmt(_tv.get('volume_avg'), 0)} "
+                             f"= {_fmt(_tv.get('volume_ratio'))}× (source: {_tv.get('volume_source')})")
+                lines.append("        _ATR uses Wilder's RMA and VWAP is session-anchored, both matching "
+                             "TradingView's defaults — so these should line up on the same symbol and "
+                             "timeframe. Differences usually mean a different symbol (spot vs futures) or a "
+                             "different session anchor._")
+
             _zsnap = get_zero_hero_snapshot(params)
             _zh_und_lbl = params.get("zh_underlying") or zero_hero_default_underlying()
             if _zsnap:
