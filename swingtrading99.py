@@ -4656,6 +4656,50 @@ def trade_history_fragment():
 ZERO_HERO_STRATEGY = "Zero Hero (Expiry Day OTM Momentum)"
 
 
+def futures_volume_series(uinfo, interval, period, target_index):
+    """
+    Per-bar FUTURES volume aligned to the underlying's candle index.
+
+    Why this exists: an index has no volume of its own (it is a calculation,
+    not a tradable instrument), so an "index volume" figure is whatever the
+    feed chooses to synthesise — often 0, sometimes an aggregate. The futures
+    contract IS traded, so its volume is genuine participation and is the
+    right series to confirm an index breakout with. Returns None when it
+    cannot be built, so the caller can say so rather than silently substitute.
+    """
+    if not uinfo:
+        return None
+    _, token = _dhan_creds()
+    if not str(token or "").strip():
+        return None
+    try:
+        exps = dhan_get_expiries(uinfo["underlying"], uinfo["fut_instrument"], uinfo["exchange"])
+        if not exps:
+            return None
+        info = dhan_lookup_future(uinfo["underlying"], exps[0], uinfo["fut_instrument"], uinfo["exchange"])
+        if not info:
+            return None
+        base = interval if interval in DHAN_INTERVAL_CODE else "5m"
+        fut = _dhan_fetch_candles_cached(info["security_id"], f"{uinfo['exchange']}_FNO",
+                                         uinfo["fut_instrument"], base, period,
+                                         hash(token) % 10_000_019)
+        if fut is None or fut.empty or "Volume" not in fut.columns:
+            return None
+        fut = normalize_index_to_ist(fut, "")
+        s = pd.to_numeric(fut["Volume"], errors="coerce")
+        s.index = _norm_ts(pd.Series(fut.index)).values
+        tgt = pd.DataFrame({"t": _norm_ts(pd.Series(target_index))})
+        right = pd.DataFrame({"t": s.index, "v": s.values}).dropna().sort_values("t")
+        if right.empty:
+            return None
+        merged = pd.merge_asof(tgt.sort_values("t"), right, on="t", direction="nearest",
+                               tolerance=pd.Timedelta(minutes=5))
+        out = pd.Series(merged["v"].values, index=target_index)
+        return out if out.notna().sum() > len(out) * 0.3 else None
+    except Exception:
+        return None
+
+
 def entries_taken_today(strategy=None):
     """
     How many positions were ACTUALLY OPENED today.
@@ -4793,15 +4837,56 @@ def zero_hero_state(df, params):
     out["thrust_dn"] = (move <= -a * thrust_mult).fillna(False)
 
     # 6 ── volume confirmation
+    #
+    # Source matters here. An index has no traded volume of its own, so the
+    # candle feed's "Volume" for ^NSEI is a synthesised figure (often 0). The
+    # futures contract is genuinely traded, so its volume is real
+    # participation. The source is therefore selectable, and which one was
+    # actually used is reported back for the status board.
     vol_n = float(params.get("zh_vol_n", 1.5))
     vw = int(params.get("zh_vol_window", 20))
-    if "Volume" in df.columns and df["Volume"].notna().any() and df["Volume"].sum() > 0:
-        avg = df["Volume"].rolling(vw).mean()
-        out["vol_ratio"] = df["Volume"] / avg.replace(0, np.nan)
+    vol_src = params.get("zh_vol_source", "Underlying candles")
+    series, used = None, "none"
+
+    if str(vol_src).startswith("Off"):
+        used = "disabled"
+    elif str(vol_src).startswith("Futures"):
+        uinfo = resolve_chain_underlying(params.get("zh_kind", "Index"),
+                                         params.get("zh_underlying") or "Nifty50")
+        # Infer the bar size from the data when the caller did not pass it, so
+        # the futures candles are fetched at a matching interval no matter
+        # which code path asked (signal generation, live loop, status board).
+        _iv = params.get("_interval")
+        if not _iv:
+            try:
+                _step = pd.Series(pd.DatetimeIndex(idx)).diff().dt.total_seconds().median()
+                _iv = {60: "1m", 180: "3m", 300: "5m", 900: "15m", 1800: "30m",
+                       3600: "1h"}.get(int(_step or 60), "5m")
+            except Exception:
+                _iv = "5m"
+        series = futures_volume_series(uinfo, _iv, params.get("_period", "5d"), idx)
+        used = "futures" if series is not None else "futures_unavailable"
+
+    if series is None and used in ("none", "futures_unavailable"):
+        if "Volume" in df.columns and df["Volume"].notna().any() and float(df["Volume"].sum()) > 0:
+            series = pd.to_numeric(df["Volume"], errors="coerce")
+            used = "underlying" if used == "none" else "underlying_fallback"
+        else:
+            used = "absent"
+
+    out["vol_source_used"] = used
+    if used == "disabled":
+        out["vol_ratio"] = pd.Series(np.nan, index=idx)
+        out["volume"] = pd.Series(True, index=idx)
+    elif series is not None:
+        avg = series.rolling(vw).mean()
+        out["vol_ratio"] = series / avg.replace(0, np.nan)
         out["volume"] = (out["vol_ratio"] >= vol_n).fillna(False)
     else:
+        # No usable volume anywhere: pass the condition rather than blocking
+        # every trade on data the feed cannot supply, and say so.
         out["vol_ratio"] = pd.Series(np.nan, index=idx)
-        out["volume"] = pd.Series(True, index=idx)   # index feeds often lack volume
+        out["volume"] = pd.Series(True, index=idx)
 
     # 7 ── combine
     long_ok = out["expiry"] & out["window"] & out["break_up"] & out["vwap_up"] & out["thrust_up"] & out["volume"]
@@ -7423,6 +7508,22 @@ def render_config_controls(ui, prefix="sb"):
                                              step=0.1, prefix=prefix)
         params["zh_thrust_bars"] = cfg_number(c2, "Thrust measured over (bars)", "zh_thrust_bars",
                                               3, 1, 50, is_int=True, prefix=prefix)
+        params["zh_vol_source"] = cfg_selectbox(
+            ui, "Volume source", "zh_vol_source",
+            ["Underlying candles", "Futures contract (recommended for indices)", "Off (skip the check)"],
+            default="Underlying candles", prefix=prefix)
+        if str(params["zh_vol_source"]).startswith("Underlying"):
+            ui.warning("⚠️ **An index has no volume of its own.** Nobody trades 'one unit of Nifty' — it is a "
+                       "calculated number, not an instrument — so whatever your feed reports for ^NSEI is a "
+                       "synthesised figure (frequently 0, sometimes an aggregate of constituents). A ratio like "
+                       "'0.33× the 20-bar average' is therefore measuring a feed artefact, not real participation. "
+                       "For a STOCK underlying this setting is fine, because stock volume is genuine.")
+        elif str(params["zh_vol_source"]).startswith("Futures"):
+            ui.success("✅ Futures volume is real traded activity in a real contract, which is the meaningful way "
+                       "to confirm an index breakout. Needs a Dhan token; if the contract cannot be read the "
+                       "status board says so and falls back to the underlying rather than failing silently.")
+        else:
+            ui.caption("Volume confirmation skipped entirely — the other five conditions still apply.")
         c1, c2 = ui.columns(2)
         params["zh_vol_n"] = cfg_number(c1, "Volume ≥ N× average", "zh_vol_n", 1.5, 1.0, 50.0,
                                         step=0.1, prefix=prefix)
@@ -8857,11 +8958,31 @@ def describe_signal_status(df, strategy, params, filters):
             else:
                 lines.append("   5. Thrust: indicators still warming up.")
             _vr = zh["vol_ratio"].iloc[_i]
-            if pd.notna(_vr):
+            _vused = zh.get("vol_source_used", "underlying")
+            _vsrc_label = {
+                "futures": "FUTURES volume (real traded contract)",
+                "underlying": "UNDERLYING candle volume",
+                "underlying_fallback": "UNDERLYING candle volume (futures unavailable, fell back)",
+                "disabled": "disabled",
+                "absent": "unavailable",
+                "futures_unavailable": "futures unavailable",
+            }.get(_vused, _vused)
+            if _vused == "disabled":
+                lines.append("   6. Volume: check turned off — auto-passes.")
+            elif pd.notna(_vr):
                 lines.append(f"   6. Volume {float(_vr):.2f}× the {int(params.get('zh_vol_window', 20))}-bar average "
-                             f"(needs {float(params.get('zh_vol_n', 1.5)):.2f}×): {_mark(zh['volume'].iloc[_i])}")
+                             f"(needs {float(params.get('zh_vol_n', 1.5)):.2f}×): {_mark(zh['volume'].iloc[_i])} "
+                             f"· source: {_vsrc_label}")
+                if _vused.startswith("underlying") and params.get("zh_kind", "Index") == "Index":
+                    lines.append("        ↳ This is the INDEX's reported volume, not CE/PE or futures volume. An "
+                                 "index is a calculation rather than a traded instrument, so this figure is a "
+                                 "feed artefact — switch the Volume source to **Futures** for real participation.")
+                if _vused == "underlying_fallback":
+                    lines.append("        ↳ Futures volume was requested but could not be read (needs a Dhan token "
+                                 "and a resolvable contract), so the underlying was used instead.")
             else:
-                lines.append("   6. Volume: this feed carries no volume for the index — condition auto-passes.")
+                lines.append(f"   6. Volume: no usable series ({_vsrc_label}) — condition auto-passes rather than "
+                             "blocking every trade on data the feed cannot supply.")
             # ---- conditions 7 & 8: these ALSO gate the entry, so they must be
             # ---- displayed or the board can appear to contradict itself
             # ---- (all six green yet "no trade").
@@ -9562,7 +9683,7 @@ def evaluate_live_signal(ticker, interval, period, strategy, params, filters, sl
             # Conditions are read from the last CLOSED bar so nothing repaints,
             # while the fill happens now at LTP.
             try:
-                _zst = zero_hero_state(sig_df.iloc[:-1], params)
+                _zst = zero_hero_state(sig_df.iloc[:-1], {**params, "_interval": interval, "_period": period})
                 last_sig = 1 if bool(_zst["long"].iloc[-1]) else (-1 if bool(_zst["short"].iloc[-1]) else 0)
                 if last_sig != 0 and (params.get("zh_use_oi_change") or params.get("zh_use_pcr")
                                       or params.get("zh_use_chain")):
