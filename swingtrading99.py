@@ -9134,11 +9134,32 @@ def describe_signal_status(df, strategy, params, filters):
             _rh = zh["ref_high"].iloc[_i]
             _rl = zh["ref_low"].iloc[_i]
             if pd.notna(_rh) and pd.notna(_rl):
-                lines.append(f"   3. Breakout of {float(_rh):.2f} / {float(_rl):.2f} (price {c_now:.2f}): "
-                             f"UP {_mark(zh['break_up'].iloc[_i])} (needs {float(_rh) - c_now:+.2f}) · "
-                             f"DOWN {_mark(zh['break_dn'].iloc[_i])} (needs {float(_rl) - c_now:+.2f})")
+                _buf = float(params.get("zh_break_buffer", 0.0))
+                _up_ok = bool(zh["break_up"].iloc[_i])
+                _dn_ok = bool(zh["break_dn"].iloc[_i])
+                # "needs" only makes sense for a condition NOT yet met. Showing
+                # a distance either way made a satisfied break read as though
+                # more movement were still required.
+                _up_txt = (f"cleared by {c_now - (float(_rh) + _buf):.2f}" if _up_ok
+                           else f"needs {(float(_rh) + _buf) - c_now:+.2f} more")
+                _dn_txt = (f"cleared by {(float(_rl) - _buf) - c_now:.2f}" if _dn_ok
+                           else f"needs {c_now - (float(_rl) - _buf):+.2f} more down")
+                lines.append(f"   3. {zh.get('range_label', 'range')} {float(_rl):,.2f} – {float(_rh):,.2f} "
+                             f"(price {c_now:,.2f}): UP {_mark(_up_ok)} ({_up_txt}) · "
+                             f"DOWN {_mark(_dn_ok)} ({_dn_txt})")
+                if str(zh.get("range_label", "")).startswith("opening"):
+                    lines.append(f"        ↳ These are the HIGH and LOW of the first "
+                                 f"{int(params.get('zh_or_minutes', 15))} minutes of TODAY'S session "
+                                 "(from 09:15). They are fixed once that window closes and stay put for the "
+                                 "rest of the day, then reset tomorrow. They are a mechanical reference, not "
+                                 "support/resistance — which is exactly why five other conditions must also hold.")
+                else:
+                    lines.append(f"        ↳ Rolling {int(params.get('zh_range_lookback', 20))}-bar high/low, "
+                                 "recalculated every bar — so unlike an opening range these levels move "
+                                 "continuously through the day.")
             else:
-                lines.append("   3. Breakout range: not formed yet for this session.")
+                lines.append("   3. Breakout range: not formed yet for this session — the opening-range window "
+                             "has not finished, so there is nothing to break out of.")
             if params.get("zh_use_vwap", True) and pd.notna(zh["vwap"].iloc[_i]):
                 _vinst = zh.get("vwap_instrument", "underlying")
                 _vb = zh.get("vwap_basis", "typical")
