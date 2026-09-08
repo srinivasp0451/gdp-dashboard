@@ -6868,6 +6868,46 @@ def tab_patterns(cfg: dict) -> None:
 # =============================================================================
 # SECTION 19c -- SIGNAL LAB  (optimiser + live screener in one pass)
 # =============================================================================
+def _period_for_timeframe(interval: str, requested: str, needed_bars: int) -> str:
+    """
+    Widen a period until the interval can supply `needed_bars`, then clamp.
+
+    Returns the LONGER of what the operator asked for and what the warm-up
+    actually requires, capped by Yahoo's ceiling for that interval.
+    """
+    per_day = APPROX_BARS_PER_DAY.get(interval, 1.0)
+    needed_days = needed_bars / max(per_day, 0.001) * 1.6      # calendar/holiday cushion
+    want_days = max(PERIOD_DAYS.get(requested, 0), needed_days)
+    ceiling = INTERVAL_MAX_DAYS.get(interval)
+    for candidate in PERIODS:
+        days = PERIOD_DAYS[candidate]
+        if days >= want_days and (ceiling is None or days <= ceiling):
+            return candidate
+    # Nothing long enough inside the ceiling: take the longest the interval allows.
+    allowed = [c for c in PERIODS if ceiling is None or PERIOD_DAYS[c] <= ceiling]
+    return allowed[-1] if allowed else requested
+
+
+def _gate_failure_note(table: pd.DataFrame, gates: dict) -> str:
+    """Say which gate blocked everything, and what was actually achievable."""
+    parts = []
+    for col, key in (("Win %", "win"), ("Sharpe", "sharpe"), ("Expectancy", "expectancy"),
+                     ("Profit Factor", "pf"), ("Net PnL", "pnl")):
+        floor = gates.get(key)
+        if not floor or col not in table.columns:
+            continue
+        try:
+            best = float(pd.to_numeric(table[col], errors="coerce").max())
+        except Exception:                                           # noqa: BLE001
+            continue
+        if np.isfinite(best) and best < float(floor):
+            parts.append(f"{col} best {best:.2f} < {float(floor):.2f}")
+    if not parts:
+        return ("no combination met the quality thresholds (the gates fail in combination even "
+                "though each is individually reachable)")
+    return "gates not met -- " + "; ".join(parts)
+
+
 def _meets_thresholds(row, gates: dict) -> bool:
     """Every gate the operator set must hold. An unset gate is not a gate."""
     checks = (("Win %", gates.get("win")), ("Sharpe", gates.get("sharpe")),
@@ -6907,7 +6947,12 @@ def run_signal_lab(tickers: list[str], cfg: dict, objective: str, iterations: in
         if progress is not None:
             progress.progress((i + 1) / max(1, len(jobs)),
                               text=f"Optimising {ticker} · {interval} ...")
-        period, _ = sanitize_period(interval, cfg["period"])
+        # The sidebar period is chosen for the sidebar timeframe. Reusing it across
+        # every timeframe is what produced "Only 22 candles at 1d/1mo": a month is
+        # plenty of 5m bars and almost no daily ones. sanitize_period only clamps
+        # DOWNWARD, so it cannot rescue this on its own -- we widen first, then let
+        # it clamp to whatever the interval can actually serve.
+        period = _period_for_timeframe(interval, cfg["period"], WARMUP_BARS + 40)
         try:
             bundle = load_market_data(ticker, period, interval,
                                       freshness_seconds=300, min_bars=WARMUP_BARS + 40)
@@ -6933,7 +6978,7 @@ def run_signal_lab(tickers: list[str], cfg: dict, objective: str, iterations: in
         qualified = table[table.apply(lambda r: _meets_thresholds(r, gates), axis=1)]
         if qualified.empty:
             errors.append({"Ticker": ticker, "Timeframe": interval,
-                           "Problem": "no combination met the quality thresholds"})
+                           "Problem": _gate_failure_note(table, gates)})
             continue
         best = qualified.iloc[0]
         fcfg = default_filter_config()
@@ -6969,7 +7014,8 @@ def run_signal_lab(tickers: list[str], cfg: dict, objective: str, iterations: in
                                    interval)
 
         rows.append({
-            "Ticker": ticker, "Timeframe": interval, "Signal": side, "When": when, **detail,
+            "Ticker": ticker, "Timeframe": interval, "Period Used": period,
+            "Signal": side, "When": when, **detail,
             "Best Strategy": best["Strategy"],
             "Stop-Loss": best["Stop-Loss"], "SL Value": best["SL Value"],
             "Target": best["Target"], "TP Value": best["TP Value"],
@@ -7035,7 +7081,15 @@ def tab_signal_lab(cfg: dict) -> None:
     if use_mtf:
         timeframes = st.multiselect(
             "Timeframes to search", INTERVALS, default=[cfg["interval"]], key="lab_tfs",
-            help="Periods are clamped automatically to what each interval can serve.")
+            help="Each timeframe gets its own history window, widened as needed to satisfy the "
+                 "200-candle warm-up and then clamped to what Yahoo serves for that interval.")
+        if timeframes:
+            spans = ", ".join(
+                f"`{tf}` -> {_period_for_timeframe(tf, cfg['period'], WARMUP_BARS + 40)}"
+                for tf in timeframes)
+            st.caption(f"History window per timeframe: {spans}. Your sidebar period "
+                       f"(`{cfg['period']}`) is a floor, not a cap — a month is thousands of 5m "
+                       f"candles but only about 22 daily ones, which is far below the warm-up.")
     else:
         timeframes = [cfg["interval"]]
         st.caption(f"Searching the sidebar timeframe only (`{cfg['interval']}`).")
@@ -7603,6 +7657,38 @@ def _test_universe_resolution():
     print("   universe resolution: live NSE, flagged fallback, loud failure  OK")
 
 
+def _test_timeframe_period_scaling():
+    """
+    Regression guard for the multi-timeframe search.
+
+    The sidebar period was reused for every timeframe, so a 1-month window gave
+    ~22 daily candles against a 240-candle requirement and every non-intraday
+    timeframe failed with "Only N candles available". The period must be treated
+    as a floor and widened per timeframe, then clamped to the interval ceiling.
+    """
+    need = WARMUP_BARS + 40
+    for tf in ("5m", "15m", "60m", "4h", "1d", "1wk", "1mo"):
+        chosen = _period_for_timeframe(tf, "1mo", need)
+        supplied = PERIOD_DAYS[chosen] * APPROX_BARS_PER_DAY[tf]
+        assert supplied >= need, f"{tf}: {chosen} supplies only {supplied:.0f} of {need} candles"
+        ceiling = INTERVAL_MAX_DAYS.get(tf)
+        if ceiling is not None:
+            assert PERIOD_DAYS[chosen] <= ceiling, f"{tf}: {chosen} exceeds Yahoo's ceiling"
+
+    # The requested period is a floor: never shrink below what was asked for.
+    assert PERIOD_DAYS[_period_for_timeframe("1d", "5y", need)] >= PERIOD_DAYS["5y"]
+    # 1m tops out at 7 days, so it must return the longest allowed rather than loop forever.
+    assert PERIOD_DAYS[_period_for_timeframe("1m", "1y", need)] <= INTERVAL_MAX_DAYS["1m"]
+
+    table = pd.DataFrame({"Win %": [55.0, 61.0], "Sharpe": [0.4, 1.1],
+                          "Expectancy": [2.0, 3.0], "Profit Factor": [1.2, 1.4],
+                          "Net PnL": [10.0, 20.0]})
+    note = _gate_failure_note(table, {"win": 90.0, "sharpe": 5.0})
+    assert "Win % best 61.00 < 90.00" in note and "Sharpe best 1.10 < 5.00" in note, note
+    assert _gate_failure_note(table, {"win": 50.0}), "a reachable gate still needs a message"
+    print("   per-timeframe history windows and gate diagnostics  OK")
+
+
 def _test_signal_detail():
     """
     The enriched signal columns must reconcile with each other exactly.
@@ -7863,6 +7949,7 @@ def run_selftest() -> int:
         _test_signal_detail()
         _test_live_entry_and_gates()
         _test_universe_resolution()
+        _test_timeframe_period_scaling()
         print("-- filters --")
         _test_filters()
         _test_new_filters()
