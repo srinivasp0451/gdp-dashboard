@@ -4614,34 +4614,69 @@ def live_position_fragment(ticker, label="LTP"):
             st.warning(f"Fetch issue (rate limit or symbol): {exc}")
 
     positions = st.session_state.get("live_positions", [])
-    if positions and ltp is not None:
+    if positions:
         pos = positions[0]
-        direction = pos["direction"]
-        points = (ltp - pos["entry_price"]) * direction
-        pnl = points * pos["remaining_qty"]
+        is_opt = pos.get("trade_instrument") == "OPTION"
 
-        st.markdown("###### 💰 Live Position P&L")
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Entry Type", "LONG" if direction == 1 else "SHORT")
-        c2.metric("Entry Price", f"{pos['entry_price']:.2f}")
-        c3.metric("LTP", f"{ltp:,.2f}")
+        # An option position must be marked against the OPTION's own premium.
+        # `ltp` above is the index/underlying price; using it here compared a
+        # 23,700 index tick against a ₹57.80 premium entry and reported a
+        # +23,649 "profit" that never existed.
+        if is_opt:
+            mark = option_premium_now(config, pos.get("opt_security_id"),
+                                      pos.get("opt_leg"), pos.get("opt_strike"))
+            mark_label = f"{pos.get('opt_leg', 'Option')} Premium (LTP)"
+            unit = "₹"
+        else:
+            mark = ltp
+            mark_label = "LTP"
+            unit = ""
 
-        c4, c5 = st.columns(2)
-        c4.metric(f"SL ({pos['sl_type']})", f"{pos['sl']:.2f}")
-        c5.metric(f"Target ({pos['target_type']})", f"{pos['target']:.2f}")
+        if mark is None:
+            st.caption("Position is open but couldn't fetch a live price this cycle — PnL will resume once the "
+                       "next tick comes in."
+                       + ("  (Waiting on the option premium; the index price is not used as a substitute.)"
+                          if is_opt else ""))
+        else:
+            mark = float(mark)
+            # Track extremes on the SAME series that prices the position.
+            pos["highest"] = max(float(pos.get("highest", mark)), mark)
+            pos["lowest"] = min(float(pos.get("lowest", mark)), mark)
+            pos["current_price"] = mark
 
-        # st.metric's delta is auto-colored green/red by sign — that IS the
-        # green/red live PnL indicator, no manual color logic needed.
-        c6, c7 = st.columns(2)
-        c6.metric("Live Points", f"{points:+.2f}", f"{points:+.2f}")
-        c7.metric("Live PnL", f"{pnl:+.2f}", f"{pnl:+.2f}")
+            direction = position_pl_direction(pos)
+            points = (mark - pos["entry_price"]) * direction
+            pnl = points * pos["remaining_qty"]
 
-        c8, c9, c10 = st.columns(3)
-        c8.metric("Highest since entry", f"{pos['highest']:.2f}")
-        c9.metric("Lowest since entry", f"{pos['lowest']:.2f}")
-        c10.metric("Qty remaining", f"{pos['remaining_qty']}/{pos['original_qty']}")
-    elif positions and ltp is None:
-        st.caption("Position is open but couldn't fetch a live price this cycle — PnL will resume once the next tick comes in.")
+            st.markdown("###### 💰 Live Position P&L")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Entry Type", position_direction_label(pos))
+            c2.metric("Entry Price", f"{unit}{pos['entry_price']:,.2f}")
+            c3.metric(mark_label, f"{unit}{mark:,.2f}")
+
+            c4, c5 = st.columns(2)
+            _sl_lbl = "SL (premium)" if is_opt else f"SL ({pos['sl_type']})"
+            _tg_lbl = "Target (premium)" if is_opt else f"Target ({pos['target_type']})"
+            c4.metric(_sl_lbl, f"{unit}{pos['sl']:,.2f}")
+            c5.metric(_tg_lbl, f"{unit}{pos['target']:,.2f}")
+
+            # st.metric's delta is auto-colored green/red by sign — that IS the
+            # green/red live PnL indicator, no manual color logic needed.
+            c6, c7 = st.columns(2)
+            c6.metric("Live Points", f"{points:+,.2f}", f"{points:+,.2f}")
+            c7.metric("Live PnL", f"{pnl:+,.2f}", f"{pnl:+,.2f}")
+
+            c8, c9, c10 = st.columns(3)
+            c8.metric("Highest since entry", f"{unit}{float(pos['highest']):,.2f}")
+            c9.metric("Lowest since entry", f"{unit}{float(pos['lowest']):,.2f}")
+            c10.metric("Qty remaining", f"{pos['remaining_qty']}/{pos['original_qty']}")
+
+            if is_opt:
+                st.caption(f"📊 Marked against the {pos.get('opt_leg', 'option')} premium — the instrument actually "
+                           f"bought. The underlying is {ltp:,.2f} and is shown for context only; it is NOT used "
+                           "for this position's P&L."
+                           + (f"  Underlying at entry was {pos['underlying_entry']:,.2f}."
+                              if pos.get("underlying_entry") else ""))
 
     return ltp
 
@@ -7086,10 +7121,15 @@ def check_profitable_hold_exit(gates, pos, ltp, now=None):
         if now_cmp.tzinfo is not None:
             now_cmp = now_cmp.tz_convert("Asia/Kolkata").tz_localize(None)
         held_min = (now_cmp - entry_cmp).total_seconds() / 60.0
-        points_now = (ltp - pos["entry_price"]) * pos["direction"]
+        # An option position is priced on its premium, so "in profit" must be
+        # judged against the premium too — the caller passes the index tick,
+        # which would otherwise make every option position look hugely
+        # profitable and trigger this gate immediately.
+        mark = float(pos.get("current_price") or ltp) if pos.get("trade_instrument") == "OPTION" else float(ltp)
+        points_now = (mark - pos["entry_price"]) * position_pl_direction(pos)
         if held_min >= max_min and points_now > 0:
-            return True, float(ltp), (f"Max Profitable Hold Duration ({held_min:.1f}m ≥ {max_min:.0f}m, "
-                                      f"in profit {points_now:+.2f} pts)")
+            return True, mark, (f"Max Profitable Hold Duration ({held_min:.1f}m ≥ {max_min:.0f}m, "
+                                f"in profit {points_now:+.2f} pts)")
     except Exception:
         pass
     return False, None, None
