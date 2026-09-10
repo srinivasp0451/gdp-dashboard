@@ -120,9 +120,9 @@ APPROX_BARS_PER_DAY = {
     "30m": 13, "60m": 7, "4h": 2, "1d": 1, "1wk": 0.2, "1mo": 0.045,
 }
 
-PERIODS = ["1d", "5d", "7d", "1mo", "3mo", "6mo", "1y", "2y", "3y",
+PERIODS = ["1d", "5d", "7d", "1mo", "60d", "3mo", "6mo", "1y", "2y", "3y",
            "5y", "10y", "15y", "20y", "30y", "max"]
-PERIOD_DAYS = {"1d": 1, "5d": 5, "7d": 7, "1mo": 30, "3mo": 91, "6mo": 182,
+PERIOD_DAYS = {"1d": 1, "5d": 5, "7d": 7, "1mo": 30, "60d": 60, "3mo": 91, "6mo": 182,
                "1y": 365, "2y": 730, "3y": 1095, "5y": 1825, "10y": 3650,
                "15y": 5475, "20y": 7300, "30y": 10950, "max": 36500}
 INTERVAL_MAX_DAYS = {"1m": 7, "2m": 60, "3m": 7, "5m": 60, "10m": 60,
@@ -4411,6 +4411,7 @@ def render_sidebar() -> dict:
             email_cfg["port"] = st.number_input("SMTP port (SSL)", 1, 65535, 465,
                                                 key="cfg_email_port")
 
+    st.session_state["groq_cfg"] = render_groq_sidebar(sb)
     filter_cfg, filter_extras = _render_filters(sb, live)
     broker = _render_broker(sb, live, symbol)
 
@@ -4922,6 +4923,14 @@ def _render_backtest(result: BacktestResult, meta: dict) -> None:
         st.dataframe(gaps.tail(200), width="stretch")
     with t4:
         st.dataframe(result.frame.tail(300), width="stretch")
+
+    render_analyst_panel(
+        "backtest", "this backtest",
+        f"Strategy: {meta['strategy']} on {meta['symbol']} {meta['interval']}\n"
+        f"Risk: {meta['risk'].as_summary()}\n"
+        f"Stats: {json.dumps(result.stats, default=str)}\n"
+        f"Warnings: {result.warnings}\n"
+        f"Trades sample:\n{_frame_context(result.trades)}")
 
 
 # =============================================================================
@@ -5819,6 +5828,9 @@ def tab_screener(cfg: dict) -> None:
                   "Everything else in your configuration is left untouched.")
         st.download_button("Download results (CSV)", results.to_csv(index=False).encode(),
                            f"screener_{pd.Timestamp.now():%Y%m%d_%H%M}.csv", "text/csv")
+        render_analyst_panel("screener", "these screener hits",
+                             f"Strategy: {cfg['strategy']} at {cfg['interval']}\n"
+                             f"{_frame_context(results[order])}")
 
     if not errors.empty:
         with st.expander(f"Tickers that could not be scanned ({len(errors)})"):
@@ -6508,6 +6520,7 @@ def tab_ledger(cfg: dict) -> None:
         if st.button("Confirm and clear", type="primary"):
             st.session_state.live_trades = []
             st.rerun()
+    render_analyst_panel("ledger", "this live trade ledger", _frame_context(frame[order]))
     _open_position_note()
 
 
@@ -6518,6 +6531,239 @@ def _open_position_note() -> None:
     st.warning(f"A {'LONG' if position.direction > 0 else 'SHORT'} position on "
                f"`{position.symbol}` is still open and therefore not in this ledger. It is "
                "journalled the moment it closes.")
+
+
+# =============================================================================
+# SECTION 20 -- GROQ ANALYST PANEL
+# =============================================================================
+# Model names on hosted APIs get retired without notice, so nothing is hardcoded:
+# the list is fetched from the key's own /models endpoint and only what that key
+# can actually reach is offered. A dropdown built from a stale constant is how
+# you end up staring at "model_not_found".
+
+GROQ_BASE = "https://api.groq.com/openai/v1"
+
+
+def groq_models(api_key: str) -> tuple[list[str], str | None]:
+    """Fetch the chat models this key can use. Returns ``(models, error)``."""
+    key = (api_key or "").strip()
+    if not key:
+        return [], "No API key supplied."
+    import requests
+    try:
+        resp = requests.get(f"{GROQ_BASE}/models",
+                            headers={"Authorization": f"Bearer {key}"}, timeout=20)
+        body = resp.json()
+    except Exception as exc:                                        # noqa: BLE001
+        return [], f"Could not reach Groq: {exc}"
+    if resp.status_code >= 400:
+        return [], f"Groq rejected the key (HTTP {resp.status_code}): {str(body)[:160]}"
+
+    models = []
+    for entry in body.get("data", []) or []:
+        name = str(entry.get("id", "")).strip()
+        if not name:
+            continue
+        # Whisper and TTS endpoints share the list but cannot answer a chat turn.
+        if any(tag in name.lower() for tag in ("whisper", "tts", "guard", "embed")):
+            continue
+        models.append(name)
+    if not models:
+        return [], "The key is valid but exposes no chat models."
+    return sorted(models), None
+
+
+def groq_chat(api_key: str, model: str, messages: list[dict], temperature: float = 0.2) -> str:
+    import requests
+    resp = requests.post(
+        f"{GROQ_BASE}/chat/completions",
+        headers={"Authorization": f"Bearer {(api_key or '').strip()}",
+                 "Content-Type": "application/json"},
+        data=json.dumps({"model": model, "messages": messages, "temperature": temperature,
+                         "max_tokens": 1200}), timeout=90)
+    try:
+        body = resp.json()
+    except Exception:                                               # noqa: BLE001
+        body = {"raw": resp.text[:400]}
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Groq error (HTTP {resp.status_code}): {str(body)[:300]}")
+    return body["choices"][0]["message"]["content"]
+
+
+_ANALYST_SYSTEM = (
+    "You are a quantitative trading analyst reviewing output from a backtesting and screening "
+    "application. Be concise and concrete, and reason from the numbers you are given.\n"
+    "Hold to these standards:\n"
+    "- Distinguish sample size from evidence. Under about 30 trades, say so plainly.\n"
+    "- Results that come from searching many combinations are shortlists, not findings. Point "
+    "out selection bias when it applies.\n"
+    "- A high win rate with a poor profit factor means small wins funding large losses. Say it.\n"
+    "- If a result is marked as an optimistic backtest (distance-trailing stops), treat its "
+    "numbers as an upper bound.\n"
+    "- Never tell the user to buy or sell anything. Describe what the data supports and what it "
+    "does not, and name the checks that would settle the question.\n"
+    "- If the data given is insufficient to answer, say that rather than guessing."
+)
+
+
+def _frame_context(frame, max_rows: int = 30, max_chars: int = 6000) -> str:
+    if frame is None or getattr(frame, "empty", True):
+        return "(no rows)"
+    try:
+        text = frame.head(max_rows).to_csv(index=False)
+    except Exception:                                               # noqa: BLE001
+        return "(unreadable)"
+    return text[:max_chars]
+
+
+def render_analyst_panel(panel_key: str, context_label: str, context_text: str) -> None:
+    """
+    A chat panel scoped to one tab's results.
+
+    The tab's own output is sent as context, so the model comments on what is on
+    screen rather than on trading in the abstract.
+    """
+    cfg = st.session_state.get("groq_cfg") or {}
+    api_key, model = cfg.get("key", ""), cfg.get("model", "")
+    with st.expander(f"Ask the analyst about {context_label}", expanded=False):
+        if not api_key:
+            st.info("Add a Groq API key in the sidebar to enable this. It is used only for these "
+                    "questions and is not stored anywhere by the app.")
+            return
+        if not model:
+            st.warning("No Groq model selected. Open the sidebar and pick one from the list "
+                       "fetched for your key.")
+            return
+
+        history_key = f"chat_{panel_key}"
+        history = st.session_state.setdefault(history_key, [])
+        for turn in history:
+            with st.chat_message(turn["role"]):
+                st.markdown(turn["content"])
+
+        c1, c2 = st.columns([4, 1])
+        question = c1.text_input("Question", key=f"{panel_key}_q",
+                                 placeholder=f"e.g. which of these {context_label} is weakest, "
+                                             "and why?")
+        if c2.button("Clear", key=f"{panel_key}_clear"):
+            st.session_state[history_key] = []
+            st.rerun()
+
+        if st.button("Ask", key=f"{panel_key}_ask", type="primary") and question.strip():
+            messages = [{"role": "system", "content": _ANALYST_SYSTEM},
+                        {"role": "user",
+                         "content": f"Here is the current {context_label} from the app.\n\n"
+                                    f"```\n{context_text}\n```\n\nQuestion: {question.strip()}"}]
+            for turn in history[-6:]:
+                messages.insert(-1, turn)
+            try:
+                with st.spinner("Thinking ..."):
+                    answer = groq_chat(api_key, model, messages)
+            except Exception as exc:                                # noqa: BLE001
+                st.error(str(exc))
+                return
+            history.append({"role": "user", "content": question.strip()})
+            history.append({"role": "assistant", "content": answer})
+            st.session_state[history_key] = history[-12:]
+            st.rerun()
+
+
+def render_groq_sidebar(sb) -> dict:
+    """Key entry and model discovery. Models come from the key, never a constant."""
+    cfg = {"key": "", "model": ""}
+    with sb.expander("Groq analyst (optional)"):
+        enabled = st.checkbox("Enable the Groq analyst", value=False, key="groq_on",
+                              help="Adds a chat panel to each results tab that can comment on "
+                                   "what the tab is showing.")
+        if not enabled:
+            return cfg
+        cfg["key"] = st.text_input("Groq API key", type="password", key="groq_key")
+        if not cfg["key"]:
+            st.caption("Get a key from console.groq.com. Nothing is sent until you ask a "
+                       "question.")
+            return cfg
+        if st.button("Fetch available models", key="groq_fetch"):
+            models, err = groq_models(cfg["key"])
+            st.session_state["groq_model_list"] = models
+            st.session_state["groq_model_error"] = err
+        models = st.session_state.get("groq_model_list") or []
+        err = st.session_state.get("groq_model_error")
+        if err:
+            st.error(err)
+        if models:
+            cfg["model"] = st.selectbox("Model", models, key="groq_model")
+            st.caption(f"{len(models)} chat model(s) available to this key. The list comes from "
+                       "Groq itself, so a retired model cannot be selected.")
+        else:
+            st.caption("Press **Fetch available models** to load the list for your key.")
+    return cfg
+
+
+def render_search_grid(prefix: str, cfg: dict, safe_only: bool):
+    """
+    Optional wide search. Off by default, because the default grid already tries
+    enough combinations to overfit a noisy sample; widening it makes the winner
+    more impressive and less trustworthy at the same time.
+
+    Returns ``(grid, exhaustive, note)`` or ``(None, False, None)`` when disabled.
+    """
+    wide = st.checkbox(
+        "Configure the search grid myself (wide / greedy search)", value=False,
+        key=f"{prefix}_wide",
+        help="Off: a fixed shortlist of sensible stops, targets and filters is sampled at "
+             "random. On: you choose every axis, including your own stop and target values.")
+    if not wide:
+        return None, False, None
+
+    st.caption("Every axis you widen multiplies the number of backtests. The estimate below "
+               "updates as you choose.")
+    default_strategies = [n for n in STRATEGY_NAMES if not n.startswith(_OPTIMISER_EXCLUDE)]
+    strategies = st.multiselect("Strategies to search", default_strategies,
+                                default=default_strategies[:12], key=f"{prefix}_g_strat")
+
+    c1, c2 = st.columns(2)
+    sl_choices = [t for t in SL_TYPES
+                  if not (safe_only and t in DISTANCE_TRAIL_TYPES) and t != "No Stop-Loss"]
+    sl_types = c1.multiselect("Stop-loss types", sl_choices,
+                              default=[t for t in ("Fixed Percentage", "Fixed Points",
+                                                   "ATR Multiple") if t in sl_choices],
+                              key=f"{prefix}_g_slt")
+    sl_text = c1.text_input("Stop-loss values (comma separated)", "0.5, 1, 1.5, 2",
+                            key=f"{prefix}_g_slv",
+                            help="Interpreted per type: percent, points, or ATR multiple.")
+    tp_types = c2.multiselect("Target types", [t for t in TP_TYPES if t != "No Target"],
+                              default=["Fixed Percentage", "Risk : Reward Multiple"],
+                              key=f"{prefix}_g_tpt")
+    tp_text = c2.text_input("Target values (comma separated)", "1, 1.5, 2, 3",
+                            key=f"{prefix}_g_tpv")
+
+    filters = st.multiselect("Entry filters to try (none is always included)",
+                             [spec["key"] for spec in FILTER_SPECS],
+                             default=["adx", "rsi", "ema20", "supertrend"],
+                             format_func=lambda k: FILTER_LABELS.get(k, k),
+                             key=f"{prefix}_g_filt")
+
+    grid = build_search_grid(strategies, sl_types, parse_number_list(sl_text, [1.0]),
+                             tp_types, parse_number_list(tp_text, [2.0]), filters, safe_only)
+    size = grid_size(grid)
+    exhaustive = st.checkbox(
+        f"Walk the whole grid ({size:,} combinations) instead of sampling it", value=False,
+        key=f"{prefix}_g_exh",
+        help="Exhaustive is reproducible but slow. Sampling covers the same space more cheaply "
+             "and, given the overfitting risk, rarely finds a worse winner.")
+    if not grid["sl"]:
+        st.error("Every stop-loss type you picked is a distance trail, and *Only search "
+                 "backtest-safe exits* excludes those. Add a fixed, ATR or structural stop, or "
+                 "untick the safe-exits box and accept that the results are optimistic.")
+    if not grid["tp"]:
+        st.error("No target types selected, so there is nothing to search.")
+    note = (f"{len(grid['strategies'])} strategies x {len(grid['sl'])} stops x "
+            f"{len(grid['tp'])} targets x {len(grid['filters'])} filters = **{size:,}** "
+            f"combinations per ticker.")
+    if size > 4000 and exhaustive:
+        st.warning(f"{size:,} exhaustive backtests per ticker will take a long time. Leave the "
+                   "box unticked to sample instead.")
+    return grid, exhaustive, note
 
 
 def tab_optimiser(cfg: dict) -> None:
@@ -6543,15 +6789,26 @@ def tab_optimiser(cfg: dict) -> None:
                             help="Excludes distance-based trailing stops, whose backtested "
                                  "results are systematically optimistic.")
 
+    grid, exhaustive, grid_note = render_search_grid("opt", cfg, safe_only)
+    if grid_note:
+        st.info(grid_note)
+
+    period = _period_for_timeframe(cfg["interval"], cfg["period"], WARMUP_BARS + 80)
+    if period != cfg["period"]:
+        st.caption(f"History widened from `{cfg['period']}` to `{period}` so that "
+                   f"`{cfg['interval']}` can supply the 200-candle warm-up plus enough bars to "
+                   f"produce trades.")
+
     if st.button("Run Optimiser", type="primary", width="stretch"):
         st.session_state.optimizer_results = None
         bar = st.progress(0.0, text="Loading data ...")
         try:
-            bundle = load_market_data(cfg["symbol"], cfg["period"], cfg["interval"], 300.0,
+            bundle = load_market_data(cfg["symbol"], period, cfg["interval"], 300.0,
                                       min_bars=WARMUP_BARS + 60)
             results = optimise(bundle.frame, cfg["params"], cfg["quantity"], cfg["costs"],
                                objective, int(min_trades), int(iterations),
-                               safe_exits_only=safe_only, progress=bar)
+                               safe_exits_only=safe_only, progress=bar,
+                               grid=grid, exhaustive=exhaustive)
             st.session_state.optimizer_results = (results, objective, float(target))
         except Exception as exc:                                    # noqa: BLE001
             st.error(f"Optimiser failed: {exc}")
@@ -6815,6 +7072,7 @@ def tab_patterns(cfg: dict) -> None:
 
     st.download_button("Download hits as CSV", rows[display_cols].to_csv(index=False).encode(),
                        f"patterns_{pd.Timestamp.now():%Y%m%d_%H%M}.csv", "text/csv")
+    render_analyst_panel("patterns", "these pattern hits", _frame_context(rows[display_cols]))
 
     action, row_idx = None, None
     for col in ("Chart", "Levels", "Sidebar"):
@@ -6868,6 +7126,35 @@ def tab_patterns(cfg: dict) -> None:
 # =============================================================================
 # SECTION 19c -- SIGNAL LAB  (optimiser + live screener in one pass)
 # =============================================================================
+# The history window each timeframe deserves. A month of daily candles is 22
+# bars; a month of 5m candles is thousands. These are the operator's chosen
+# windows, still subject to what Yahoo will actually serve.
+LAB_TIMEFRAME_PERIODS = {
+    "1m": "7d", "2m": "60d", "3m": "7d", "5m": "60d", "10m": "60d", "15m": "60d",
+    "30m": "60d", "60m": "3y", "4h": "3y", "1d": "10y", "1wk": "20y", "1mo": "max",
+}
+
+
+def lab_period_for(interval: str, needed_bars: int = WARMUP_BARS + 40) -> tuple[str, str | None]:
+    """
+    Resolve the history window for a timeframe in the lab.
+
+    Returns ``(period, note)``. Yahoo caps intraday history hard -- 60m tops out
+    around 730 days -- so an ask for 3 years of hourly candles gets clamped, and
+    the note says so instead of the request silently shrinking.
+    """
+    wanted = LAB_TIMEFRAME_PERIODS.get(interval, "1y")
+    effective, clamp = sanitize_period(interval, wanted)
+    floor = _period_for_timeframe(interval, effective, needed_bars)
+    if PERIOD_DAYS.get(floor, 0) > PERIOD_DAYS.get(effective, 0):
+        effective = floor
+    note = None
+    if clamp:
+        note = (f"`{interval}`: asked for {wanted}, Yahoo serves at most "
+                f"{INTERVAL_MAX_DAYS.get(interval)} days, so {effective} is used.")
+    return effective, note
+
+
 def _period_for_timeframe(interval: str, requested: str, needed_bars: int) -> str:
     """
     Widen a period until the interval can supply `needed_bars`, then clamp.
@@ -6928,7 +7215,8 @@ def _meets_thresholds(row, gates: dict) -> bool:
 def run_signal_lab(tickers: list[str], cfg: dict, objective: str, iterations: int,
                    min_trades: int, signal_window: int, safe_only: bool,
                    timeframes: list[str] | None = None, gates: dict | None = None,
-                   progress=None) -> tuple[pd.DataFrame, pd.DataFrame]:
+                   progress=None, grid: dict | None = None,
+                   exhaustive: bool = False) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     For each ticker: search for the best configuration on its own history, then
     ask whether that winning configuration is signalling right now.
@@ -6943,16 +7231,24 @@ def run_signal_lab(tickers: list[str], cfg: dict, objective: str, iterations: in
     gates = gates or {}
     timeframes = timeframes or [cfg["interval"]]
     jobs = [(t, tf) for t in tickers for tf in timeframes]
+    lab_started = time.time()
     for i, (ticker, interval) in enumerate(jobs):
         if progress is not None:
-            progress.progress((i + 1) / max(1, len(jobs)),
-                              text=f"Optimising {ticker} · {interval} ...")
+            done = (i + 1) / max(1, len(jobs))
+            elapsed = time.time() - lab_started
+            eta = (elapsed / max(done, 1e-6)) - elapsed
+            progress.progress(done,
+                              text=f"{i + 1} of {len(jobs)} ({done*100:.0f}%) — {ticker} · "
+                                   f"{interval} — about {eta:0.0f}s left")
         # The sidebar period is chosen for the sidebar timeframe. Reusing it across
         # every timeframe is what produced "Only 22 candles at 1d/1mo": a month is
         # plenty of 5m bars and almost no daily ones. sanitize_period only clamps
         # DOWNWARD, so it cannot rescue this on its own -- we widen first, then let
         # it clamp to whatever the interval can actually serve.
-        period = _period_for_timeframe(interval, cfg["period"], WARMUP_BARS + 40)
+        if cfg.get("use_lab_windows", True) and len(timeframes) > 1:
+            period, _ = lab_period_for(interval, WARMUP_BARS + 40)
+        else:
+            period = _period_for_timeframe(interval, cfg["period"], WARMUP_BARS + 40)
         try:
             bundle = load_market_data(ticker, period, interval,
                                       freshness_seconds=300, min_bars=WARMUP_BARS + 40)
@@ -6965,7 +7261,8 @@ def run_signal_lab(tickers: list[str], cfg: dict, objective: str, iterations: in
         params["intraday"] = interval in INTRADAY_INTERVALS
         try:
             table = optimise(bundle.frame, params, cfg["quantity"], costs, objective,
-                             min_trades, iterations, seed=11, safe_exits_only=safe_only)
+                             min_trades, iterations, seed=11, safe_exits_only=safe_only,
+                             grid=grid, exhaustive=exhaustive)
         except Exception as exc:                                    # noqa: BLE001
             errors.append({"Ticker": ticker, "Timeframe": interval,
                            "Problem": f"optimiser: {str(exc)[:120]}"})
@@ -7028,6 +7325,37 @@ def run_signal_lab(tickers: list[str], cfg: dict, objective: str, iterations: in
     return pd.DataFrame(rows), pd.DataFrame(errors)
 
 
+def _quality_score(row) -> float:
+    """
+    One number to sort a shortlist by, blending the things that matter together.
+
+    Deliberately crude and deliberately harsh on small samples: a 90% win rate
+    over 8 trades should not outrank a 55% win rate over 200. It is a sorting
+    aid for a shortlist, not a measure of edge -- every input still came from a
+    search that kept its own best result.
+    """
+    def num(col, default=0.0):
+        try:
+            v = float(row.get(col, default))
+            return v if np.isfinite(v) else default
+        except (TypeError, ValueError):
+            return default
+
+    trades = num("Trades")
+    if trades <= 0:
+        return 0.0
+    # Confidence grows with sample size and saturates: 30 trades is worth ~0.5.
+    confidence = trades / (trades + 30.0)
+    pf = min(num("Profit Factor", 0.0), 5.0)          # cap so "inf" cannot dominate
+    sharpe = max(min(num("Sharpe"), 5.0), -5.0)
+    expectancy = num("Expectancy")
+    win = num("Win %") / 100.0
+    raw = (0.35 * min(pf / 3.0, 1.0) + 0.25 * min(max(sharpe, 0) / 2.0, 1.0)
+           + 0.20 * win + 0.20 * (1.0 if expectancy > 0 else 0.0))
+    penalty = 0.75 if str(row.get("Reliability", "")).lower().startswith("optim") else 1.0
+    return round(raw * confidence * penalty * 100.0, 1)
+
+
 def tab_signal_lab(cfg: dict) -> None:
     st.subheader("Signal Lab — optimise, then screen")
     st.error("**Two compounding ways to fool yourself, in one tab.** Searching many "
@@ -7084,20 +7412,31 @@ def tab_signal_lab(cfg: dict) -> None:
             help="Each timeframe gets its own history window, widened as needed to satisfy the "
                  "200-candle warm-up and then clamped to what Yahoo serves for that interval.")
         if timeframes:
-            spans = ", ".join(
-                f"`{tf}` -> {_period_for_timeframe(tf, cfg['period'], WARMUP_BARS + 40)}"
-                for tf in timeframes)
-            st.caption(f"History window per timeframe: {spans}. Your sidebar period "
-                       f"(`{cfg['period']}`) is a floor, not a cap — a month is thousands of 5m "
-                       f"candles but only about 22 daily ones, which is far below the warm-up.")
+            spans, notes = [], []
+            for tf in timeframes:
+                per, note = lab_period_for(tf, WARMUP_BARS + 40)
+                spans.append(f"`{tf}` -> {per}")
+                if note:
+                    notes.append(note)
+            st.caption("History window per timeframe: " + ", ".join(spans) +
+                       ". A month is thousands of 5m candles but only about 22 daily ones, so "
+                       "each timeframe gets its own window rather than reusing the sidebar "
+                       "period.")
+            for note in notes:
+                st.warning(note)
     else:
         timeframes = [cfg["interval"]]
         st.caption(f"Searching the sidebar timeframe only (`{cfg['interval']}`).")
+    grid, exhaustive, grid_note = None, False, None
     safe_only = st.checkbox("Backtest-safe exits only (exclude distance trails)", value=True,
                             key="lab_safe",
                             help="Distance trails cannot be simulated faithfully on OHLC bars, "
                                  "so including them lets an optimiser pick a configuration whose "
                                  "backtest is systematically optimistic.")
+
+    grid, exhaustive, grid_note = render_search_grid("lab", cfg, safe_only)
+    if grid_note:
+        st.info(grid_note)
 
     tickers = tickers[:int(max_names)]
     timeframes = timeframes or [cfg["interval"]]
@@ -7114,7 +7453,7 @@ def tab_signal_lab(cfg: dict) -> None:
         try:
             results, errors = run_signal_lab(tickers, cfg, objective, int(iterations),
                                              int(min_trades), int(signal_window), safe_only,
-                                             timeframes, gates, bar)
+                                             timeframes, gates, bar, grid, exhaustive)
             st.session_state.lab_results = (results, errors)
         except Exception as exc:                                    # noqa: BLE001
             st.session_state.lab_results = None
@@ -7133,16 +7472,23 @@ def tab_signal_lab(cfg: dict) -> None:
             st.dataframe(errors, width="stretch", hide_index=True)
         return
 
+    results = results.copy()
+    results["Quality"] = results.apply(_quality_score, axis=1)
     signalling = results[results["Signal"] != "-"]
     a, b, c = st.columns(3)
     a.metric("Ticker/timeframe pairs", len(results))
+    st.caption("**Quality** blends profit factor, Sharpe, win rate and positive expectancy, "
+               "scaled by sample size and cut by 25% for optimistic backtests. It is a sorting "
+               "aid for a shortlist, not a measure of edge — every row still came from a search "
+               "that kept its own best result.")
     b.metric("Signalling now", len(signalling))
     c.metric("Backtest-safe configs", int((results["Reliability"] == "Backtest-safe").sum()))
 
     show_only = st.checkbox("Show only tickers that are signalling", value=True, key="lab_filter")
     table = signalling if show_only else results
-    table = table.sort_values(["Signal", "Score"], ascending=[True, False]).reset_index(drop=True)
-    front = [c for c in ["Ticker", "Timeframe", "Signal", "When", "Bars Ago", "Signal Time",
+    table = table.sort_values(["Quality", "Score"], ascending=[False, False]).reset_index(drop=True)
+    front = [c for c in ["Ticker", "Timeframe", "Quality", "Signal", "When", "Bars Ago",
+                         "Signal Time",
                          "Price at Signal", "Fill Price (next open)", "Price Now",
                          "Move in Favour", "R Multiple Now", "Best Strategy", "Stop-Loss",
                          "SL Value", "Target", "TP Value", "Filter", "Trades", "Win %",
@@ -7171,6 +7517,10 @@ def tab_signal_lab(cfg: dict) -> None:
                f"filter {row['Filter']} | {row['Trades']} trades | {row['Reliability']}")
     st.download_button("Download lab results (CSV)", results.to_csv(index=False).encode(),
                        "signal_lab.csv", "text/csv")
+    render_analyst_panel("lab", "these Signal Lab results",
+                         f"Objective: {objective}. Timeframes: {timeframes}. "
+                         f"Combinations per ticker: {iterations}.\n"
+                         f"{_frame_context(table)}")
     if not errors.empty:
         with st.expander(f"Tickers that could not be processed ({len(errors)})"):
             st.dataframe(errors, width="stretch", hide_index=True)
@@ -7689,6 +8039,40 @@ def _test_timeframe_period_scaling():
     print("   per-timeframe history windows and gate diagnostics  OK")
 
 
+def _test_search_grid_and_quality():
+    """Custom grids expand correctly, and the quality score respects sample size."""
+    grid = build_search_grid(
+        ["01 \u00b7 Dual EMA Crossover", "08 \u00b7 RSI Centerline 50 Crossing"],
+        ["Fixed Percentage", "Previous Swing Low/High"], [0.5, 1.0],
+        ["Risk : Reward Multiple"], [1.5, 2.0], ["adx"], True)
+    # A structural stop takes its level from the chart, so it must NOT be multiplied
+    # across the typed values -- that would inflate the grid with identical runs.
+    assert grid["sl"] == [("Fixed Percentage", 0.5), ("Fixed Percentage", 1.0),
+                          ("Previous Swing Low/High", 0.0)], grid["sl"]
+    assert grid["filters"] == [None, "adx"], "'no filter' must always be searched"
+    assert grid_size(grid) == 2 * 3 * 2 * 2
+
+    safe = build_search_grid(["01 \u00b7 Dual EMA Crossover"], ["Trailing Points"], [10.0],
+                             ["Fixed Points"], [20.0], [], True)
+    assert all(t not in DISTANCE_TRAIL_TYPES for t, _ in safe["sl"]), \
+        "safe mode must drop distance trails"
+
+    assert parse_number_list("0.5, 1 ; 1.5, junk, 1", [9.0]) == [0.5, 1.0, 1.5]
+    assert parse_number_list("", [2.0]) == [2.0], "empty input must fall back"
+
+    base = {"Trades": 200, "Profit Factor": 2.0, "Sharpe": 1.5, "Expectancy": 5.0,
+            "Win %": 55.0, "Reliability": "Backtest-safe"}
+    tiny = dict(base, Trades=8, **{"Profit Factor": 5.0, "Sharpe": 4.0, "Win %": 90.0})
+    assert _quality_score(base) > _quality_score(tiny), \
+        "a spectacular 8-trade sample must not outrank a solid 200-trade one"
+    assert _quality_score(dict(base, Reliability="Optimistic")) < _quality_score(base), \
+        "optimistic backtests must be marked down"
+    assert _quality_score(dict(base, Trades=0)) == 0.0
+    assert _quality_score(dict(base, **{"Profit Factor": float("inf")})) <= 100.0, \
+        "an infinite profit factor must not blow up the score"
+    print("   custom search grids and the composite quality score  OK")
+
+
 def _test_signal_detail():
     """
     The enriched signal columns must reconcile with each other exactly.
@@ -7950,6 +8334,7 @@ def run_selftest() -> int:
         _test_live_entry_and_gates()
         _test_universe_resolution()
         _test_timeframe_period_scaling()
+        _test_search_grid_and_quality()
         print("-- filters --")
         _test_filters()
         _test_new_filters()
@@ -8168,9 +8553,73 @@ def _objective_value(stats: dict, objective: str) -> float:
             else stats["profit_factor"]}.get(objective, 0.0)
 
 
+def parse_number_list(text: str, fallback: list[float]) -> list[float]:
+    """Parse '0.5, 1, 1.5' into floats, keeping order and dropping duplicates."""
+    out: list[float] = []
+    for chunk in str(text or "").replace(";", ",").split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        try:
+            value = float(chunk)
+        except ValueError:
+            continue
+        if value not in out:
+            out.append(value)
+    return out or list(fallback)
+
+
+def build_search_grid(strategies: list[str], sl_types: list[str], sl_values: list[float],
+                      tp_types: list[str], tp_values: list[float],
+                      filters: list[str], safe_exits_only: bool) -> dict:
+    """
+    Expand the operator's choices into the axes the search walks.
+
+    Structural exits take their level from the chart, so they are paired with a
+    single dummy magnitude rather than multiplied across every value the user
+    typed -- otherwise the grid inflates with combinations that are identical.
+    """
+    def pairs(types: list[str], values: list[float], no_value: set) -> list[tuple[str, float]]:
+        out = []
+        for t in types:
+            if t in no_value:
+                out.append((t, 0.0))
+            else:
+                out.extend((t, v) for v in values)
+        return out
+
+    def strip_unsafe(pairs_in):
+        return [x for x in pairs_in if x[0] not in DISTANCE_TRAIL_TYPES] \
+            if safe_exits_only else list(pairs_in)
+
+    sl = strip_unsafe(pairs(sl_types, sl_values, _SL_NO_VALUE))
+    tp = pairs(tp_types, tp_values, _TP_NO_VALUE)
+    # The fallback must obey safe mode too. Substituting the default grid
+    # unfiltered would quietly hand back the distance trails that safe mode was
+    # asked to exclude. If the operator's own choice empties out, leave it empty
+    # so the caller can say so rather than searching something else.
+    if not sl and not sl_types:
+        sl = strip_unsafe(_OPT_SL_GRID)
+    if not tp and not tp_types:
+        tp = list(_OPT_TP_GRID)
+    return {
+        "strategies": strategies or [n for n in STRATEGY_NAMES
+                                     if not n.startswith(_OPTIMISER_EXCLUDE)],
+        "sl": sl,
+        "tp": tp,
+        "filters": ([None] + [f for f in filters if f]) if filters else list(_OPT_FILTERS),
+    }
+
+
+def grid_size(grid: dict) -> int:
+    return (len(grid["strategies"]) * max(1, len(grid["sl"])) * max(1, len(grid["tp"]))
+            * max(1, len(grid["filters"])))
+
+
 def optimise(df: pd.DataFrame, base_params: dict, quantity: float, costs: CostModel,
              objective: str, min_trades: int, iterations: int, seed: int = 11,
-             safe_exits_only: bool = True, progress=None) -> pd.DataFrame:
+             safe_exits_only: bool = True, progress=None,
+             grid: dict | None = None, exhaustive: bool = False) -> pd.DataFrame:
     """
     Randomised search over strategy x stop x target x one optional filter.
 
@@ -8180,18 +8629,43 @@ def optimise(df: pd.DataFrame, base_params: dict, quantity: float, costs: CostMo
     ranking as a shortlist to validate out of sample, never as a result.
     """
     rng = np.random.default_rng(seed)
-    names = [n for n in STRATEGY_NAMES if not n.startswith(_OPTIMISER_EXCLUDE)]
-    sl_grid = [x for x in _OPT_SL_GRID
-               if not (safe_exits_only and x[0] in DISTANCE_TRAIL_TYPES)]
-    rows, seen = [], set()
+    if grid is None:
+        grid = {"strategies": [n for n in STRATEGY_NAMES
+                               if not n.startswith(_OPTIMISER_EXCLUDE)],
+                "sl": [x for x in _OPT_SL_GRID
+                       if not (safe_exits_only and x[0] in DISTANCE_TRAIL_TYPES)],
+                "tp": list(_OPT_TP_GRID), "filters": list(_OPT_FILTERS)}
+    names, sl_grid = grid["strategies"], grid["sl"]
+    tp_grid, filters = grid["tp"], grid["filters"]
+    if not (names and sl_grid and tp_grid and filters):
+        return pd.DataFrame()
 
-    for it in range(int(iterations)):
+    if exhaustive:
+        combos = [(a, b, c, d) for a in names for b in sl_grid for c in tp_grid for d in filters]
+        rng.shuffle(combos)                       # shuffled so a cap still samples the space
+        combos = combos[:int(iterations)] if iterations else combos
+    else:
+        combos = None
+
+    rows, seen = [], set()
+    total = len(combos) if combos is not None else int(iterations)
+    started = time.time()
+
+    for it in range(total):
         if progress is not None and it % 5 == 0:
-            progress.progress(min(1.0, (it + 1) / iterations), text=f"Tested {it} combinations ...")
-        strategy = names[int(rng.integers(len(names)))]
-        sl_type, sl_val = sl_grid[int(rng.integers(len(sl_grid)))]
-        tp_type, tp_val = _OPT_TP_GRID[int(rng.integers(len(_OPT_TP_GRID)))]
-        filt = _OPT_FILTERS[int(rng.integers(len(_OPT_FILTERS)))]
+            done = (it + 1) / max(1, total)
+            elapsed = time.time() - started
+            eta = (elapsed / max(done, 1e-6)) - elapsed
+            progress.progress(min(1.0, done),
+                              text=f"Tested {it} of {total} combinations "
+                                   f"({done*100:.0f}%) - about {eta:0.0f}s left")
+        if combos is not None:
+            strategy, (sl_type, sl_val), (tp_type, tp_val), filt = combos[it]
+        else:
+            strategy = names[int(rng.integers(len(names)))]
+            sl_type, sl_val = sl_grid[int(rng.integers(len(sl_grid)))]
+            tp_type, tp_val = tp_grid[int(rng.integers(len(tp_grid)))]
+            filt = filters[int(rng.integers(len(filters)))]
         key = (strategy, sl_type, sl_val, tp_type, tp_val, filt)
         if key in seen:
             continue
