@@ -3180,6 +3180,8 @@ class Position:
     broker_order_id: str | None = None
     entry_ltp_at_fill: float | None = None
     entry_bar: dict | None = None          # OHLC of the candle the fill happened on
+    high_since_entry: float | None = None  # highest price seen while the trade was open
+    low_since_entry: float | None = None
     option_leg: str | None = None          # "CE" / "PE" when routed as an option
 
     @property
@@ -3659,6 +3661,7 @@ _STATE_DEFAULTS = {
     "ltp_note": None, "screener_results": None, "screener_error": None,
     "last_seen_ltp": None, "last_ltp_change_ts": 0.0, "pending_ticker": None,
     "last_closed_bar": None, "option_metrics": None, "live_last_signal_time": None,
+    "live_first_cycle": False,
     "optimizer_results": None, "pattern_results": None, "pending_combo": None,
     "pattern_rows": None, "pattern_frames": None, "pattern_hits": None,
     "pattern_errors": None, "lab_results": None,
@@ -3938,17 +3941,37 @@ def _maybe_route_broker(cfg: dict, position: Position, closing: bool) -> None:
         log_event(f"Broker order FAILED: {exc}", "error")
 
 
-def _open_live_position(cfg: dict, direction: int, price: float, ctx: BarCtx, bar_time) -> Position:
-    mgr = ExitManager(cfg["risk"], float(price), direction, ctx)
+def _open_live_position(cfg: dict, direction: int, price: float, ctx: BarCtx, bar_time,
+                        levels_from: float | None = None) -> Position:
+    """
+    Open a tracked position.
+
+    ``levels_from`` anchors the stop and target on a DIFFERENT price from the
+    fill. That is what "join the trade with whatever is left" means: the levels
+    stay where the original signal put them, while PnL is measured from the
+    price you actually got.
+    """
+    anchor = float(levels_from) if levels_from is not None else float(price)
+    mgr = ExitManager(cfg["risk"], anchor, direction, ctx)
+    if levels_from is not None:
+        mgr.entry = float(price)
+        mgr.mfe = float(price)
+        mgr.risk_points = abs(float(price) - mgr.sl) if mgr.sl is not None else None
     position = Position(strategy=cfg["strategy"], symbol=cfg["symbol"], interval=cfg["interval"],
                         direction=direction, quantity=cfg["risk"].quantity,
                         entry_price=float(price), entry_time=pd.Timestamp.now(),
                         signal_bar_time=bar_time, manager=mgr,
                         entry_ltp_at_fill=cfg.get("_ltp_at_fill"),
                         entry_bar=_bar_dict(ctx),
+                        high_since_entry=float(price), low_since_entry=float(price),
                         option_leg=("CE" if direction > 0 else "PE")
                         if (cfg.get("broker") or {}).get("instrument") == "OPTIONS" else None)
     st.session_state.live_position = position
+    if levels_from is not None:
+        remaining = None if mgr.tp is None else abs(mgr.tp - float(price))
+        log_event(f"Joined an existing signal: levels kept from the original entry "
+                  f"{fmt(anchor)}, filled at {fmt(price)}. Remaining to target: "
+                  f"{fmt(remaining)}; risk now {fmt(mgr.risk_points)}.", "warn")
     _maybe_route_broker(cfg, position, closing=False)
     db_save_position(position, cfg)
     err = send_email(cfg, f"ENTRY {'LONG' if direction > 0 else 'SHORT'} {cfg['symbol']} "
@@ -4046,6 +4069,10 @@ def run_cycle(cfg: dict) -> None:
                 return
             mgr.bars_held += 1
         mgr.update(snapshot.ltp, closed_ctx)         # trail on the running price
+        # True extremes of the trade, which differ from the manager's favourable
+        # excursion: for a short the LOW is the good news and the HIGH is the pain.
+        position.high_since_entry = max(position.high_since_entry or snapshot.ltp, snapshot.ltp)
+        position.low_since_entry = min(position.low_since_entry or snapshot.ltp, snapshot.ltp)
         if new_bar:
             db_save_position(position, cfg)          # persist the ratcheted stop
         st.session_state.live_last_bar = snapshot.last_closed_time
@@ -4070,6 +4097,37 @@ def run_cycle(cfg: dict) -> None:
     direction = int(snapshot.last_closed_signal)
     signal_time = snapshot.last_closed_time
     catch_up = False
+
+    first_cycle = bool(st.session_state.get("live_first_cycle"))
+    st.session_state.live_first_cycle = False
+    join_window = int(cfg.get("join_window", 20) or 20)
+
+    if direction == 0 and first_cycle and cfg.get("enter_on_start", True) \
+            and snapshot.recent_signal != 0 and snapshot.recent_signal_bars_ago is not None \
+            and 0 < snapshot.recent_signal_bars_ago <= join_window:
+        # You pressed Start because the screener showed a signal. Take it, but on
+        # the original signal's terms: the stop and target stay where they were,
+        # so you are joining with whatever reward is left rather than getting a
+        # fresh full-width target from a price that has already moved.
+        frame_idx = snapshot.frame.index
+        pos_i = int(frame_idx.get_loc(snapshot.recent_signal_time))
+        original_fill = (float(snapshot.frame["Open"].iloc[pos_i + 1])
+                         if pos_i + 1 < len(frame_idx) else snapshot.ltp)
+        d = int(snapshot.recent_signal)
+        probe = ExitManager(cfg["risk"], original_fill, d, closed_ctx)
+        already_done = probe.check_tick(snapshot.ltp)
+        if already_done:
+            log_event(f"A {'LONG' if d > 0 else 'SHORT'} signal fired "
+                      f"{snapshot.recent_signal_bars_ago} candle(s) ago, but price has already "
+                      f"reached its {already_done[1].lower()} at {fmt(snapshot.ltp)}. Not "
+                      f"entering — there is nothing left of that trade.", "warn")
+            st.session_state.live_last_signal_time = snapshot.recent_signal_time
+            return
+        st.session_state.live_last_signal_time = snapshot.recent_signal_time
+        cfg["_ltp_at_fill"] = snapshot.ltp
+        _open_live_position(cfg, d, snapshot.ltp, closed_ctx, snapshot.recent_signal_time,
+                            levels_from=original_fill)
+        return
 
     if direction == 0:
         # Catch-up: the screener reports a signal from a window of candles, and
@@ -4131,7 +4189,7 @@ def _label(col: str) -> str:
 
 
 def price_chart(df, title, overlays=("ema_fast", "ema_slow"), trades=None, tail=None,
-                hide_weekends=True, height=620):
+                hide_weekends=True, height=620, light=False, ema_lengths=None):
     """
     The single chart used by both tabs: candles plus overlay lines.
 
@@ -4148,13 +4206,20 @@ def price_chart(df, title, overlays=("ema_fast", "ema_slow"), trades=None, tail=
         increasing_line_color=_UP, decreasing_line_color=_DOWN,
         increasing_fillcolor=_UP, decreasing_fillcolor=_DOWN))
 
+    # Name the EMAs by their actual length -- "EMA 9" tells you more than
+    # "Fast EMA" when the lengths are configurable.
+    ema_names = {"ema_fast": f"EMA {int((ema_lengths or {}).get('fast', 0))}",
+                 "ema_slow": f"EMA {int((ema_lengths or {}).get('slow', 0))}"} \
+        if ema_lengths else {}
+    line_colours = {"ema_fast": "#f4a261", "ema_slow": "#4f9df7"}
+
     for i, col in enumerate(dict.fromkeys(("ema_fast", "ema_slow", *overlays))):
         if col not in data.columns or data[col].notna().sum() == 0:
             continue
-        colour = _OVERLAY_COLOURS[i % len(_OVERLAY_COLOURS)]
+        colour = line_colours.get(col, _OVERLAY_COLOURS[i % len(_OVERLAY_COLOURS)])
         last = data[col].dropna()
         value = float(last.iloc[-1]) if len(last) else None
-        name = _label(col) + (f"  {fmt(value)}" if value is not None else "")
+        name = ema_names.get(col, _label(col)) + (f"  {fmt(value)}" if value is not None else "")
         fig.add_trace(go.Scatter(x=data.index, y=data[col], mode="lines", name=name,
                                  line=dict(width=1.6, color=colour)))
         if value is not None:
@@ -4186,9 +4251,14 @@ def price_chart(df, title, overlays=("ema_fast", "ema_slow"), trades=None, tail=
                           "<br>PnL %{customdata[1]:,.2f}<extra></extra>"))
 
     fig.update_layout(title=dict(text=title, x=0.01, xanchor="left", font=dict(size=15)),
-                      height=height, margin=dict(l=10, r=90, t=46, b=10), hovermode="x unified",
+                      height=height, margin=dict(l=10, r=90, t=46, b=10), hovermode="x",
                       legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                      xaxis_rangeslider_visible=False, dragmode="pan")
+                      xaxis_rangeslider_visible=False, dragmode="pan",
+                      template="plotly_white" if light else None)
+    if light:
+        fig.update_xaxes(showgrid=False, showspikes=True, spikemode="across",
+                         spikedash="dot", spikethickness=1, spikecolor="#9aa0a6")
+        fig.update_yaxes(showgrid=True, gridcolor="rgba(0,0,0,0.06)", side="left")
     if hide_weekends:
         fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
     return fig
@@ -4332,6 +4402,16 @@ def render_sidebar() -> dict:
                    "requests a minute. Quotes are small, but Yahoo still throttles: if you start "
                    "seeing backoff messages, ease this up. The heavy candle download runs on its "
                    "own slower cadence below and is unaffected.")
+    enter_on_start = sb.checkbox(
+        "Enter immediately on start if a signal already fired", value=True, disabled=live,
+        key="cfg_enter_start",
+        help="You pressed Start because the screener showed a signal. This takes it on the "
+             "first poll, keeping the ORIGINAL stop and target — so you join with whatever "
+             "reward is left rather than getting a fresh full-width target from a price that "
+             "has already moved. If price has already hit those levels, nothing is entered.")
+    join_window = sb.number_input(
+        "How many candles old a signal may be to join", 1, 100, 20, 1, disabled=live,
+        key="cfg_join_window") if enter_on_start else 20
     entry_lookback = sb.number_input(
         "Live: act on a signal up to N candles old", min_value=0, max_value=20, value=0, step=1,
         disabled=live, key="cfg_entry_look",
@@ -4522,13 +4602,14 @@ def render_sidebar() -> dict:
             "flip_entries": bool(flip),
             "allow_stale_entries": bool(allow_stale),
             "entry_lookback": int(entry_lookback),
+            "enter_on_start": bool(enter_on_start), "join_window": int(join_window),
             "square_off_on_stop": bool(square_off_on_stop),
             "candle_seconds": float(candle_seconds), "costs": costs,
             "walk_forward": bool(walk_fwd), "wf_folds": int(wf_folds),
             "use_dhan_data": bool(use_dhan_data), "email": email_cfg,
             "filter_cfg": filter_cfg, "filter_extras": filter_extras, "broker": broker,
             "currency": currency_symbol(symbol),
-            "hide_weekends": not (symbol.endswith("-USD") or symbol.endswith("=X"))}
+            "hide_weekends": not trades_around_the_clock(symbol)}
 
 
 def _render_filters(sb, live: bool):
@@ -4970,6 +5051,7 @@ def _live_controls(cfg: dict) -> None:
         st.session_state.live_running = True
         st.session_state.live_started_at = pd.Timestamp.now()
         st.session_state.live_last_poll = 0.0
+        st.session_state.live_first_cycle = True
         log_event(f"Core started :: {cfg['symbol']} | {cfg['interval']} | {cfg['strategy']} | "
                   f"{cfg['risk'].as_summary()} | poll {fmt(cfg['poll_seconds'],1)}s", "success")
         st.rerun(scope="app")
@@ -5046,8 +5128,10 @@ def _live_body() -> None:
     for w in snapshot.data_warnings:
         st.warning(w)
 
+    _metric_style()
     _feed_banner(cfg, snapshot)
     _heartbeat(cfg, snapshot)
+    _market_data_panel(cfg, snapshot)
     position = st.session_state.live_position
     if position is not None:
         _position_dashboard(position, snapshot, cfg["currency"])
@@ -5087,6 +5171,60 @@ def _mount_live_fragment(poll_seconds: float) -> None:
         frag = st.fragment(run_every=tick)(_live_body)
         _LIVE_FRAGMENTS[tick] = frag
     frag()
+
+
+def ema_angle_degrees(frame: pd.DataFrame) -> float | None:
+    """
+    Convergence angle of the EMA pair, normalised by ATR.
+
+    A raw gradient is in price units per bar, so its "angle" changes with the
+    instrument and with how far you zoom. Dividing by ATR makes the number mean
+    the same thing on Nifty and on Bitcoin.
+    """
+    if not {"ema_fast", "ema_slow", "atr"} <= set(frame.columns) or len(frame) < 3:
+        return None
+    spread = frame["ema_fast"] - frame["ema_slow"]
+    a = float(frame["atr"].iloc[-1])
+    if not np.isfinite(a) or a <= 0:
+        return None
+    rate = float(spread.iloc[-1] - spread.iloc[-2]) / a
+    if not np.isfinite(rate):
+        return None
+    return float(abs(np.degrees(np.arctan(rate))))
+
+
+def _metric_style() -> None:
+    """Large, light metric values, matching the dashboard layout."""
+    st.markdown("""
+        <style>
+        div[data-testid="stMetricValue"] { font-size: 2.0rem; font-weight: 300;
+                                           line-height: 1.15; }
+        div[data-testid="stMetricLabel"] p { font-size: 0.80rem; font-weight: 400;
+                                             opacity: 0.65; }
+        div[data-testid="stMetricDelta"] { font-size: 0.85rem; }
+        </style>""", unsafe_allow_html=True)
+
+
+def _market_data_panel(cfg: dict, snapshot: LiveSnapshot) -> None:
+    """The market half of the dashboard: price and where the EMAs stand."""
+    frame = snapshot.frame
+    fast = safe_last(frame["ema_fast"]) if "ema_fast" in frame else None
+    slow = safe_last(frame["ema_slow"]) if "ema_slow" in frame else None
+    angle = ema_angle_degrees(frame)
+    cur = cfg["currency"]
+
+    st.markdown("#### \U0001F4C8 Current Market Data")
+    c = st.columns(5)
+    c[0].metric("Current Price", f"{cur}{fmt(snapshot.ltp)}")
+    c[1].metric("Fast EMA", f"{cur}{fmt(fast)}")
+    c[2].metric("Slow EMA", f"{cur}{fmt(slow)}")
+    c[3].metric("EMA Angle", "--" if angle is None else f"{angle:.2f}\u00b0")
+    if fast is None or slow is None:
+        c[4].metric("Crossover", "--")
+    elif fast > slow:
+        c[4].metric("Crossover", "Bullish \u2191", f"+{fmt(fast - slow)}")
+    else:
+        c[4].metric("Crossover", "Bearish \u2193", f"-{fmt(slow - fast)}")
 
 
 def _feed_banner(cfg: dict, snapshot: LiveSnapshot) -> None:
@@ -5161,33 +5299,37 @@ def _position_dashboard(position: Position, snapshot, currency: str) -> None:
     points, pnl = position.points(ltp), position.pnl(ltp)
     side = "LONG" if position.direction > 0 else "SHORT"
 
-    st.markdown("#### Open Strategy Performance")
+    st.markdown("#### \U0001F4CA Current Position")
+    r1 = st.columns(5)
+    r1[0].metric("Type", side, position.strategy.split("\u00b7 ")[-1].strip())
+    r1[1].metric("Entry Price", f"{currency}{fmt(position.entry_price)}")
+    r1[2].metric("Current Price", f"{currency}{fmt(ltp)}")
+    r1[3].metric("Stop Loss", f"{currency}{fmt(mgr.sl)}" if mgr.sl is not None else "none",
+                 None if mgr.initial_sl is None else f"from {fmt(mgr.initial_sl)}")
+    tgt_label = "Target (display)" if mgr.tp_display_only else "Target"
+    r1[4].metric(tgt_label, f"{currency}{fmt(mgr.tp)}" if mgr.tp is not None else "none")
+
+    r2 = st.columns(5)
+    r2[0].metric("Quantity", fmt(position.quantity, 0))
+    r2[1].metric("Locked Ticker", position.symbol, position.interval)
+    r2[2].metric("Current P&L", f"{currency}{fmt_signed(pnl)}", f"{fmt_signed(points)} pts")
+    r2[3].metric("Highest Price",
+                 f"{currency}{fmt(position.high_since_entry or ltp)}")
+    r2[4].metric("Lowest Price",
+                 f"{currency}{fmt(position.low_since_entry or ltp)}")
+
+    r3 = st.columns(5)
+    locked = None if mgr.sl is None else (mgr.sl - position.entry_price) * position.direction
+    r3[0].metric("Locked In by Stop", fmt_signed(locked) if locked is not None else "--",
+                 help="Points the stop now guarantees; positive once the trail clears cost.")
+    r3[1].metric("Entry Risk", fmt(mgr.risk_points) if mgr.risk_points else "--")
+    r3[2].metric("R Multiple", fmt(points / mgr.risk_points) if mgr.risk_points else "--")
+    r3[3].metric("Bars Held", f"{mgr.bars_held}")
+    r3[4].metric("Best Price", fmt(mgr.mfe),
+                 help="Best price in the trade's favour; drives the trailing stop.")
+
     (st.success if pnl >= 0 else st.error)(
         f"{side} {position.symbol} :: running {fmt_signed(pnl)} {currency}")
-
-    r1 = st.columns(4)
-    r1[0].metric("Strategy", position.strategy.split("· ")[-1],
-                 help=position.strategy)
-    r1[1].metric("Entry Price", fmt(position.entry_price), side)
-    r1[2].metric("LTP", fmt(ltp))
-    r1[3].metric("Qty", fmt(position.quantity, 0))
-
-    r2 = st.columns(4)
-    tgt_label = "Target (display)" if mgr.tp_display_only else "Target"
-    r2[0].metric(tgt_label, fmt(mgr.tp) if mgr.tp is not None else "none")
-    r2[1].metric("Stop-Loss", fmt(mgr.sl) if mgr.sl is not None else "none",
-                 f"initial {fmt(mgr.initial_sl)}" if mgr.initial_sl is not None else None)
-    r2[2].metric("Points +/-", fmt_signed(points))
-    r2[3].metric(f"Live PnL ({currency})", fmt_signed(pnl))
-
-    r3 = st.columns(4)
-    r3[0].metric("Best Price", fmt(mgr.mfe), help="Best price seen since entry (drives trails).")
-    locked = None if mgr.sl is None else (mgr.sl - position.entry_price) * position.direction
-    r3[1].metric("Locked In", fmt_signed(locked) if locked is not None else "--",
-                 help="Points the stop now guarantees, positive once the trail passes cost.")
-    r3[2].metric("Entry Risk", fmt(mgr.risk_points) if mgr.risk_points else "--")
-    r3[3].metric("Bars", f"{mgr.bars_held}")
-
     for note in mgr.notes:
         st.warning("Exit engine: " + note)
     st.caption(f"Entered {fmt_time(position.entry_time)} off the signal candle "
@@ -5250,21 +5392,38 @@ def _searching_widget(cfg: dict, snapshot: LiveSnapshot) -> None:
 
 def _live_chart(cfg: dict, snapshot: LiveSnapshot) -> None:
     strat = get_strategy(cfg["strategy"])
+    params = cfg.get("params") or {}
     st.markdown("#### Live Chart")
-    fig = price_chart(snapshot.frame, f"{cfg['symbol']} | {cfg['interval']} | last 100 candles",
-                      strat.overlays, tail=120,
-                      hide_weekends=cfg.get("hide_weekends", True), height=520)
+    fig = price_chart(
+        snapshot.frame, f"{cfg['symbol']} | {cfg['interval']} | last 120 candles",
+        strat.overlays, tail=120, hide_weekends=cfg.get("hide_weekends", True), height=520,
+        light=True,
+        ema_lengths={"fast": _p(params, "ema_fast"), "slow": _p(params, "ema_slow")})
+
     position = st.session_state.live_position
     if position is not None:
         mgr = position.manager
-        fig.add_hline(y=position.entry_price, line=dict(width=1.2, dash="dash", color="#4f9df7"),
-                      annotation_text="Entry")
+        # Target above, entry in the middle, stop below: dotted for the levels
+        # price has to travel to, dashed for where the position was opened.
         if mgr.tp is not None:
-            fig.add_hline(y=mgr.tp, line=dict(width=1.2, dash="dot", color="#26a69a"),
-                          annotation_text="Target" + (" (display)" if mgr.tp_display_only else ""))
+            fig.add_hline(y=mgr.tp, line=dict(width=1.4, dash="dot", color="#06b6d4"),
+                          annotation_text="Target" + (" (display)" if mgr.tp_display_only else ""),
+                          annotation_position="right",
+                          annotation_font=dict(size=10, color="#06b6d4"))
+        fig.add_hline(y=position.entry_price, line=dict(width=1.4, dash="dash", color="#26a69a"),
+                      annotation_text="Entry", annotation_position="right",
+                      annotation_font=dict(size=10, color="#26a69a"))
         if mgr.sl is not None:
-            fig.add_hline(y=mgr.sl, line=dict(width=1.2, dash="dot", color="#ef5350"),
-                          annotation_text="Stop")
+            fig.add_hline(y=mgr.sl, line=dict(width=1.4, dash="dot", color="#ef5350"),
+                          annotation_text="Stop", annotation_position="right",
+                          annotation_font=dict(size=10, color="#ef5350"))
+        try:                       # vertical marker at the candle we entered on
+            entry_x = pd.Timestamp(position.signal_bar_time)
+            if entry_x >= pd.Timestamp(snapshot.frame.index[-120 if len(snapshot.frame) > 120
+                                                            else 0]):
+                fig.add_vline(x=entry_x, line=dict(width=1, dash="dash", color="#9aa0a6"))
+        except Exception:                                           # noqa: BLE001
+            pass
     st.plotly_chart(fig, width="stretch", config={"scrollZoom": True})
 
 
@@ -5454,8 +5613,53 @@ SCREENER_UNIVERSES = [
     "Nifty Bank", "Nifty IT", "Nifty Auto", "Nifty Pharma", "Nifty FMCG", "Nifty Metal",
     "Nifty Energy", "Nifty Realty", "Nifty Financial Services",
     "All NSE equities (Dhan master)",
-    "Broad indices", "Sector indices", "Custom list (paste or upload)",
+    "Broad indices", "Sector indices",
+    "Crypto (major)", "US large caps", "Forex majors", "Commodities", "Global indices",
+    "Custom list (paste or upload)",
 ]
+
+# Non-Indian universes. These are curated lists rather than index memberships:
+# crypto pairs, FX crosses and futures roots barely change, so a static list is
+# honest here in a way a NIFTY 500 snapshot is not. The US list is a sample of
+# large caps, NOT the S&P 500 -- that membership drifts and is not fetched.
+CRYPTO_MAJOR = [
+    "BTC-USD", "ETH-USD", "BNB-USD", "SOL-USD", "XRP-USD", "ADA-USD", "DOGE-USD",
+    "AVAX-USD", "DOT-USD", "MATIC-USD", "LINK-USD", "LTC-USD", "TRX-USD", "BCH-USD",
+    "ATOM-USD", "UNI-USD", "XLM-USD", "ETC-USD", "FIL-USD", "NEAR-USD",
+]
+US_LARGE_CAPS = [
+    "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA", "BRK-B", "AVGO", "JPM",
+    "V", "MA", "UNH", "XOM", "JNJ", "WMT", "PG", "COST", "HD", "ORCL",
+    "LLY", "MRK", "ABBV", "PEP", "KO", "BAC", "CRM", "AMD", "NFLX", "ADBE",
+    "CSCO", "MCD", "INTC", "QCOM", "TXN", "DIS", "VZ", "IBM", "CAT", "GE",
+]
+FOREX_MAJORS = [
+    "EURUSD=X", "GBPUSD=X", "USDJPY=X", "USDCHF=X", "AUDUSD=X", "USDCAD=X",
+    "NZDUSD=X", "USDINR=X", "EURINR=X", "GBPINR=X", "EURGBP=X", "EURJPY=X",
+]
+COMMODITY_FUTURES = [
+    "GC=F", "SI=F", "CL=F", "NG=F", "HG=F", "PL=F", "PA=F", "BZ=F",
+    "ZC=F", "ZW=F", "ZS=F", "KC=F", "SB=F", "CT=F",
+]
+GLOBAL_INDICES = [
+    "^GSPC", "^DJI", "^IXIC", "^RUT", "^VIX", "^FTSE", "^GDAXI", "^FCHI",
+    "^N225", "^HSI", "^STOXX50E", "^AXJO", "^BSESN", "^NSEI",
+]
+
+STATIC_UNIVERSES = {
+    "Crypto (major)": (CRYPTO_MAJOR, "Yahoo crypto pairs, quoted in USD and traded 24/7 — "
+                                     "weekend gaps do not exist, so weekend-hiding on charts is "
+                                     "switched off automatically."),
+    "US large caps": (US_LARGE_CAPS, "A curated sample of US large caps, NOT the S&P 500. "
+                                     "Index membership changes and is not fetched here; paste "
+                                     "your own list if you need exact constituents."),
+    "Forex majors": (FOREX_MAJORS, "Spot FX crosses. These report zero volume on Yahoo, so "
+                                   "volume-gated strategies and filters will not arm."),
+    "Commodities": (COMMODITY_FUTURES, "Front-month futures. Yahoo stitches contract rollovers, "
+                                       "which puts artificial gaps in the history."),
+    "Global indices": (GLOBAL_INDICES, "Index levels report zero volume on Yahoo; VWAP falls "
+                                       "back to a session TWAP."),
+}
 
 # Fallbacks only. Used when NSE cannot be reached, and flagged as stale when they are.
 _FALLBACK_LISTS = {
@@ -5528,6 +5732,10 @@ def _universe_tickers(choice: str, custom_text: str, uploaded) -> tuple[list[str
     a silently stale constituent list means screening companies that left the
     index and missing the ones that joined.
     """
+    if choice in STATIC_UNIVERSES:
+        names, note = STATIC_UNIVERSES[choice]
+        return list(names), note
+
     if choice == "Broad indices":
         return ["^NSEI", "^NSEBANK", "^BSESN", "NIFTY_FIN_SERVICE.NS", "^NSMIDCP"], None
     if choice == "Sector indices":
@@ -5582,8 +5790,35 @@ def _universe_tickers(choice: str, custom_text: str, uploaded) -> tuple[list[str
             raw = ""
     raw = (raw + "\n" + (custom_text or "")).replace(",", "\n")
     names = [x.strip().upper() for x in raw.splitlines() if x.strip()]
-    return [n if ("." in n or n.startswith("^") or "=" in n) else f"{n}.NS"
-            for n in names], None
+    return [_normalise_ticker(n) for n in names], None
+
+
+# Yahoo suffixes and shapes that are already complete and must not be touched.
+_KNOWN_SUFFIXES = (".NS", ".BO", ".L", ".TO", ".AX", ".HK", ".SI", ".DE", ".PA",
+                   ".MI", ".SW", ".T", ".KS", ".SA", ".MX", ".NZ")
+_QUOTE_CURRENCIES = ("-USD", "-USDT", "-EUR", "-GBP", "-INR", "-BTC", "-ETH")
+
+
+def _normalise_ticker(name: str) -> str:
+    """
+    Complete a bare symbol into a Yahoo ticker without breaking foreign ones.
+
+    `.NS` used to be appended to anything without a dot, which turned BTC-USD
+    into BTC-USD.NS and AAPL into AAPL.NS. Only a plain alphanumeric Indian-style
+    symbol gets the suffix; crypto pairs, FX crosses, futures roots, indices and
+    already-suffixed tickers are passed through untouched.
+    """
+    n = (name or "").strip().upper()
+    if not n:
+        return n
+    if (n.startswith("^") or "=" in n or n.endswith(_KNOWN_SUFFIXES)
+            or n.endswith(_QUOTE_CURRENCIES) or "." in n):
+        return n
+    if n in set(CRYPTO_MAJOR) | set(US_LARGE_CAPS):
+        return n
+    if not n.replace("&", "").replace("-", "").isalnum():
+        return n
+    return f"{n}.NS"
 
 
 def signal_detail(frame: pd.DataFrame, hit_time, direction: int, risk: "RiskConfig | None",
@@ -6856,6 +7091,12 @@ def tab_optimiser(cfg: dict) -> None:
 PATTERN_TIMEFRAMES = ["5m", "15m", "30m", "60m", "4h", "1d", "1wk"]
 
 
+def trades_around_the_clock(symbol: str) -> bool:
+    """Crypto and spot FX have no weekend gap, so the chart must not hide one."""
+    t = (symbol or "").upper()
+    return t.endswith(_QUOTE_CURRENCIES) or "=X" in t or t.endswith("=F")
+
+
 def _pattern_period_for(interval: str) -> str:
     return {"5m": "1mo", "15m": "3mo", "30m": "3mo", "60m": "6mo",
             "4h": "1y", "1d": "2y", "1wk": "5y"}.get(interval, "1y")
@@ -8073,6 +8314,41 @@ def _test_search_grid_and_quality():
     print("   custom search grids and the composite quality score  OK")
 
 
+def _test_global_universes_and_join():
+    """Foreign tickers must survive normalisation, and joining keeps the old levels."""
+    assert _normalise_ticker("BTC-USD") == "BTC-USD", "a crypto pair must not gain .NS"
+    assert _normalise_ticker("AAPL") == "AAPL", "a known US ticker must not gain .NS"
+    assert _normalise_ticker("EURUSD=X") == "EURUSD=X"
+    assert _normalise_ticker("GC=F") == "GC=F"
+    assert _normalise_ticker("^GSPC") == "^GSPC"
+    assert _normalise_ticker("TATAMOTORS.BO") == "TATAMOTORS.BO"
+    assert _normalise_ticker("7203.T") == "7203.T"
+    assert _normalise_ticker("RELIANCE") == "RELIANCE.NS", "a bare Indian name still gets .NS"
+
+    for name in ("Crypto (major)", "US large caps", "Forex majors", "Commodities",
+                 "Global indices"):
+        tickers, note = _universe_tickers(name, "", None)
+        assert tickers and note, f"{name}: empty or undocumented"
+        assert all(t == _normalise_ticker(t) for t in tickers), f"{name}: unstable tickers"
+
+    assert trades_around_the_clock("BTC-USD") and trades_around_the_clock("EURUSD=X")
+    assert not trades_around_the_clock("RELIANCE.NS"), "equities do have weekend gaps"
+
+    # Joining an existing signal keeps the ORIGINAL levels and re-bases the PnL.
+    ctx = _ctx(close=100.0, atr=2.0)
+    risk = RiskConfig("Fixed Points", 10.0, "Fixed Points", 30.0, 1.0)
+    original_entry, actual_fill = 100.0, 108.0
+    mgr = ExitManager(risk, original_entry, 1, ctx)
+    assert mgr.sl == 90.0 and mgr.tp == 130.0
+    mgr.entry = actual_fill
+    mgr.mfe = actual_fill
+    mgr.risk_points = abs(actual_fill - mgr.sl)
+    assert mgr.sl == 90.0 and mgr.tp == 130.0, "levels must not move to the new fill"
+    assert mgr.points(actual_fill) == 0.0, "PnL must start from the price actually paid"
+    assert mgr.risk_points == 18.0, "risk is now fill-to-original-stop, and it is wider"
+    print("   foreign tickers, global universes and joining an in-flight signal  OK")
+
+
 def _test_signal_detail():
     """
     The enriched signal columns must reconcile with each other exactly.
@@ -8335,6 +8611,7 @@ def run_selftest() -> int:
         _test_universe_resolution()
         _test_timeframe_period_scaling()
         _test_search_grid_and_quality()
+        _test_global_universes_and_join()
         print("-- filters --")
         _test_filters()
         _test_new_filters()
