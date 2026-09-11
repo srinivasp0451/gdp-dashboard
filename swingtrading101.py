@@ -3661,7 +3661,7 @@ _STATE_DEFAULTS = {
     "ltp_note": None, "screener_results": None, "screener_error": None,
     "last_seen_ltp": None, "last_ltp_change_ts": 0.0, "pending_ticker": None,
     "last_closed_bar": None, "option_metrics": None, "live_last_signal_time": None,
-    "live_first_cycle": False,
+    "live_first_cycle": False, "last_good_quote": None, "suspect_ticks": 0,
     "optimizer_results": None, "pattern_results": None, "pending_combo": None,
     "pattern_rows": None, "pattern_frames": None, "pattern_hits": None,
     "pattern_errors": None, "lab_results": None,
@@ -3797,8 +3797,20 @@ def fetch_live_ltp(cfg: dict, frame: pd.DataFrame) -> tuple[float, str]:
 
     price = yahoo_ltp(cfg["symbol"])
     if price is not None:
+        st.session_state.last_good_quote = (float(price), time.time())
         return float(price), "Yahoo quote (ticks continuously)"
-    return float(frame["Close"].iloc[-1]), "Candle close (quote unavailable -- steps per candle)"
+
+    # Falling back to the candle close on a single failed quote call makes the
+    # price flip between the live quote and a stale close on alternate ticks --
+    # a sawtooth that looks like market movement but is pure feed artefact, and
+    # one that can trip a trailing stop. Hold the last good quote instead.
+    cached = st.session_state.get("last_good_quote")
+    if cached:
+        px, when = cached
+        age = time.time() - float(when)
+        if age <= 120:
+            return float(px), f"Last good quote ({age:0.0f}s old — quote call failed)"
+    return float(frame["Close"].iloc[-1]), "Candle close (no quote available)"
 
 
 def build_snapshot(cfg: dict, frame: pd.DataFrame, reports, warnings, vix,
@@ -4039,6 +4051,7 @@ def run_cycle(cfg: dict) -> None:
     # ticks, the refresh loop is fine and the FEED is standing still.
     log = st.session_state.feed_log
     prev_ltp = log[0]["LTP"] if log else None
+    prev_source = log[0]["Source"] if log else None
     log.insert(0, {"Polled at": pd.Timestamp.now().strftime("%H:%M:%S.%f")[:-3],
                    "Newest candle": fmt_time(snapshot.frame.index[-1]),
                    "LTP": round(snapshot.ltp, 4),
@@ -4047,8 +4060,30 @@ def run_cycle(cfg: dict) -> None:
                    "Source": snapshot.ltp_source})
     del log[60:]
 
+    # Alternating sources are the classic cause of a phantom sawtooth.
+    if prev_source and prev_source != snapshot.ltp_source:
+        log_event(f"Price source changed: {prev_source} -> {snapshot.ltp_source}. A change here "
+                  f"moves the quoted price for reasons that have nothing to do with the market.",
+                  "warn")
+
     closed_ctx = bar_ctx(frame, len(frame) - 2)
     st.session_state.last_closed_bar = _bar_dict(closed_ctx)
+
+    # A single bad print can hit a stop that the market never reached. A move of
+    # this size between two ticks seconds apart is a data artefact, not a market
+    # event, so the tick is logged and skipped for risk management -- the next
+    # poll is 0.3s away and will confirm or deny it.
+    suspect = False
+    if prev_ltp is not None and np.isfinite(closed_ctx.atr) and closed_ctx.atr > 0:
+        jump = abs(snapshot.ltp - float(prev_ltp))
+        if jump > max(8.0 * closed_ctx.atr, 0.03 * float(prev_ltp)):
+            suspect = True
+            st.session_state.suspect_ticks += 1
+            log_event(f"Suspect tick ignored: {fmt(prev_ltp)} -> {fmt(snapshot.ltp)} "
+                      f"({fmt(jump)} in one poll, ATR {fmt(closed_ctx.atr)}). Waiting for the "
+                      f"next quote to confirm.", "warn")
+    if suspect:
+        return
     position: Position | None = st.session_state.live_position
     new_bar = st.session_state.live_last_bar != snapshot.last_closed_time
 
@@ -5338,8 +5373,215 @@ def _position_dashboard(position: Position, snapshot, currency: str) -> None:
                   if position.entry_ltp_at_fill else ""))
 
 
+# =============================================================================
+# SECTION 14d -- ENTRY CONDITION CHECKLIST
+# =============================================================================
+# Prose explains one blocker at a time; a checklist shows every condition at once
+# and, crucially, shows how far away each one is. Two layers are rendered: the
+# ENGINE gates (feed, position, filters, signal freshness), which apply to every
+# profile, and the STRATEGY conditions for the selected profile.
+
+TICK_YES, TICK_NO, TICK_NA = "\u2705", "\u274c", "\u2796"
+
+
+@dataclass
+class ConditionCheck:
+    label: str
+    long_ok: bool | None          # None -> not applicable, shown as auto-pass
+    short_ok: bool | None
+    detail: str = ""
+
+
+def _ck(label, long_ok, short_ok, detail=""):
+    return ConditionCheck(label, long_ok, short_ok, detail)
+
+
+def _mark(value) -> str:
+    return TICK_NA if value is None else (TICK_YES if value else TICK_NO)
+
+
+def engine_checks(cfg: dict, snapshot: LiveSnapshot) -> list[ConditionCheck]:
+    """The gates the live engine applies regardless of which profile is selected."""
+    checks: list[ConditionCheck] = []
+    live = bool(snapshot.quote_live)
+    checks.append(_ck("Feed alive (quote moving)", live, live,
+                      f"source: {snapshot.ltp_source}"))
+
+    flat = st.session_state.live_position is None
+    checks.append(_ck("No position already open", flat, flat,
+                      "one position at a time" if flat else "square off first"))
+
+    for rep in snapshot.filter_reports:
+        checks.append(_ck(f"Filter · {rep.label}", rep.long_ok, rep.short_ok, rep.value))
+
+    ago = snapshot.recent_signal_bars_ago
+    lookback = int(cfg.get("entry_lookback", 0) or 0)
+    if snapshot.last_closed_signal != 0:
+        fresh = True
+        detail = "signal on the newest closed candle"
+    elif snapshot.recent_signal != 0 and ago is not None:
+        fresh = bool(lookback >= ago > 0)
+        detail = (f"last signal {ago} candle(s) ago; catch-up allows {lookback}"
+                  if not fresh else f"{ago} candle(s) ago, inside the catch-up window")
+    else:
+        fresh = False
+        detail = "no signal on any recent closed candle"
+    side_long = fresh and (snapshot.last_closed_signal == 1 or snapshot.recent_signal == 1)
+    side_short = fresh and (snapshot.last_closed_signal == -1 or snapshot.recent_signal == -1)
+    checks.append(_ck("Signal fresh enough to act on", side_long, side_short, detail))
+
+    already = st.session_state.get("live_last_signal_time")
+    sig_time = snapshot.last_closed_time if snapshot.last_closed_signal != 0 \
+        else snapshot.recent_signal_time
+    unused = already != sig_time
+    checks.append(_ck("Signal not already traded", unused, unused,
+                      "fresh" if unused else "this exact signal was already taken"))
+    return checks
+
+
+def _need(value, target, direction_up: bool) -> str:
+    """Human 'needs +X more' for a level that has to be crossed."""
+    if value is None or target is None:
+        return ""
+    gap = (target - value) if direction_up else (value - target)
+    return "cleared" if gap <= 0 else f"needs {abs(gap):,.2f} more"
+
+
+def strategy_checks(name: str, frame: pd.DataFrame, params: dict) -> list[ConditionCheck]:
+    """
+    Per-profile conditions, with the distance to each one.
+
+    Only profiles whose conditions decompose cleanly are covered; anything else
+    falls back to the prose description, which is still shown underneath.
+    """
+    def last(col):
+        return safe_last(frame[col]) if col in frame.columns else None
+
+    close = last("Close")
+    out: list[ConditionCheck] = []
+
+    if name.startswith(("01 ", "32 ", "34 ")):
+        fast, slow = last("ema_fast"), last("ema_slow")
+        if fast is not None and slow is not None:
+            spread = fast - slow
+            out.append(_ck(f"Fast EMA vs slow EMA ({fmt(fast)} vs {fmt(slow)})",
+                           spread > 0, spread < 0,
+                           f"spread {fmt_signed(spread)}; a cross needs {fmt(abs(spread))} more"))
+            angle = ema_angle_degrees(frame)
+            if angle is not None:
+                out.append(_ck("Crossover angle", True, True, f"{angle:.2f}\u00b0"))
+    if name.startswith(("32 ", "30 ", "36 ", "33 ", "31 ")):
+        r = last("rsi")
+        lo, hi = float(_p(params, "rsi_long_level")), float(_p(params, "rsi_short_level"))
+        if r is not None:
+            out.append(_ck(f"RSI {fmt(r)} against {fmt(lo)} / {fmt(hi)}", r >= lo, r <= hi,
+                           f"long {_need(r, lo, True)} · short {_need(r, hi, False)}"))
+    if name.startswith("08 "):
+        r = last("rsi")
+        if r is not None:
+            out.append(_ck(f"RSI {fmt(r)} vs the 50 centerline", r > 50, r < 50,
+                           f"{_need(r, 50, True)} to cross up"))
+    if name.startswith(("25 ", "04 ")):
+        d = last("st_dir") if "st_dir" in frame.columns else last("trail_dir")
+        if d is not None:
+            out.append(_ck("Trend band direction", d == 1, d == -1,
+                           "bullish" if d == 1 else "bearish"))
+    if name.startswith("05 "):
+        hi, lo = last("or_high"), last("or_low")
+        out.append(_ck(f"Opening range {fmt(lo)} - {fmt(hi)}",
+                       None if hi is None else close > hi,
+                       None if lo is None else close < lo,
+                       f"UP {_need(close, hi, True)} · DOWN {_need(close, lo, False)}"))
+    if name.startswith("47 "):
+        expiry = last("is_expiry_day")
+        move, a = last("move_from_open"), last("atr")
+        need = float(_p(params, "zero_hero_atr")) * (a or 0)
+        out.append(_ck("Expiry day", bool(expiry), bool(expiry),
+                       "yes" if expiry else "not an expiry weekday"))
+        out.append(_ck(f"Burst {fmt(need)} from the session open",
+                       (move or 0) >= need, (move or 0) <= -need,
+                       f"move {fmt_signed(move)}; UP {_need(move, need, True)} · "
+                       f"DOWN {_need(move, -need, False)}"))
+    if name.startswith("48 "):
+        late = last("is_late_session")
+        ratio = last("atr_ratio")
+        hi, lo = last("day_high"), last("day_low")
+        out.append(_ck("Inside the closing stretch", bool(late), bool(late),
+                       "yes" if late else "too early in the session"))
+        out.append(_ck(f"Volatility expanding (>= {fmt(_p(params, 'squeeze_mult'))}x)",
+                       (ratio or 0) >= float(_p(params, "squeeze_mult")),
+                       (ratio or 0) >= float(_p(params, "squeeze_mult")),
+                       f"ATR ratio {fmt(ratio)}"))
+        out.append(_ck(f"Session range {fmt(lo)} - {fmt(hi)}",
+                       None if hi is None else close > hi,
+                       None if lo is None else close < lo,
+                       f"UP {_need(close, hi, True)} · DOWN {_need(close, lo, False)}"))
+    if name.startswith(("35 ", "36 ", "37 ", "38 ", "39 ", "40 ", "41 ")):
+        gh, gl = last("fib_golden_hi"), last("fib_golden_lo")
+        up_leg = last("fib_up_leg")
+        if gh is not None and gl is not None:
+            inside = gl <= (close or 0) <= gh
+            out.append(_ck(f"Golden zone {fmt(gl)} - {fmt(gh)}",
+                           bool(up_leg) and inside, (not up_leg) and inside,
+                           f"price {fmt(close)}, leg is {'up' if up_leg else 'down'}"))
+    if name.startswith("28 "):
+        lvl = last("threshold")
+        out.append(_ck(f"Threshold {fmt(lvl)}",
+                       None if lvl is None else close > lvl,
+                       None if lvl is None else close < lvl,
+                       f"UP {_need(close, lvl, True)} · DOWN {_need(close, lvl, False)}"))
+    if name.startswith("29 "):
+        up, dn = last("threshold_up"), last("threshold_dn")
+        out.append(_ck(f"Bands {fmt(dn)} - {fmt(up)}",
+                       None if up is None else close > up,
+                       None if dn is None else close < dn,
+                       f"UP {_need(close, up, True)} · DOWN {_need(close, dn, False)}"))
+    if name.startswith("43 "):
+        votes_l, votes_s = last("hybrid_long_votes"), last("hybrid_short_votes")
+        members = int(last("hybrid_members") or 0)
+        need_all = str(params.get("hybrid_logic", "")).startswith("All")
+        required = members if need_all else 1
+        out.append(_ck(f"Member agreement ({'all' if need_all else 'any one'} of {members})",
+                       (votes_l or 0) >= required, (votes_s or 0) >= required,
+                       f"long votes {fmt(votes_l, 0)} · short votes {fmt(votes_s, 0)}"))
+    return out
+
+
+def render_condition_checklist(cfg: dict, snapshot: LiveSnapshot) -> None:
+    """The whole entry gate, one line per condition, with the distance to each."""
+    strat = get_strategy(cfg["strategy"])
+    checks = engine_checks(cfg, snapshot) + strategy_checks(cfg["strategy"], snapshot.frame,
+                                                            cfg.get("params") or {})
+    long_ready = all(c.long_ok is not False for c in checks)
+    short_ready = all(c.short_ok is not False for c in checks)
+
+    headline = (f"**\U0001F3AF {strat.name}** — every condition must hold on the SAME bar "
+                f"(`{cfg['symbol']}` · `{cfg['interval']}`)")
+    if long_ready or short_ready:
+        st.success(headline + f"  \u2192 **{'LONG' if long_ready else 'SHORT'} is ready**")
+    else:
+        st.info(headline)
+
+    lines = []
+    for i, c in enumerate(checks, start=1):
+        detail = f" — {c.detail}" if c.detail else ""
+        lines.append(f"- **{i}. {c.label}**: LONG {_mark(c.long_ok)} · SHORT {_mark(c.short_ok)}"
+                     f"{detail}")
+    st.markdown("\n".join(lines))
+
+    blocked_long = [c.label for c in checks if c.long_ok is False]
+    blocked_short = [c.label for c in checks if c.short_ok is False]
+    if blocked_long and blocked_short:
+        st.caption(f"Blocking a LONG: {', '.join(blocked_long[:4])}. "
+                   f"Blocking a SHORT: {', '.join(blocked_short[:4])}.")
+    st.caption(f"{TICK_YES} met · {TICK_NO} not met · {TICK_NA} not applicable to this profile "
+               "(treated as met rather than blocking every trade).")
+
+
 def _searching_widget(cfg: dict, snapshot: LiveSnapshot) -> None:
     st.markdown("#### Signal Scanner")
+    render_condition_checklist(cfg, snapshot)
+    st.divider()
     blocked = [r for r in snapshot.filter_reports
                if (snapshot.raw_signal == 1 and not r.long_ok)
                or (snapshot.raw_signal == -1 and not r.short_ok)]
@@ -5348,26 +5590,6 @@ def _searching_widget(cfg: dict, snapshot: LiveSnapshot) -> None:
                    + ", ".join(f"{r.label} ({r.value})" for r in blocked))
     else:
         st.info(f"**Searching for Signal** :: {snapshot.status.headline}")
-
-    lookback = int(cfg.get("entry_lookback", 0) or 0)
-    ago = snapshot.recent_signal_bars_ago
-    if snapshot.last_closed_signal != 0:
-        st.success(f"**Signal on the newest closed candle** "
-                   f"({'LONG' if snapshot.last_closed_signal > 0 else 'SHORT'}). The next tick "
-                   f"will take it unless a filter or the feed check blocks it.")
-    elif snapshot.recent_signal != 0 and ago is not None:
-        side = "LONG" if snapshot.recent_signal > 0 else "SHORT"
-        if lookback >= ago > 0:
-            st.info(f"**A {side} signal fired {ago} candle(s) ago** and catch-up is set to "
-                    f"{lookback}, so the next tick will take it at the current price.")
-        else:
-            st.warning(
-                f"**A {side} signal fired {ago} candle(s) ago, and it will NOT be taken.** The "
-                f"engine only acts on the newest closed candle, which is why a screener hit from "
-                f"a few candles back does not become a trade. Either wait for a fresh signal, or "
-                f"raise *Live: act on a signal up to N candles old* in the sidebar to at least "
-                f"{ago}. The catch-up fill is the current price, not the original next-candle "
-                f"open.")
 
     metrics = [("Live LTP", fmt(snapshot.ltp))] + list(snapshot.status.metrics)
     cols = st.columns(min(len(metrics), 5))
@@ -5437,26 +5659,6 @@ def _strategy_status_panel(cfg: dict, snapshot: LiveSnapshot) -> None:
     """
     st.markdown("#### Strategy & Filter Status")
     st.info(f"**{cfg['strategy']}** :: {snapshot.status.headline}")
-    lookback = int(cfg.get("entry_lookback", 0) or 0)
-    ago = snapshot.recent_signal_bars_ago
-    if snapshot.last_closed_signal != 0:
-        st.success(f"**Signal on the newest closed candle** "
-                   f"({'LONG' if snapshot.last_closed_signal > 0 else 'SHORT'}). The next tick "
-                   f"will take it unless a filter or the feed check blocks it.")
-    elif snapshot.recent_signal != 0 and ago is not None:
-        side = "LONG" if snapshot.recent_signal > 0 else "SHORT"
-        if lookback >= ago > 0:
-            st.info(f"**A {side} signal fired {ago} candle(s) ago** and catch-up is set to "
-                    f"{lookback}, so the next tick will take it at the current price.")
-        else:
-            st.warning(
-                f"**A {side} signal fired {ago} candle(s) ago, and it will NOT be taken.** The "
-                f"engine only acts on the newest closed candle, which is why a screener hit from "
-                f"a few candles back does not become a trade. Either wait for a fresh signal, or "
-                f"raise *Live: act on a signal up to N candles old* in the sidebar to at least "
-                f"{ago}. The catch-up fill is the current price, not the original next-candle "
-                f"open.")
-
     metrics = [("Live LTP", fmt(snapshot.ltp))] + list(snapshot.status.metrics)
     cols = st.columns(min(len(metrics), 5))
     for i, (label, value) in enumerate(metrics):
@@ -6942,13 +7144,19 @@ def render_search_grid(prefix: str, cfg: dict, safe_only: bool):
 
     Returns ``(grid, exhaustive, note)`` or ``(None, False, None)`` when disabled.
     """
+    scale_points = st.checkbox(
+        "Scale point-based stops and targets to the instrument (ATR)", value=True,
+        key=f"{prefix}_scale",
+        help="On: absolute point values in the grid are rewritten as multiples of this "
+             "instrument's own ATR. A 40-point stop is normal on Nifty and 0.05% on Bitcoin, so "
+             "searching the same fixed numbers everywhere compares nothing with nothing.")
     wide = st.checkbox(
         "Configure the search grid myself (wide / greedy search)", value=False,
         key=f"{prefix}_wide",
         help="Off: a fixed shortlist of sensible stops, targets and filters is sampled at "
              "random. On: you choose every axis, including your own stop and target values.")
     if not wide:
-        return None, False, None
+        return None, False, None, scale_points
 
     st.caption("Every axis you widen multiplies the number of backtests. The estimate below "
                "updates as you choose.")
@@ -6998,7 +7206,7 @@ def render_search_grid(prefix: str, cfg: dict, safe_only: bool):
     if size > 4000 and exhaustive:
         st.warning(f"{size:,} exhaustive backtests per ticker will take a long time. Leave the "
                    "box unticked to sample instead.")
-    return grid, exhaustive, note
+    return grid, exhaustive, note, scale_points
 
 
 def tab_optimiser(cfg: dict) -> None:
@@ -7024,7 +7232,7 @@ def tab_optimiser(cfg: dict) -> None:
                             help="Excludes distance-based trailing stops, whose backtested "
                                  "results are systematically optimistic.")
 
-    grid, exhaustive, grid_note = render_search_grid("opt", cfg, safe_only)
+    grid, exhaustive, grid_note, scale_points = render_search_grid("opt", cfg, safe_only)
     if grid_note:
         st.info(grid_note)
 
@@ -7043,7 +7251,7 @@ def tab_optimiser(cfg: dict) -> None:
             results = optimise(bundle.frame, cfg["params"], cfg["quantity"], cfg["costs"],
                                objective, int(min_trades), int(iterations),
                                safe_exits_only=safe_only, progress=bar,
-                               grid=grid, exhaustive=exhaustive)
+                               grid=grid, exhaustive=exhaustive, scale_points=scale_points)
             st.session_state.optimizer_results = (results, objective, float(target))
         except Exception as exc:                                    # noqa: BLE001
             st.error(f"Optimiser failed: {exc}")
@@ -7456,8 +7664,8 @@ def _meets_thresholds(row, gates: dict) -> bool:
 def run_signal_lab(tickers: list[str], cfg: dict, objective: str, iterations: int,
                    min_trades: int, signal_window: int, safe_only: bool,
                    timeframes: list[str] | None = None, gates: dict | None = None,
-                   progress=None, grid: dict | None = None,
-                   exhaustive: bool = False) -> tuple[pd.DataFrame, pd.DataFrame]:
+                   progress=None, grid: dict | None = None, exhaustive: bool = False,
+                   scale_points: bool = True) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     For each ticker: search for the best configuration on its own history, then
     ask whether that winning configuration is signalling right now.
@@ -7503,7 +7711,7 @@ def run_signal_lab(tickers: list[str], cfg: dict, objective: str, iterations: in
         try:
             table = optimise(bundle.frame, params, cfg["quantity"], costs, objective,
                              min_trades, iterations, seed=11, safe_exits_only=safe_only,
-                             grid=grid, exhaustive=exhaustive)
+                             grid=grid, exhaustive=exhaustive, scale_points=scale_points)
         except Exception as exc:                                    # noqa: BLE001
             errors.append({"Ticker": ticker, "Timeframe": interval,
                            "Problem": f"optimiser: {str(exc)[:120]}"})
@@ -7668,14 +7876,14 @@ def tab_signal_lab(cfg: dict) -> None:
     else:
         timeframes = [cfg["interval"]]
         st.caption(f"Searching the sidebar timeframe only (`{cfg['interval']}`).")
-    grid, exhaustive, grid_note = None, False, None
+    grid, exhaustive, grid_note, scale_points = None, False, None, True
     safe_only = st.checkbox("Backtest-safe exits only (exclude distance trails)", value=True,
                             key="lab_safe",
                             help="Distance trails cannot be simulated faithfully on OHLC bars, "
                                  "so including them lets an optimiser pick a configuration whose "
                                  "backtest is systematically optimistic.")
 
-    grid, exhaustive, grid_note = render_search_grid("lab", cfg, safe_only)
+    grid, exhaustive, grid_note, scale_points = render_search_grid("lab", cfg, safe_only)
     if grid_note:
         st.info(grid_note)
 
@@ -7694,7 +7902,8 @@ def tab_signal_lab(cfg: dict) -> None:
         try:
             results, errors = run_signal_lab(tickers, cfg, objective, int(iterations),
                                              int(min_trades), int(signal_window), safe_only,
-                                             timeframes, gates, bar, grid, exhaustive)
+                                             timeframes, gates, bar, grid, exhaustive,
+                                             scale_points)
             st.session_state.lab_results = (results, errors)
         except Exception as exc:                                    # noqa: BLE001
             st.session_state.lab_results = None
@@ -8349,6 +8558,51 @@ def _test_global_universes_and_join():
     print("   foreign tickers, global universes and joining an in-flight signal  OK")
 
 
+def _test_condition_checklist_and_scaling():
+    """Checklist logic, and point grids that scale to the instrument."""
+    df = _synthetic(600, seed=11)
+    params = dict(DEFAULT_PARAMS)
+    params["intraday"] = True
+    frame, _ = prepare(df, "01 \u00b7 Dual EMA Crossover", params)
+
+    checks = strategy_checks("01 \u00b7 Dual EMA Crossover", frame, params)
+    assert checks, "the dual EMA profile must decompose into conditions"
+    spread_check = checks[0]
+    # Exactly one side of a crossover can be satisfied at a time.
+    assert spread_check.long_ok != spread_check.short_ok, "both sides cannot be met at once"
+    assert "needs" in spread_check.detail, "the distance to the cross must be stated"
+    assert _mark(True) == TICK_YES and _mark(False) == TICK_NO and _mark(None) == TICK_NA
+
+    assert _need(40.0, 50.0, True) == "needs 10.00 more"
+    assert _need(60.0, 50.0, True) == "cleared"
+    assert _need(60.0, 50.0, False) == "needs 10.00 more"
+
+    # Point-based grid values must follow the instrument, not a hardcoded 20/40.
+    def synth(price, vol, n=500):
+        rng = np.random.default_rng(5)
+        close = price + np.cumsum(rng.normal(0, vol, n))
+        high = close + np.abs(rng.normal(0, vol, n))
+        low = close - np.abs(rng.normal(0, vol, n))
+        open_ = np.r_[close[0], close[:-1]]
+        return pd.DataFrame(
+            {"Open": open_, "High": np.maximum.reduce([high, open_, close]),
+             "Low": np.minimum.reduce([low, open_, close]), "Close": close, "Volume": 1.0},
+            index=pd.date_range("2026-01-01", periods=n, freq="5min"))
+
+    base = {"strategies": ["x"], "sl": list(_OPT_SL_GRID), "tp": list(_OPT_TP_GRID),
+            "filters": [None]}
+    btc = scale_points_to_instrument(base, synth(77000, 90))
+    nifty = scale_points_to_instrument(base, synth(24000, 12))
+    btc_pts = [v for k, v in btc["sl"] if k == "Fixed Points"]
+    nifty_pts = [v for k, v in nifty["sl"] if k == "Fixed Points"]
+    assert min(btc_pts) > max(nifty_pts), \
+        f"a BTC point stop must dwarf a Nifty one: {btc_pts} vs {nifty_pts}"
+    assert all(p > 0 for p in btc_pts + nifty_pts)
+    # Percentage and structural entries must pass through untouched.
+    assert ("Fixed Percentage", 0.5) in btc["sl"] and ("ATR Multiple", 1.5) in btc["sl"]
+    print("   entry checklist and instrument-scaled point grids  OK")
+
+
 def _test_signal_detail():
     """
     The enriched signal columns must reconcile with each other exactly.
@@ -8612,6 +8866,7 @@ def run_selftest() -> int:
         _test_timeframe_period_scaling()
         _test_search_grid_and_quality()
         _test_global_universes_and_join()
+        _test_condition_checklist_and_scaling()
         print("-- filters --")
         _test_filters()
         _test_new_filters()
@@ -8846,6 +9101,44 @@ def parse_number_list(text: str, fallback: list[float]) -> list[float]:
     return out or list(fallback)
 
 
+def scale_points_to_instrument(grid: dict, df: pd.DataFrame, atr_len: int = 14) -> dict:
+    """
+    Rewrite absolute point values as multiples of the instrument's own ATR.
+
+    A 40-point stop is a sensible intraday stop on Nifty and 0.05% on Bitcoin.
+    Searching the same absolute numbers across instruments does not compare like
+    with like: on BTC every point-based combination is effectively a zero-width
+    stop that is hit immediately, and on a Rs.50 stock it is wider than the whole
+    day's range. The multipliers are preserved -- only their scale changes.
+    """
+    try:
+        atr_series = atr(df["High"], df["Low"], df["Close"], atr_len)
+        unit = float(atr_series.median(skipna=True))
+    except Exception:                                               # noqa: BLE001
+        return grid
+    if not np.isfinite(unit) or unit <= 0:
+        return grid
+
+    base = 20.0                       # the point values in the default grid are multiples of this
+    def rescale(pairs_in):
+        out = []
+        for kind, value in pairs_in:
+            if kind == "Fixed Points" and value:
+                multiple = float(value) / base
+                scaled = round(unit * multiple * 2.0, 4)
+                scaled = round(scaled, 2) if scaled >= 1 else round(scaled, 4)
+                out.append((kind, scaled))
+            else:
+                out.append((kind, value))
+        return out
+
+    out = dict(grid)
+    out["sl"] = rescale(grid["sl"])
+    out["tp"] = rescale(grid["tp"])
+    out["_atr_unit"] = round(unit, 4)
+    return out
+
+
 def build_search_grid(strategies: list[str], sl_types: list[str], sl_values: list[float],
                       tp_types: list[str], tp_values: list[float],
                       filters: list[str], safe_exits_only: bool) -> dict:
@@ -8896,7 +9189,8 @@ def grid_size(grid: dict) -> int:
 def optimise(df: pd.DataFrame, base_params: dict, quantity: float, costs: CostModel,
              objective: str, min_trades: int, iterations: int, seed: int = 11,
              safe_exits_only: bool = True, progress=None,
-             grid: dict | None = None, exhaustive: bool = False) -> pd.DataFrame:
+             grid: dict | None = None, exhaustive: bool = False,
+             scale_points: bool = True) -> pd.DataFrame:
     """
     Randomised search over strategy x stop x target x one optional filter.
 
@@ -8912,6 +9206,8 @@ def optimise(df: pd.DataFrame, base_params: dict, quantity: float, costs: CostMo
                 "sl": [x for x in _OPT_SL_GRID
                        if not (safe_exits_only and x[0] in DISTANCE_TRAIL_TYPES)],
                 "tp": list(_OPT_TP_GRID), "filters": list(_OPT_FILTERS)}
+    if scale_points:
+        grid = scale_points_to_instrument(grid, df, int(base_params.get("atr_len", 14)))
     names, sl_grid = grid["strategies"], grid["sl"]
     tp_grid, filters = grid["tp"], grid["filters"]
     if not (names and sl_grid and tp_grid and filters):
