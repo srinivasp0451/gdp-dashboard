@@ -3892,6 +3892,14 @@ def init_state() -> None:
 
 
 def log_event(message: str, level: str = "info") -> None:
+    # Logging is never important enough to break the caller: outside a Streamlit
+    # session (tests, scripts) there is no state to write to.
+    if st is None:
+        return
+    try:
+        st.session_state.live_events
+    except Exception:                                               # noqa: BLE001
+        return
     st.session_state.live_events.insert(
         0, {"time": pd.Timestamp.now().strftime("%H:%M:%S"), "level": level, "message": message})
     del st.session_state.live_events[300:]
@@ -4175,6 +4183,40 @@ def _maybe_route_broker(cfg: dict, position: Position, closing: bool) -> None:
         log_event(f"Broker order FAILED: {exc}", "error")
 
 
+def _live_fill_price(cfg: dict, snapshot: LiveSnapshot, ctx: BarCtx) -> float:
+    """
+    The price a live order can ACTUALLY get: the current LTP.
+
+    The backtest fills a signal from candle N at the open of candle N+1, because
+    when a bar is replayed its open is the first tradable price of that bar.
+    Carrying that rule into live trading is wrong and expensive: by the time the
+    engine sees the signal, candle N+1 has been forming for a while and its open
+    is a price that already happened. Booking it manufactures profit — a trade
+    opens showing a gain it never earned, and every live result is inflated by
+    however far price drifted since the candle opened.
+
+    The N+1 open is still offered for operators who want the backtest-consistent
+    number, but only while it is still close to the live price; past a fraction
+    of an ATR it is silently unobtainable, so the LTP wins and the log says so.
+    """
+    ltp = float(snapshot.ltp)
+    if not cfg.get("prefer_candle_open"):
+        return ltp
+
+    open_px = float(snapshot.next_open)
+    if not np.isfinite(open_px) or open_px <= 0:
+        return ltp
+    drift = abs(open_px - ltp)
+    tolerance = max(0.25 * ctx.atr if np.isfinite(ctx.atr) else 0.0, ltp * 0.0002)
+    if drift <= tolerance:
+        return open_px
+    log_event(f"Candle-open fill rejected: the N+1 open was {fmt(open_px)} but price is now "
+              f"{fmt(ltp)} ({fmt(drift)} away). That open is no longer obtainable, so the fill "
+              f"is the live price. Booking the open would have shown "
+              f"{fmt(drift)} points of profit the trade never made.", "warn")
+    return ltp
+
+
 def _open_live_position(cfg: dict, direction: int, price: float, ctx: BarCtx, bar_time,
                         levels_from: float | None = None, bars_ago: int | None = None,
                         route: str = "newest closed candle") -> Position:
@@ -4421,7 +4463,7 @@ def run_cycle(cfg: dict) -> None:
                   f"ago, so the N+1 open has passed. Filling at the current price "
                   f"{fmt(fill)} instead.", "warn")
     else:
-        fill = snapshot.ltp if cfg.get("fill_at_ltp") else snapshot.next_open
+        fill = _live_fill_price(cfg, snapshot, closed_ctx)
     cfg["_ltp_at_fill"] = snapshot.ltp
     _open_live_position(cfg, direction, fill, closed_ctx, signal_time,
                         bars_ago=(snapshot.recent_signal_bars_ago if catch_up else 0),
@@ -4706,10 +4748,13 @@ def render_sidebar() -> dict:
                                      help="How often the full candle history is re-downloaded and "
                                           "indicators recomputed. The price, PnL, stop and target "
                                           "refresh on every tick regardless of this.")
-    fill_at_ltp = sb.checkbox("Live: fill at LTP instead of the N+1 open", value=False,
-                              disabled=live, key="cfg_fill_ltp",
-                              help="Default follows the N+1-open rule. Turn this on if you would "
-                                   "rather record the price a market order would actually get.")
+    prefer_candle_open = sb.checkbox(
+        "Live: prefer the N+1 candle open as the fill price", value=False, disabled=live,
+        key="cfg_fill_open",
+        help="Off by default, and it should usually stay off. Live fills are recorded at the "
+             "CURRENT price, because that is the only price an order can get. The candle open "
+             "already happened; booking it shows profit the trade never made. With this on, the "
+             "open is used only while it is still within a quarter of an ATR of the live price.")
 
     sb.subheader("Analysis Options")
     costs = CostModel(enabled=sb.checkbox("Include charges / brokerage in PnL", value=False,
@@ -4897,7 +4942,8 @@ def render_sidebar() -> dict:
     return {"symbol": symbol, "asset_label": asset_label, "interval": interval,
             "period": eff_period, "requested_period": period, "strategy": strategy,
             "params": params, "risk": risk, "quantity": float(quantity),
-            "poll_seconds": float(poll_seconds), "fill_at_ltp": bool(fill_at_ltp),
+            "poll_seconds": float(poll_seconds),
+            "prefer_candle_open": bool(prefer_candle_open),
             "flip_entries": bool(flip),
             "allow_stale_entries": bool(allow_stale),
             "entry_lookback": int(entry_lookback),
@@ -5646,6 +5692,14 @@ def _position_dashboard(position: Position, snapshot, currency: str) -> None:
     r3[3].metric("Bars Held", f"{mgr.bars_held}")
     r3[4].metric("Best Price", fmt(mgr.mfe),
                  help="Best price in the trade's favour; drives the trailing stop.")
+
+    ref = position.entry_ltp_at_fill
+    if ref is not None and np.isfinite(ref):
+        slip = position.entry_price - float(ref)
+        if abs(slip) > 1e-9:
+            st.caption(f"Recorded entry {fmt(position.entry_price)} versus the live price at "
+                       f"fill {fmt(ref)} — a gap of {fmt_signed(slip)}. A gap here means the "
+                       f"position opened showing PnL it did not earn.")
 
     (st.success if pnl >= 0 else st.error)(
         f"{side} {position.symbol} :: running {fmt_signed(pnl)} {currency}")
@@ -9159,6 +9213,43 @@ def _test_volume_profile_and_depth():
     print("   volume profile value areas and live-only depth profile  OK")
 
 
+def _test_no_phantom_entry_pnl():
+    """
+    A live position must open at zero PnL. Always.
+
+    This is the regression guard for the worst bug in this file: live fills were
+    booked at the open of the candle already forming, copying the backtest rule.
+    That open is a price that has already happened, so a trade opened showing a
+    gain it never earned and every live result was inflated by the drift since
+    the candle opened.
+    """
+    class Snap:
+        def __init__(self, ltp, open_px):
+            self.ltp = ltp
+            self.next_open = open_px
+
+    ctx = _ctx(close=20000.0, atr=20.0)
+
+    # Default: the live price, whatever the candle open says.
+    snap = Snap(20013.52, 19828.68)
+    assert _live_fill_price({}, snap, ctx) == snap.ltp
+
+    # Opt-in, but the open has drifted far beyond a quarter of an ATR: rejected.
+    fill = _live_fill_price({"prefer_candle_open": True}, snap, ctx)
+    assert fill == snap.ltp, f"an unobtainable open must be rejected, got {fill}"
+
+    # Opt-in and the open is still within tolerance: it may be used.
+    near = Snap(20000.50, 20000.00)
+    assert _live_fill_price({"prefer_candle_open": True}, near, ctx) == near.next_open
+
+    # Whatever the fill, PnL at that price is zero by construction.
+    for entry in (20013.52, 19828.68, 20000.0):
+        risk = RiskConfig("Fixed Points", 100.0, "Fixed Points", 200.0, 1.0)
+        mgr = ExitManager(risk, entry, 1, ctx)
+        assert mgr.pnl(entry) == 0.0, "a position cannot open in profit"
+    print("   live fills use an obtainable price; no phantom entry PnL  OK")
+
+
 def _test_signal_detail():
     """
     The enriched signal columns must reconcile with each other exactly.
@@ -9426,6 +9517,7 @@ def run_selftest() -> int:
         _test_requirement_summary()
         _test_screener_live_reconciliation()
         _test_volume_profile_and_depth()
+        _test_no_phantom_entry_pnl()
         print("-- filters --")
         _test_filters()
         _test_new_filters()
