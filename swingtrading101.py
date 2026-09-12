@@ -282,6 +282,8 @@ DEFAULT_PARAMS: dict[str, float] = {
     "st_len": 10, "st_mult": 3.0, "structure_len": 20,
     "rsi_long_level": 40.0, "rsi_short_level": 60.0,
     "oi_change_threshold": 0.0, "pcr_min": 0.8, "pcr_max": 1.2,
+    "vp_lookback": 120, "vp_bins": 24, "vp_value_area": 0.70,
+    "ob_min_ratio": 2.0, "ob_min_qty": 0.0, "ob_max_spread": 1e9,
     "zero_hero_atr": 2.0, "expiry_weekday": 3, "gamma_tail_bars": 6,
     "flip_entries": False,
     "threshold_price": 0.0, "threshold_pct": 1.0,
@@ -2341,6 +2343,212 @@ def s_hybrid(df, p):
                "Member profiles must agree per the selected logic.")
 
 
+def volume_profile(df: pd.DataFrame, lookback: int = 120, bins: int = 24,
+                   value_area: float = 0.70):
+    """
+    Fixed-range volume profile: POC and the value area, rolled forward.
+
+    Volume is distributed across each candle's range rather than dumped at the
+    close, which is what stops a single large bar from inventing a point of
+    control at one price.
+
+    HONESTY: indices and spot FX report zero volume on Yahoo. Rather than divide
+    by zero or silently return nothing, the profile falls back to counting TIME
+    spent at each price (a TPO-style profile). That is a different statistic and
+    the caller is told so via the returned flag.
+    """
+    n = len(df)
+    poc = np.full(n, np.nan)
+    vah = np.full(n, np.nan)
+    val = np.full(n, np.nan)
+    high = df["High"].to_numpy(float)
+    low = df["Low"].to_numpy(float)
+    vol = df["Volume"].fillna(0.0).to_numpy(float)
+    volume_ok = float(np.nansum(np.abs(vol))) > 0.0
+    weights = vol if volume_ok else np.ones(n, dtype=float)
+
+    step = max(1, lookback // 12)                 # recompute periodically, carry between
+    for end in range(lookback, n + 1, step):
+        start = end - lookback
+        lo, hi = float(np.nanmin(low[start:end])), float(np.nanmax(high[start:end]))
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            continue
+        edges = np.linspace(lo, hi, bins + 1)
+        centres = (edges[:-1] + edges[1:]) / 2.0
+        hist = np.zeros(bins, dtype=float)
+        for i in range(start, end):
+            bar_lo, bar_hi, w = low[i], high[i], weights[i]
+            if not np.isfinite(bar_lo) or not np.isfinite(bar_hi) or w <= 0:
+                continue
+            # Spread this bar's weight evenly over the buckets its range touches.
+            first = int(np.clip(np.searchsorted(edges, bar_lo, "right") - 1, 0, bins - 1))
+            last = int(np.clip(np.searchsorted(edges, bar_hi, "left") - 1, 0, bins - 1))
+            if last < first:
+                first, last = last, first
+            hist[first:last + 1] += w / float(last - first + 1)
+        total = hist.sum()
+        if total <= 0:
+            continue
+        peak = int(np.argmax(hist))
+        lo_i = hi_i = peak
+        covered = hist[peak]
+        # Grow outward from the point of control until the value area is covered.
+        while covered < value_area * total and (lo_i > 0 or hi_i < bins - 1):
+            take_low = hist[lo_i - 1] if lo_i > 0 else -1.0
+            take_high = hist[hi_i + 1] if hi_i < bins - 1 else -1.0
+            if take_high >= take_low:
+                hi_i += 1
+                covered += max(take_high, 0.0)
+            else:
+                lo_i -= 1
+                covered += max(take_low, 0.0)
+        stop = min(end + step, n)
+        poc[end - 1:stop] = centres[peak]
+        val[end - 1:stop] = centres[lo_i]
+        vah[end - 1:stop] = centres[hi_i]
+
+    idx = df.index
+    return (pd.Series(poc, index=idx).ffill(), pd.Series(vah, index=idx).ffill(),
+            pd.Series(val, index=idx).ffill(), volume_ok)
+
+
+def c_volume_profile(df, p):
+    """
+    Value-area edges as support and resistance.
+
+    Long when price dips below the value-area low and closes back inside; short
+    on the mirror at the value-area high. The point of control is where the most
+    business was done, so the edges are where acceptance ends.
+    """
+    out = df.copy()
+    look = int(_p(p, "vp_lookback"))
+    poc, vah, val, volume_ok = volume_profile(out, look, int(_p(p, "vp_bins")),
+                                              float(_p(p, "vp_value_area")))
+    out["vp_poc"], out["vp_vah"], out["vp_val"] = poc, vah, val
+    out.attrs["vp_volume_weighted"] = volume_ok
+    long = (out["Low"] <= out["vp_val"]) & (out["Close"] > out["vp_val"]) & \
+        (out["Close"] > out["Open"])
+    short = (out["High"] >= out["vp_vah"]) & (out["Close"] < out["vp_vah"]) & \
+        (out["Close"] < out["Open"])
+    return _finalise(out, long, short)
+
+
+def s_volume_profile(df, p):
+    volume_ok = bool(df.attrs.get("vp_volume_weighted", True))
+    head = ("Value area built from traded volume." if volume_ok else
+            "This feed reports no volume, so the profile counts TIME at each price instead of "
+            "volume. That is a TPO profile, not a volume profile — a different statistic.")
+    c = safe_last(df["Close"])
+    return _sr(head,
+               [("Last price", fmt(c)), ("Point of control", fmt(safe_last(df["vp_poc"]))),
+                ("Value area high", fmt(safe_last(df["vp_vah"]))),
+                ("Value area low", fmt(safe_last(df["vp_val"]))),
+                ("Range", f"{int(_p(p, 'vp_lookback'))} candles")],
+               "Price must dip below the value-area low and close back inside it, green.",
+               "Price must poke above the value-area high and close back inside it, red.")
+
+
+# --------------------------------------------------------------------------- #
+# Order book depth (Dhan). Live only, and excluded from the optimiser.
+# --------------------------------------------------------------------------- #
+def dhan_depth(broker: dict, contract: dict) -> dict | None:
+    """
+    Top-of-book depth from DhanHQ v2 Market Quote.
+
+    Returns aggregate bid/ask quantities and the spread, or None when the call
+    is unavailable. Never raises into the live loop.
+    """
+    token = str(broker.get("access_token", "")).strip()
+    client = str(broker.get("client_id", "")).strip()
+    if not token or not client or not contract:
+        return None
+    import requests
+    seg, sec = contract["exchange_segment"], str(contract["security_id"])
+    try:
+        resp = requests.post(f"{DHAN_BASE}/marketfeed/quote",
+                             headers={"Content-Type": "application/json",
+                                      "Accept": "application/json",
+                                      "access-token": token, "client-id": client},
+                             data=json.dumps({seg: [int(sec)]}), timeout=10)
+        body = resp.json()
+    except Exception:                                               # noqa: BLE001
+        return None
+    if resp.status_code >= 400:
+        return None
+    try:
+        quote = body["data"][seg][sec]
+    except (KeyError, TypeError):
+        return None
+
+    depth = quote.get("depth") or {}
+    buys = depth.get("buy") or []
+    sells = depth.get("sell") or []
+    bid_qty = float(sum(float(lvl.get("quantity", 0) or 0) for lvl in buys))
+    ask_qty = float(sum(float(lvl.get("quantity", 0) or 0) for lvl in sells))
+    best_bid = float(buys[0].get("price", 0) or 0) if buys else 0.0
+    best_ask = float(sells[0].get("price", 0) or 0) if sells else 0.0
+    spread = (best_ask - best_bid) if (best_bid and best_ask) else float("nan")
+    return {"bid_qty": bid_qty, "ask_qty": ask_qty, "best_bid": best_bid,
+            "best_ask": best_ask, "spread": spread,
+            "imbalance": (bid_qty / ask_qty) if ask_qty else float("nan"),
+            "last_price": float(quote.get("last_price", 0) or 0)}
+
+
+def c_order_book(df, p):
+    """
+    Resting-depth imbalance.
+
+    LIVE ONLY. Depth is a snapshot with no history anywhere, so this profile
+    cannot be backtested and produces nothing in one. It is also excluded from
+    the optimiser for the same reason.
+    """
+    out = df.copy()
+    out["ema_fast"] = ema(out["Close"], int(_p(p, "ema_fast")))
+    out["ema_slow"] = ema(out["Close"], int(_p(p, "ema_slow")))
+    book = (st.session_state.get("order_book") if st is not None else None) or {}
+    out["ob_bid_qty"] = book.get("bid_qty", np.nan)
+    out["ob_ask_qty"] = book.get("ask_qty", np.nan)
+    out["ob_imbalance"] = book.get("imbalance", np.nan)
+    out["ob_spread"] = book.get("spread", np.nan)
+
+    long = pd.Series(False, index=out.index)
+    short = pd.Series(False, index=out.index)
+    ratio = book.get("imbalance")
+    bid_q, ask_q = book.get("bid_qty", 0.0), book.get("ask_qty", 0.0)
+    min_ratio = float(_p(p, "ob_min_ratio"))
+    min_qty = float(_p(p, "ob_min_qty"))
+    max_spread = float(_p(p, "ob_max_spread"))
+    spread = book.get("spread", float("nan"))
+    spread_ok = (not np.isfinite(spread)) or spread <= max_spread
+    if ratio is not None and np.isfinite(ratio) and len(out) >= 2 and spread_ok:
+        if ratio >= min_ratio and bid_q >= min_qty:
+            long.iloc[-2] = True
+        elif ratio <= (1.0 / min_ratio if min_ratio else 0) and ask_q >= min_qty:
+            short.iloc[-2] = True
+    return _finalise(out, long, short)
+
+
+def s_order_book(df, p):
+    book = (st.session_state.get("order_book") if st is not None else None) or {}
+    if not book:
+        head = ("No depth snapshot yet. This profile needs Dhan market data and a resolved "
+                "contract; it cannot be backtested because no source publishes a history of "
+                "the order book.")
+    else:
+        head = (f"Bid {fmt(book.get('bid_qty'), 0)} vs ask {fmt(book.get('ask_qty'), 0)} "
+                f"(ratio {fmt(book.get('imbalance'))}).")
+    return _sr(head,
+               [("Bid quantity", fmt(book.get("bid_qty"), 0)),
+                ("Ask quantity", fmt(book.get("ask_qty"), 0)),
+                ("Imbalance", fmt(book.get("imbalance"))),
+                ("Spread", fmt(book.get("spread"))),
+                ("Required ratio", fmt(_p(p, "ob_min_ratio")))],
+               f"Bid depth at least {fmt(_p(p, 'ob_min_ratio'))}x the ask, with at least "
+               f"{fmt(_p(p, 'ob_min_qty'), 0)} resting.",
+               f"Ask depth at least {fmt(_p(p, 'ob_min_ratio'))}x the bid, with at least "
+               f"{fmt(_p(p, 'ob_min_qty'), 0)} resting.")
+
+
 # ------------------------------------------ 44-48 Option profiles ------------
 # DIRECTION MAPPING: a LONG signal buys a CALL, a SHORT signal buys a PUT. The
 # engine and the Dhan router both follow that rule, and the leg is recorded on
@@ -2740,6 +2948,12 @@ _DEFS = [
     ("S48", "48 · Options: Gamma Blast (late-session)",
      "Late-session volatility expansion breaking the day's range.", 60,
      c_gamma_blast, s_gamma_blast, ("day_high", "day_low"), None, False),
+    ("S49", "49 · Volume Profile (fixed range)",
+     "Value-area edges from a rolling fixed-range volume profile.", 140,
+     c_volume_profile, s_volume_profile, ("vp_poc", "vp_vah", "vp_val"), None, False),
+    ("S50", "50 · Order Book Imbalance (Dhan depth)",
+     "Live-only. Resting bid vs ask depth, for spotting size in the book.", 30,
+     c_order_book, s_order_book, ("ema_fast", "ema_slow"), None, False),
     ("S33", "33 · Volume Spike + RSI", "Volume confirmation on an RSI crossing.", 60,
      c_vol_rsi, s_vol_rsi, (), "rsi", False),
 ]
@@ -3664,6 +3878,7 @@ _STATE_DEFAULTS = {
     "last_seen_ltp": None, "last_ltp_change_ts": 0.0, "pending_ticker": None,
     "last_closed_bar": None, "option_metrics": None, "live_last_signal_time": None,
     "live_first_cycle": False, "last_good_quote": None, "suspect_ticks": 0,
+    "order_book": None,
     "optimizer_results": None, "pattern_results": None, "pending_combo": None,
     "pattern_rows": None, "pattern_frames": None, "pattern_hits": None,
     "pattern_errors": None, "lab_results": None,
@@ -3773,6 +3988,11 @@ def refresh_candles(cfg: dict):
     extras = dict(cfg.get("filter_extras") or {})
     if cfg.get("filter_cfg", {}).get("vix", {}).get("enabled"):
         extras["vix"] = load_vix(freshness_seconds=60)
+    if str(cfg.get("strategy", "")).startswith("50 "):
+        broker = cfg.get("broker") or {}
+        if broker.get("contract"):
+            st.session_state.order_book = dhan_depth(broker, broker["contract"])
+
     frame, reports = prepare(bundle.frame, cfg["strategy"], cfg["params"],
                              cfg.get("filter_cfg"), extras)
     if len(frame) < 3:
@@ -4142,7 +4362,7 @@ def run_cycle(cfg: dict) -> None:
 
     first_cycle = bool(st.session_state.get("live_first_cycle"))
     st.session_state.live_first_cycle = False
-    join_window = int(cfg.get("join_window", 20) or 20)
+    join_window = int(cfg.get("join_window", 3) or 3)
 
     if direction == 0 and first_cycle and cfg.get("enter_on_start", True) \
             and snapshot.recent_signal != 0 and snapshot.recent_signal_bars_ago is not None \
@@ -4458,8 +4678,10 @@ def render_sidebar() -> dict:
              "reward is left rather than getting a fresh full-width target from a price that "
              "has already moved. If price has already hit those levels, nothing is entered.")
     join_window = sb.number_input(
-        "How many candles old a signal may be to join", 1, 100, 20, 1, disabled=live,
-        key="cfg_join_window") if enter_on_start else 20
+        "How many candles old a signal may be to join", 1, 100, 3, 1, disabled=live,
+        key="cfg_join_window",
+        help="Kept deliberately small and matched to the Screener's default window, so the two "
+             "tabs agree about what counts as a live signal.") if enter_on_start else 3
     entry_lookback = sb.number_input(
         "Live: act on a signal up to N candles old", min_value=0, max_value=20, value=0, step=1,
         disabled=live, key="cfg_entry_look",
@@ -4468,10 +4690,12 @@ def render_sidebar() -> dict:
              "reported a few candles ago — but the N+1 open has passed by then, so the fill is "
              "the current price and the trade row says so.")
     square_off_on_stop = sb.checkbox(
-        "Square off the open position when the engine stops", value=False, disabled=live,
+        "Square off the open position when the engine stops", value=True, disabled=live,
         key="cfg_sq_stop",
-        help="Off by default: stopping the engine leaves the position open. Be aware that "
-             "nothing is then watching its stop-loss.")
+        help="On by default: stopping closes the book, because once the engine is off nothing "
+             "is watching the stop-loss. Untick it only if you intend to manage the position "
+             "yourself. The Manual Square-Off button is separate — it closes the trade and "
+             "leaves the engine running.")
     allow_stale = sb.checkbox("Live: allow entries on a frozen feed", value=False,
                               disabled=live, key="cfg_stale",
                               help="Off by default. When the venue is closed the LTP is just an "
@@ -4585,6 +4809,33 @@ def render_sidebar() -> dict:
         else:
             sb.caption("OR fires on the first member to signal, so it inherits the false "
                        "positives of all of them.")
+
+    if strategy.startswith("49 "):
+        sb.subheader("Volume Profile")
+        params["vp_lookback"] = sb.number_input("Fixed range (candles)", 20, 1000, 120, 10,
+                                                disabled=live, key="cfg_vp_look")
+        params["vp_bins"] = sb.number_input("Price buckets", 6, 100, 24, 1, disabled=live,
+                                            key="cfg_vp_bins")
+        params["vp_value_area"] = sb.slider("Value area", 0.5, 0.95, 0.70, 0.05, disabled=live,
+                                            key="cfg_vp_va")
+        sb.caption("On a zero-volume feed (indices, spot FX) this becomes a TPO profile "
+                   "counting time at price, which is a different statistic.")
+
+    if strategy.startswith("50 "):
+        sb.subheader("Order Book Depth")
+        sb.warning("LIVE ONLY. Needs Dhan market data and a resolved contract. It cannot be "
+                   "backtested and is excluded from the optimiser, because no source publishes "
+                   "a history of the order book.")
+        params["ob_min_ratio"] = sb.number_input("Minimum bid:ask imbalance", 1.1, 50.0, 2.0,
+                                                 0.1, disabled=live, key="cfg_ob_ratio")
+        params["ob_min_qty"] = sb.number_input("Minimum resting quantity on the heavy side",
+                                               0.0, 1e9, 0.0, 100.0, disabled=live,
+                                               key="cfg_ob_qty")
+        params["ob_max_spread"] = sb.number_input("Maximum acceptable spread", 0.0, 1e9, 1e9,
+                                                  0.05, disabled=live, key="cfg_ob_spread")
+        sb.caption("Resting depth is not committed volume: large orders are routinely placed to "
+                   "be seen and pulled before they trade. Treat this as a hint, never as proof "
+                   "of a large buyer.")
 
     if strategy.startswith(("44 ", "45 ", "46 ")):
         sb.subheader("Option Chain Settings")
@@ -5501,6 +5752,49 @@ def engine_checks(cfg: dict, snapshot: LiveSnapshot) -> list[ConditionCheck]:
     return checks
 
 
+def next_candle_close(frame: pd.DataFrame, interval: str):
+    """When the candle currently forming will close, and how long that is."""
+    try:
+        last = pd.Timestamp(frame.index[-1])
+    except Exception:                                               # noqa: BLE001
+        return None, None
+    seconds = INTERVAL_SECONDS.get(interval)
+    if not seconds:
+        return None, None
+    closes_at = last + pd.Timedelta(seconds=seconds)
+    now = pd.Timestamp.now(tz=last.tz) if last.tz is not None else pd.Timestamp.now()
+    return closes_at, float((closes_at - now).total_seconds())
+
+
+def render_next_step(cfg: dict, snapshot: LiveSnapshot) -> None:
+    """
+    Answer the only question that matters when nothing has happened: what now?
+
+    An empty screen after pressing Start is indistinguishable from a broken app.
+    This states plainly that an entry needs a real signal, and when the next
+    chance to produce one arrives.
+    """
+    closes_at, remaining = next_candle_close(snapshot.frame, cfg["interval"])
+    when = ""
+    if closes_at is not None and remaining is not None:
+        mins, secs = divmod(max(int(remaining), 0), 60)
+        when = (f" The candle now forming closes at **{closes_at.strftime('%H:%M:%S')}** "
+                f"(~{mins}m {secs}s), and that is the next moment a signal can appear.")
+
+    if snapshot.last_closed_signal != 0:
+        st.success("**Next step:** a signal is present on the newest closed candle. The next "
+                   "tick will act on it unless a filter or the feed check blocks it.")
+    elif snapshot.recent_signal != 0 and snapshot.recent_signal_bars_ago:
+        side = "LONG" if snapshot.recent_signal > 0 else "SHORT"
+        st.info(f"**Next step:** the last {side} signal was "
+                f"{snapshot.recent_signal_bars_ago} candle(s) ago." + when)
+    else:
+        st.info("**Next step:** this profile has produced no signal on any recent closed "
+                "candle, so nothing will be entered." + when +
+                " A position is only ever opened from a real signal — that is the whole "
+                "difference between a strategy and Simple Buy/Sell, which enter on command.")
+
+
 def _need(value, target, direction_up: bool) -> str:
     """Human 'needs +X more' for a level that has to be crossed."""
     if value is None or target is None:
@@ -5697,6 +5991,7 @@ def render_condition_checklist(cfg: dict, snapshot: LiveSnapshot) -> None:
 
 def _searching_widget(cfg: dict, snapshot: LiveSnapshot) -> None:
     st.markdown("#### Signal Scanner")
+    render_next_step(cfg, snapshot)
     render_condition_checklist(cfg, snapshot)
     st.divider()
     blocked = [r for r in snapshot.filter_reports
@@ -8820,6 +9115,50 @@ def _test_screener_live_reconciliation():
     print(f"   screener window vs live join window reconcile (sample signal age {age})  OK")
 
 
+def _test_volume_profile_and_depth():
+    """Value areas must bracket the POC; depth profiles must stay silent offline."""
+    df = _synthetic(600, seed=11)
+    params = dict(DEFAULT_PARAMS)
+    params["intraday"] = True
+
+    poc, vah, val, volume_ok = volume_profile(df, 120, 24, 0.70)
+    assert volume_ok, "the synthetic sample has volume"
+    ok = pd.concat([poc, vah, val], axis=1).dropna()
+    assert len(ok) > 0, "the profile produced nothing"
+    assert (ok.iloc[:, 1] >= ok.iloc[:, 0]).all(), "value-area high below the POC"
+    assert (ok.iloc[:, 2] <= ok.iloc[:, 0]).all(), "value-area low above the POC"
+    lo, hi = float(df["Low"].min()), float(df["High"].max())
+    assert (ok.min().min() >= lo - 1e-6) and (ok.max().max() <= hi + 1e-6), \
+        "profile levels escaped the price range"
+
+    # Zero volume must degrade to a time-at-price profile, not divide by zero.
+    flat = df.copy()
+    flat["Volume"] = 0.0
+    poc0, vah0, val0, ok0 = volume_profile(flat, 120, 24, 0.70)
+    assert not ok0, "a zero-volume feed must report that it is not volume weighted"
+    assert poc0.notna().sum() > 0, "the TPO fallback must still produce levels"
+
+    # A wider value area can never be narrower than a tighter one.
+    _, vah90, val90, _ = volume_profile(df, 120, 24, 0.90)
+    wide = (vah90 - val90).dropna()
+    tight = (vah - val).dropna()
+    common = wide.index.intersection(tight.index)
+    assert (wide.loc[common] >= tight.loc[common] - 1e-9).all(), \
+        "a 90% value area must not be narrower than a 70% one"
+
+    frame, _ = prepare(df, "49 \u00b7 Volume Profile (fixed range)", params)
+    assert set(frame["signal"].unique()).issubset({-1, 0, 1})
+
+    # Depth is a live snapshot: with no book in session state there is no signal.
+    book, _ = prepare(df, "50 \u00b7 Order Book Imbalance (Dhan depth)", params)
+    assert int((book["signal"] != 0).sum()) == 0, \
+        "the depth profile must not signal without a live order book"
+    assert "50 \u00b7" in _OPTIMISER_EXCLUDE, "depth must be excluded from the optimiser"
+    for excluded in ("44 \u00b7", "45 \u00b7", "46 \u00b7"):
+        assert excluded in _OPTIMISER_EXCLUDE, f"{excluded} cannot be backtested either"
+    print("   volume profile value areas and live-only depth profile  OK")
+
+
 def _test_signal_detail():
     """
     The enriched signal columns must reconcile with each other exactly.
@@ -9086,6 +9425,7 @@ def run_selftest() -> int:
         _test_condition_checklist_and_scaling()
         _test_requirement_summary()
         _test_screener_live_reconciliation()
+        _test_volume_profile_and_depth()
         print("-- filters --")
         _test_filters()
         _test_new_filters()
@@ -9281,7 +9621,11 @@ def walk_forward(df: pd.DataFrame, strategy: str, params: dict, risk: RiskConfig
 # Excluded from the search: Simple Buy, Simple Sell and both threshold profiles.
 # They are execution helpers, not edges -- optimising them would just be fitting
 # noise to whichever direction the sample happened to drift.
-_OPTIMISER_EXCLUDE = ("16 \u00b7", "17 \u00b7", "28 \u00b7", "29 \u00b7")
+# Excluded because they cannot be backtested honestly: the immediate profiles
+# take no signal, the threshold profiles depend on a hand-typed level, and the
+# depth/OI profiles read a live snapshot with no published history.
+_OPTIMISER_EXCLUDE = ("16 \u00b7", "17 \u00b7", "28 \u00b7", "29 \u00b7", "44 \u00b7",
+                      "45 \u00b7", "46 \u00b7", "50 \u00b7")
 
 OPTIMISER_OBJECTIVES = ["Win rate (accuracy)", "Sharpe ratio", "Net PnL", "Expectancy per trade",
                         "Profit factor"]
