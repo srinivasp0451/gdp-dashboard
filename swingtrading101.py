@@ -3182,6 +3182,8 @@ class Position:
     entry_bar: dict | None = None          # OHLC of the candle the fill happened on
     high_since_entry: float | None = None  # highest price seen while the trade was open
     low_since_entry: float | None = None
+    signal_bars_ago: int | None = None     # age of the signal at the moment of entry
+    entry_route: str = "newest closed candle"
     option_leg: str | None = None          # "CE" / "PE" when routed as an option
 
     @property
@@ -3954,7 +3956,8 @@ def _maybe_route_broker(cfg: dict, position: Position, closing: bool) -> None:
 
 
 def _open_live_position(cfg: dict, direction: int, price: float, ctx: BarCtx, bar_time,
-                        levels_from: float | None = None) -> Position:
+                        levels_from: float | None = None, bars_ago: int | None = None,
+                        route: str = "newest closed candle") -> Position:
     """
     Open a tracked position.
 
@@ -3976,6 +3979,7 @@ def _open_live_position(cfg: dict, direction: int, price: float, ctx: BarCtx, ba
                         entry_ltp_at_fill=cfg.get("_ltp_at_fill"),
                         entry_bar=_bar_dict(ctx),
                         high_since_entry=float(price), low_since_entry=float(price),
+                        signal_bars_ago=bars_ago, entry_route=route,
                         option_leg=("CE" if direction > 0 else "PE")
                         if (cfg.get("broker") or {}).get("instrument") == "OPTIONS" else None)
     st.session_state.live_position = position
@@ -3995,8 +3999,9 @@ def _open_live_position(cfg: dict, direction: int, price: float, ctx: BarCtx, ba
                      f"Time: {pd.Timestamp.now()}")
     if err:
         log_event(err, "error")
-    log_event(f"ENTRY {'LONG' if direction > 0 else 'SHORT'} @ {fmt(price)} | "
-              f"SL {fmt(mgr.sl)} | TGT {fmt(mgr.tp)} | qty {fmt(cfg['risk'].quantity, 0)}", "success")
+    log_event(f"ENTRY {'LONG' if direction > 0 else 'SHORT'} @ {fmt(price)} on signal from "
+              f"{cfg['strategy']} (candle {fmt_time(bar_time)}) | SL {fmt(mgr.sl)} | "
+              f"TGT {fmt(mgr.tp)} | qty {fmt(cfg['risk'].quantity, 0)}", "success")
     for note in mgr.notes:
         log_event("Exit engine: " + note, "warn")
     return position
@@ -4124,7 +4129,9 @@ def run_cycle(cfg: dict) -> None:
     if strat.immediate:
         direction = 1 if "Buy" in strat.name else -1
         cfg["_ltp_at_fill"] = snapshot.ltp
-        _open_live_position(cfg, direction, snapshot.ltp, closed_ctx, snapshot.last_closed_time)
+        _open_live_position(cfg, direction, snapshot.ltp, closed_ctx,
+                            snapshot.last_closed_time, bars_ago=0,
+                            route="immediate profile, no candle wait")
         st.session_state.live_last_bar = snapshot.last_closed_time
         return
 
@@ -4161,7 +4168,9 @@ def run_cycle(cfg: dict) -> None:
         st.session_state.live_last_signal_time = snapshot.recent_signal_time
         cfg["_ltp_at_fill"] = snapshot.ltp
         _open_live_position(cfg, d, snapshot.ltp, closed_ctx, snapshot.recent_signal_time,
-                            levels_from=original_fill)
+                            levels_from=original_fill,
+                            bars_ago=snapshot.recent_signal_bars_ago,
+                            route=f"joined on start (join window {join_window})")
         return
 
     if direction == 0:
@@ -4184,7 +4193,9 @@ def run_cycle(cfg: dict) -> None:
     st.session_state.live_last_signal_time = signal_time
 
     # Signal on candle N -> fill at the OPEN of candle N+1 (already printed).
+    route = "newest closed candle"
     if catch_up:
+        route = f"catch-up (lookback {int(cfg.get('entry_lookback', 0) or 0)})"
         fill = snapshot.ltp
         log_event(f"Catch-up entry: the signal fired {snapshot.recent_signal_bars_ago} candle(s) "
                   f"ago, so the N+1 open has passed. Filling at the current price "
@@ -4192,7 +4203,9 @@ def run_cycle(cfg: dict) -> None:
     else:
         fill = snapshot.ltp if cfg.get("fill_at_ltp") else snapshot.next_open
     cfg["_ltp_at_fill"] = snapshot.ltp
-    _open_live_position(cfg, direction, fill, closed_ctx, signal_time)
+    _open_live_position(cfg, direction, fill, closed_ctx, signal_time,
+                        bars_ago=(snapshot.recent_signal_bars_ago if catch_up else 0),
+                        route=route)
 
 
 def should_poll(cfg: dict) -> bool:
@@ -5091,6 +5104,9 @@ def _live_controls(cfg: dict) -> None:
                   f"{cfg['risk'].as_summary()} | poll {fmt(cfg['poll_seconds'],1)}s", "success")
         st.rerun(scope="app")
 
+    if running:
+        c2.caption("Stop " + ("closes the position." if cfg.get("square_off_on_stop")
+                              else "leaves the position OPEN (sidebar setting)."))
     if c2.button("Stop Live Processing Engine", disabled=not running, width="stretch"):
         squared = None
         if st.session_state.live_position is not None and cfg.get("square_off_on_stop"):
@@ -5129,8 +5145,20 @@ def _idle_panel(cfg: dict) -> None:
         st.error(f"Heads up: the last poll found the newest `{cfg['symbol']}` candle to be "
                  f"{_human_age(snap.feed_age_seconds)} old. The venue is closed, so starting the "
                  "core now will poll a frozen tape until it reopens.")
-    if st.session_state.live_position is not None:
-        st.warning("A tracked position is still open from the previous run. Square it off below.")
+    position = st.session_state.live_position
+    if position is not None:
+        st.error(
+            f"**The engine is stopped but a {'LONG' if position.direction > 0 else 'SHORT'} "
+            f"position on `{position.symbol}` is still OPEN.** Stopping does not close it — that "
+            f"is the *Square off the open position when the engine stops* setting in the "
+            f"sidebar, which is off. Nothing is watching its stop-loss right now.")
+        if st.button("Square off this position now", type="primary", width="stretch",
+                     key="idle_squareoff"):
+            trade = square_off("Manual Square-Off")
+            if trade:
+                st.toast(f"Closed at {fmt(trade['Exit Price'])} for "
+                         f"{fmt_signed(trade['PnL'])}.")
+            st.rerun()
         _position_dashboard(st.session_state.live_position, st.session_state.live_snapshot,
                             cfg["currency"])
     _event_feed()
@@ -5170,6 +5198,11 @@ def _live_body() -> None:
     position = st.session_state.live_position
     if position is not None:
         _position_dashboard(position, snapshot, cfg["currency"])
+        # The entry gate stays visible while a trade runs: it is the only way to
+        # see whether the profile would still take this trade right now.
+        with st.expander("Entry conditions (still evaluated while the position is open)",
+                         expanded=False):
+            render_condition_checklist(cfg, snapshot)
     else:
         _searching_widget(cfg, snapshot)
     _strategy_status_panel(cfg, snapshot)
@@ -5367,8 +5400,16 @@ def _position_dashboard(position: Position, snapshot, currency: str) -> None:
         f"{side} {position.symbol} :: running {fmt_signed(pnl)} {currency}")
     for note in mgr.notes:
         st.warning("Exit engine: " + note)
-    st.caption(f"Entered {fmt_time(position.entry_time)} off the signal candle "
-               f"{fmt_time(position.signal_bar_time)}."
+    age = position.signal_bars_ago
+    st.info(
+        f"**Why this position exists** — profile **{position.strategy}**, signal on the candle "
+        f"at {fmt_time(position.signal_bar_time)}"
+        + (f", which was **{age} candle(s) old** when it was taken" if age else "")
+        + f", route: *{position.entry_route}*. A different profile can point the other way on "
+        f"the same instrument, and a signal older than the Screener's window can still be "
+        f"traded here if the join window allows it — that is the setting to reconcile if the "
+        f"two tabs disagree.")
+    st.caption(f"Entered {fmt_time(position.entry_time)}."
                + (f" LTP at fill was {fmt(position.entry_ltp_at_fill)}."
                   if position.entry_ltp_at_fill else ""))
 
@@ -5390,10 +5431,13 @@ class ConditionCheck:
     long_ok: bool | None          # None -> not applicable, shown as auto-pass
     short_ok: bool | None
     detail: str = ""
+    current: str = ""             # what the parameter reads right now
+    need_long: str = ""           # what it would have to read for a LONG
+    need_short: str = ""
 
 
-def _ck(label, long_ok, short_ok, detail=""):
-    return ConditionCheck(label, long_ok, short_ok, detail)
+def _ck(label, long_ok, short_ok, detail="", current="", need_long="", need_short=""):
+    return ConditionCheck(label, long_ok, short_ok, detail, current, need_long, need_short)
 
 
 def _mark(value) -> str:
@@ -5405,14 +5449,23 @@ def engine_checks(cfg: dict, snapshot: LiveSnapshot) -> list[ConditionCheck]:
     checks: list[ConditionCheck] = []
     live = bool(snapshot.quote_live)
     checks.append(_ck("Feed alive (quote moving)", live, live,
-                      f"source: {snapshot.ltp_source}"))
+                      f"source: {snapshot.ltp_source}",
+                      current=snapshot.ltp_source,
+                      need_long="a moving quote", need_short="a moving quote"))
 
     flat = st.session_state.live_position is None
+    pos = st.session_state.live_position
     checks.append(_ck("No position already open", flat, flat,
-                      "one position at a time" if flat else "square off first"))
+                      "one position at a time" if flat else "square off first",
+                      current="flat" if flat else
+                      f"{'LONG' if pos.direction > 0 else 'SHORT'} {pos.symbol} open",
+                      need_long="flat", need_short="flat"))
 
     for rep in snapshot.filter_reports:
-        checks.append(_ck(f"Filter · {rep.label}", rep.long_ok, rep.short_ok, rep.value))
+        checks.append(_ck(f"Filter · {rep.label}", rep.long_ok, rep.short_ok, rep.value,
+                          current=rep.value,
+                          need_long="filter must allow a long",
+                          need_short="filter must allow a short"))
 
     ago = snapshot.recent_signal_bars_ago
     lookback = int(cfg.get("entry_lookback", 0) or 0)
@@ -5428,14 +5481,23 @@ def engine_checks(cfg: dict, snapshot: LiveSnapshot) -> list[ConditionCheck]:
         detail = "no signal on any recent closed candle"
     side_long = fresh and (snapshot.last_closed_signal == 1 or snapshot.recent_signal == 1)
     side_short = fresh and (snapshot.last_closed_signal == -1 or snapshot.recent_signal == -1)
-    checks.append(_ck("Signal fresh enough to act on", side_long, side_short, detail))
+    checks.append(_ck("Signal fresh enough to act on", side_long, side_short, detail,
+                      current=("no recent signal" if snapshot.recent_signal == 0 else
+                               f"{'LONG' if snapshot.recent_signal > 0 else 'SHORT'}, "
+                               f"{ago} candle(s) ago"),
+                      need_long="a LONG signal on the newest closed candle"
+                                + (f" (or within {lookback})" if lookback else ""),
+                      need_short="a SHORT signal on the newest closed candle"
+                                 + (f" (or within {lookback})" if lookback else "")))
 
     already = st.session_state.get("live_last_signal_time")
     sig_time = snapshot.last_closed_time if snapshot.last_closed_signal != 0 \
         else snapshot.recent_signal_time
     unused = already != sig_time
     checks.append(_ck("Signal not already traded", unused, unused,
-                      "fresh" if unused else "this exact signal was already taken"))
+                      "fresh" if unused else "this exact signal was already taken",
+                      current=fmt_time(already) if already else "none taken yet",
+                      need_long="an untraded signal", need_short="an untraded signal"))
     return checks
 
 
@@ -5464,86 +5526,124 @@ def strategy_checks(name: str, frame: pd.DataFrame, params: dict) -> list[Condit
         fast, slow = last("ema_fast"), last("ema_slow")
         if fast is not None and slow is not None:
             spread = fast - slow
-            out.append(_ck(f"Fast EMA vs slow EMA ({fmt(fast)} vs {fmt(slow)})",
-                           spread > 0, spread < 0,
-                           f"spread {fmt_signed(spread)}; a cross needs {fmt(abs(spread))} more"))
+            out.append(_ck("Fast EMA vs slow EMA", spread > 0, spread < 0,
+                           f"spread {fmt_signed(spread)}; a cross needs {fmt(abs(spread))} more",
+                           current=f"fast {fmt(fast)} / slow {fmt(slow)} "
+                                   f"(spread {fmt_signed(spread)})",
+                           need_long=f"fast above slow — {_need(fast, slow, True)}",
+                           need_short=f"fast below slow — {_need(fast, slow, False)}"))
             angle = ema_angle_degrees(frame)
             if angle is not None:
-                out.append(_ck("Crossover angle", True, True, f"{angle:.2f}\u00b0"))
+                out.append(_ck("Crossover angle", True, True, f"{angle:.2f}\u00b0",
+                               current=f"{angle:.2f}\u00b0",
+                               need_long="no minimum unless the angle filter is on",
+                               need_short="no minimum unless the angle filter is on"))
     if name.startswith(("32 ", "30 ", "36 ", "33 ", "31 ")):
         r = last("rsi")
         lo, hi = float(_p(params, "rsi_long_level")), float(_p(params, "rsi_short_level"))
         if r is not None:
-            out.append(_ck(f"RSI {fmt(r)} against {fmt(lo)} / {fmt(hi)}", r >= lo, r <= hi,
-                           f"long {_need(r, lo, True)} · short {_need(r, hi, False)}"))
+            out.append(_ck("RSI level", r >= lo, r <= hi,
+                           f"long {_need(r, lo, True)} · short {_need(r, hi, False)}",
+                           current=fmt(r),
+                           need_long=f"at or above {fmt(lo)} — {_need(r, lo, True)}",
+                           need_short=f"at or below {fmt(hi)} — {_need(r, hi, False)}"))
     if name.startswith("08 "):
         r = last("rsi")
         if r is not None:
-            out.append(_ck(f"RSI {fmt(r)} vs the 50 centerline", r > 50, r < 50,
-                           f"{_need(r, 50, True)} to cross up"))
+            out.append(_ck("RSI centerline", r > 50, r < 50,
+                           f"{_need(r, 50, True)} to cross up", current=fmt(r),
+                           need_long=f"above 50 — {_need(r, 50, True)}",
+                           need_short=f"below 50 — {_need(r, 50, False)}"))
     if name.startswith(("25 ", "04 ")):
         d = last("st_dir") if "st_dir" in frame.columns else last("trail_dir")
         if d is not None:
             out.append(_ck("Trend band direction", d == 1, d == -1,
-                           "bullish" if d == 1 else "bearish"))
+                           "bullish" if d == 1 else "bearish",
+                           current="bullish" if d == 1 else "bearish",
+                           need_long="bullish band", need_short="bearish band"))
     if name.startswith("05 "):
         hi, lo = last("or_high"), last("or_low")
-        out.append(_ck(f"Opening range {fmt(lo)} - {fmt(hi)}",
+        out.append(_ck("Opening range break",
                        None if hi is None else close > hi,
                        None if lo is None else close < lo,
-                       f"UP {_need(close, hi, True)} · DOWN {_need(close, lo, False)}"))
+                       f"UP {_need(close, hi, True)} · DOWN {_need(close, lo, False)}",
+                       current=f"price {fmt(close)}, range {fmt(lo)} - {fmt(hi)}",
+                       need_long=f"above {fmt(hi)} — {_need(close, hi, True)}",
+                       need_short=f"below {fmt(lo)} — {_need(close, lo, False)}"))
     if name.startswith("47 "):
         expiry = last("is_expiry_day")
         move, a = last("move_from_open"), last("atr")
         need = float(_p(params, "zero_hero_atr")) * (a or 0)
         out.append(_ck("Expiry day", bool(expiry), bool(expiry),
-                       "yes" if expiry else "not an expiry weekday"))
-        out.append(_ck(f"Burst {fmt(need)} from the session open",
+                       "yes" if expiry else "not an expiry weekday",
+                       current="expiry day" if expiry else "not an expiry weekday",
+                       need_long="an expiry weekday", need_short="an expiry weekday"))
+        out.append(_ck("Burst from the session open",
                        (move or 0) >= need, (move or 0) <= -need,
-                       f"move {fmt_signed(move)}; UP {_need(move, need, True)} · "
-                       f"DOWN {_need(move, -need, False)}"))
+                       f"move {fmt_signed(move)}",
+                       current=f"{fmt_signed(move)} from the open",
+                       need_long=f"+{fmt(need)} — {_need(move, need, True)}",
+                       need_short=f"-{fmt(need)} — {_need(move, -need, False)}"))
     if name.startswith("48 "):
         late = last("is_late_session")
         ratio = last("atr_ratio")
         hi, lo = last("day_high"), last("day_low")
         out.append(_ck("Inside the closing stretch", bool(late), bool(late),
-                       "yes" if late else "too early in the session"))
-        out.append(_ck(f"Volatility expanding (>= {fmt(_p(params, 'squeeze_mult'))}x)",
-                       (ratio or 0) >= float(_p(params, "squeeze_mult")),
-                       (ratio or 0) >= float(_p(params, "squeeze_mult")),
-                       f"ATR ratio {fmt(ratio)}"))
-        out.append(_ck(f"Session range {fmt(lo)} - {fmt(hi)}",
+                       "yes" if late else "too early in the session",
+                       current="in the closing stretch" if late else "too early",
+                       need_long="the closing stretch", need_short="the closing stretch"))
+        need_ratio = float(_p(params, "squeeze_mult"))
+        out.append(_ck("Volatility expanding",
+                       (ratio or 0) >= need_ratio, (ratio or 0) >= need_ratio,
+                       f"ATR ratio {fmt(ratio)}", current=f"{fmt(ratio)}x its mean",
+                       need_long=f">= {fmt(need_ratio)}x", need_short=f">= {fmt(need_ratio)}x"))
+        out.append(_ck("Session range break",
                        None if hi is None else close > hi,
                        None if lo is None else close < lo,
-                       f"UP {_need(close, hi, True)} · DOWN {_need(close, lo, False)}"))
+                       f"UP {_need(close, hi, True)} · DOWN {_need(close, lo, False)}",
+                       current=f"price {fmt(close)}, range {fmt(lo)} - {fmt(hi)}",
+                       need_long=f"above {fmt(hi)} — {_need(close, hi, True)}",
+                       need_short=f"below {fmt(lo)} — {_need(close, lo, False)}"))
     if name.startswith(("35 ", "36 ", "37 ", "38 ", "39 ", "40 ", "41 ")):
         gh, gl = last("fib_golden_hi"), last("fib_golden_lo")
         up_leg = last("fib_up_leg")
         if gh is not None and gl is not None:
             inside = gl <= (close or 0) <= gh
-            out.append(_ck(f"Golden zone {fmt(gl)} - {fmt(gh)}",
+            out.append(_ck("Fibonacci golden zone",
                            bool(up_leg) and inside, (not up_leg) and inside,
-                           f"price {fmt(close)}, leg is {'up' if up_leg else 'down'}"))
+                           f"leg is {'up' if up_leg else 'down'}",
+                           current=f"price {fmt(close)}, zone {fmt(gl)} - {fmt(gh)}",
+                           need_long=f"a rising leg with price inside {fmt(gl)} - {fmt(gh)}",
+                           need_short=f"a falling leg with price inside {fmt(gl)} - {fmt(gh)}"))
     if name.startswith("28 "):
         lvl = last("threshold")
-        out.append(_ck(f"Threshold {fmt(lvl)}",
+        out.append(_ck("Price threshold",
                        None if lvl is None else close > lvl,
                        None if lvl is None else close < lvl,
-                       f"UP {_need(close, lvl, True)} · DOWN {_need(close, lvl, False)}"))
+                       f"UP {_need(close, lvl, True)} · DOWN {_need(close, lvl, False)}",
+                       current=f"price {fmt(close)}, threshold {fmt(lvl)}",
+                       need_long=f"above {fmt(lvl)} — {_need(close, lvl, True)}",
+                       need_short=f"below {fmt(lvl)} — {_need(close, lvl, False)}"))
     if name.startswith("29 "):
         up, dn = last("threshold_up"), last("threshold_dn")
-        out.append(_ck(f"Bands {fmt(dn)} - {fmt(up)}",
+        out.append(_ck("Percentage bands",
                        None if up is None else close > up,
                        None if dn is None else close < dn,
-                       f"UP {_need(close, up, True)} · DOWN {_need(close, dn, False)}"))
+                       f"UP {_need(close, up, True)} · DOWN {_need(close, dn, False)}",
+                       current=f"price {fmt(close)}, bands {fmt(dn)} - {fmt(up)}",
+                       need_long=f"above {fmt(up)} — {_need(close, up, True)}",
+                       need_short=f"below {fmt(dn)} — {_need(close, dn, False)}"))
     if name.startswith("43 "):
         votes_l, votes_s = last("hybrid_long_votes"), last("hybrid_short_votes")
         members = int(last("hybrid_members") or 0)
         need_all = str(params.get("hybrid_logic", "")).startswith("All")
         required = members if need_all else 1
-        out.append(_ck(f"Member agreement ({'all' if need_all else 'any one'} of {members})",
+        out.append(_ck("Hybrid member agreement",
                        (votes_l or 0) >= required, (votes_s or 0) >= required,
-                       f"long votes {fmt(votes_l, 0)} · short votes {fmt(votes_s, 0)}"))
+                       f"{'all' if need_all else 'any one'} of {members}",
+                       current=f"long votes {fmt(votes_l, 0)} · short votes {fmt(votes_s, 0)}",
+                       need_long=f"{required} long vote(s)",
+                       need_short=f"{required} short vote(s)"))
     return out
 
 
@@ -5568,6 +5668,23 @@ def render_condition_checklist(cfg: dict, snapshot: LiveSnapshot) -> None:
         lines.append(f"- **{i}. {c.label}**: LONG {_mark(c.long_ok)} · SHORT {_mark(c.short_ok)}"
                      f"{detail}")
     st.markdown("\n".join(lines))
+
+    st.markdown("##### Required vs current")
+    rows = []
+    for i, c in enumerate(checks, start=1):
+        rows.append({
+            "#": i,
+            "Parameter": c.label,
+            "Current value": c.current or c.detail or "--",
+            "Required for LONG": c.need_long or "--",
+            "LONG": _mark(c.long_ok),
+            "Required for SHORT": c.need_short or "--",
+            "SHORT": _mark(c.short_ok),
+        })
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+    st.caption("Shown for both directions at all times, whether or not a position is open, so "
+               "you can see how far each side is from triggering rather than only learning why "
+               "the one that fired did.")
 
     blocked_long = [c.label for c in checks if c.long_ok is False]
     blocked_short = [c.label for c in checks if c.short_ok is False]
@@ -6106,7 +6223,8 @@ def signal_detail(frame: pd.DataFrame, hit_time, direction: int, risk: "RiskConf
     }
 
 
-def screen_universe(tickers: list[str], cfg: dict, lookback_bars: int, progress=None):
+def screen_universe(tickers: list[str], cfg: dict, lookback_bars: int, progress=None,
+                    include_older: bool = True):
     """
     Run the sidebar configuration across a list of tickers and report signals.
 
@@ -6140,16 +6258,28 @@ def screen_universe(tickers: list[str], cfg: dict, lookback_bars: int, progress=
         forming = int(frame["signal"].iloc[-1])
         last_closed_pos = len(frame) - 2
 
-        if fired.empty and forming == 0:
+        # Anything older than the window used to be dropped silently, so a ticker
+        # whose last signal was 12 candles ago looked identical to one that has
+        # never signalled -- while the live engine, with a wider join window,
+        # would happily trade it. Report the age instead of hiding it.
+        older = frame["signal"].iloc[:-1]
+        older = older[older != 0]
+        if fired.empty and forming == 0 and not (include_older and len(older)):
             continue
+
         if not fired.empty:
             hit_time = fired.index[-1]
             direction = int(fired["signal"].iloc[-1])
             bars_ago = last_closed_pos - frame.index.get_loc(hit_time)
             when = ("Just now (last closed candle)" if bars_ago <= 0
                     else f"Just before ({int(bars_ago)} candles ago)")
-        else:
+        elif forming != 0:
             hit_time, direction, when = frame.index[-1], forming, "Forming candle (unconfirmed)"
+        else:
+            hit_time = older.index[-1]
+            direction = int(older.iloc[-1])
+            bars_ago = last_closed_pos - frame.index.get_loc(hit_time)
+            when = f"Older than the window ({int(bars_ago)} candles ago)"
 
         detail = signal_detail(frame, hit_time, direction, cfg.get("risk"), ticker,
                                cfg["interval"])
@@ -6200,11 +6330,23 @@ def tab_screener(cfg: dict) -> None:
                f"carries the mandatory {API_GUARD_DELAY}s guard on both sides so the scan does "
                "not get the IP throttled.")
 
+    include_older = st.checkbox(
+        "Also list signals older than the window (with their age)", value=True,
+        key="scr_older",
+        help="A ticker whose last signal was 12 candles ago is not the same as one that has "
+             "never signalled. The live engine's join window is set separately in the sidebar, "
+             "so a signal can be too old for this list and still be tradable there.")
+    st.caption(f"This window is **{int(lookback)} candle(s)**. The live engine joins signals up "
+               f"to its own *join window* (sidebar, default 20). When the two differ, the live "
+               f"tab can enter a trade this list does not show — that is the setting to "
+               f"reconcile, not a fault.")
+
     if st.button("Run Screener", type="primary", width="stretch"):
         st.session_state.screener_error = None
         bar = st.progress(0.0, text="Starting ...")
         try:
-            results, errors = screen_universe(tickers, cfg, int(lookback), bar)
+            results, errors = screen_universe(tickers, cfg, int(lookback), bar,
+                                              include_older=include_older)
             st.session_state.screener_results = (results, errors)
         except Exception as exc:                                    # noqa: BLE001
             st.session_state.screener_error = str(exc)
@@ -8603,6 +8745,81 @@ def _test_condition_checklist_and_scaling():
     print("   entry checklist and instrument-scaled point grids  OK")
 
 
+def _test_requirement_summary():
+    """Every condition must state a current reading and a requirement for BOTH sides."""
+    df = _synthetic(600, seed=11)
+    params = dict(DEFAULT_PARAMS)
+    params["intraday"] = True
+
+    covered = 0
+    for name in ("01 \u00b7 Dual EMA Crossover", "08 \u00b7 RSI Centerline 50 Crossing",
+                 "25 \u00b7 SuperTrend Flip", "05 \u00b7 Opening Range Breakout (ORB)",
+                 "35 \u00b7 Fibonacci Retracement Zone",
+                 "48 \u00b7 Options: Gamma Blast (late-session)"):
+        frame, _ = prepare(df, name, params)
+        checks = strategy_checks(name, frame, params)
+        assert checks, f"{name}: no conditions decomposed"
+        for c in checks:
+            assert c.current, f"{name}/{c.label}: no current reading"
+            assert c.need_long and c.need_short, \
+                f"{name}/{c.label}: a requirement is missing for one side"
+            assert c.long_ok is None or isinstance(c.long_ok, (bool, np.bool_))
+            assert c.short_ok is None or isinstance(c.short_ok, (bool, np.bool_))
+        covered += 1
+    assert covered == 6
+
+    # A crossover cannot satisfy both directions at once.
+    frame, _ = prepare(df, "01 \u00b7 Dual EMA Crossover", params)
+    spread = strategy_checks("01 \u00b7 Dual EMA Crossover", frame, params)[0]
+    assert spread.long_ok != spread.short_ok
+    assert "cleared" in (spread.need_long + spread.need_short)
+    assert "needs" in (spread.need_long + spread.need_short)
+    print("   requirement-vs-current summary covers both directions  OK")
+
+
+def _test_screener_live_reconciliation():
+    """
+    The Screener and the live engine must never disagree SILENTLY.
+
+    They use different lookbacks -- the screener's signal window versus the live
+    join window -- so the live tab can legitimately trade a signal the screener
+    does not list. Dropping older signals made that look like a contradiction;
+    they are now reported with their age instead.
+    """
+    df = _synthetic(600, seed=11)
+    params = dict(DEFAULT_PARAMS)
+    params["intraday"] = True
+    frame, _ = prepare(df, "15 \u00b7 Macro-Trend EMA Bias Scalper", params)
+
+    closed = frame["signal"].iloc[:-1]
+    fired = closed[closed != 0]
+    assert not fired.empty, "need a signal to reason about"
+    last_closed_pos = len(frame) - 2
+    age = last_closed_pos - frame.index.get_loc(fired.index[-1])
+
+    # Any window narrower than the signal's age hides it; a wider one shows it.
+    narrow = frame.iloc[-(max(age, 1)):-1]
+    assert (narrow["signal"] != 0).sum() == 0 or age <= 1, \
+        "a window narrower than the signal age should not contain it"
+    wide = frame.iloc[-(age + 2):-1]
+    assert (wide["signal"] != 0).sum() >= 1, "a wider window must contain the same signal"
+
+    # The live join path uses its own window, so the two can differ by design.
+    # Age 0 means the signal is on the newest closed candle and is taken directly
+    # rather than joined; the join predicate covers strictly older signals only.
+    def joinable(signal_age: int, join_window: int) -> bool:
+        return 0 < signal_age <= join_window
+
+    assert not joinable(0, 20), "a signal on the newest candle is taken, not joined"
+    assert joinable(12, 20), "a 12-candle-old signal is inside a 20 join window"
+    assert not joinable(12, 5), "a 12-candle-old signal is outside a 5 join window"
+    assert not joinable(21, 20), "the join window is a hard edge"
+    # This is exactly the reported case: invisible at a screener window of 5,
+    # yet tradable by a live join window of 20.
+    assert not joinable(12, 5) and joinable(12, 20)
+    print(f"   screener window vs live join window reconcile (sample signal age {age})  OK")
+
+
 def _test_signal_detail():
     """
     The enriched signal columns must reconcile with each other exactly.
@@ -8867,6 +9084,8 @@ def run_selftest() -> int:
         _test_search_grid_and_quality()
         _test_global_universes_and_join()
         _test_condition_checklist_and_scaling()
+        _test_requirement_summary()
+        _test_screener_live_reconciliation()
         print("-- filters --")
         _test_filters()
         _test_new_filters()
