@@ -3970,6 +3970,8 @@ class LiveSnapshot:
     feed_age_seconds: float = 0.0
     stale: bool = False                     # candles are lagging (signals may be old)
     quote_live: bool = True                 # the PRICE is moving (the venue is open)
+    closed_index: int = -2                  # position of the last FULLY CLOSED candle
+    last_is_forming: bool = True            # is the newest row still being built?
     recent_signal: int = 0                  # most recent signal on ANY closed candle
     recent_signal_time: Any = None
     recent_signal_bars_ago: int | None = None
@@ -4046,11 +4048,25 @@ def fetch_live_ltp(cfg: dict, frame: pd.DataFrame) -> tuple[float, str]:
 def build_snapshot(cfg: dict, frame: pd.DataFrame, reports, warnings, vix,
                    ltp: float, ltp_source: str) -> LiveSnapshot:
     strat = get_strategy(cfg["strategy"])
-    closed = -2                                     # last FULLY CLOSED candle
     last_ts = pd.Timestamp(frame.index[-1])
     now = pd.Timestamp.now(tz=last_ts.tz) if last_ts.tz is not None else pd.Timestamp.now()
     age = float((now - last_ts).total_seconds())
     bar_seconds = INTERVAL_SECONDS.get(cfg["interval"], 300)
+
+    # Is the newest row still being built, or did it finish long ago?
+    #
+    # Assuming the last row is always the forming candle is wrong the moment the
+    # feed lags. On a delayed feed a "5m" candle can be hours old, in which case
+    # it is FINISHED, and treating it as unfinished throws away a real closed
+    # candle's signal and leaves the engine permanently one candle behind.
+    last_is_forming = age < bar_seconds
+    closed = -2 if last_is_forming else -1
+    closed_pos = len(frame) + closed
+
+    # There is only a "next candle open" while a next candle actually exists. If
+    # the newest row has already closed, no later candle has opened yet, and any
+    # number printed here would be the open of a candle that finished hours ago.
+    next_open = float(frame["Open"].iloc[-1]) if last_is_forming else float("nan")
     # Candles lagging by more than three bars. On a delayed feed this is routine
     # DURING market hours, so on its own it proves nothing about the venue.
     stale = age > max(3 * bar_seconds, 120)
@@ -4079,23 +4095,24 @@ def build_snapshot(cfg: dict, frame: pd.DataFrame, reports, warnings, vix,
     # panel must be able to talk about the same thing. Without this the engine
     # can only ever see the newest closed bar, and a signal that fired two bars
     # ago looks like nothing happened at all.
-    closed_sig = frame["signal"].iloc[:-1]
+    closed_sig = frame["signal"].iloc[:closed_pos + 1]
     recent = closed_sig[closed_sig != 0]
     r_sig, r_time, r_ago = 0, None, None
     if len(recent):
         r_time = recent.index[-1]
         r_sig = int(recent.iloc[-1])
-        r_ago = int(len(frame) - 2 - frame.index.get_loc(r_time))
+        r_ago = int(closed_pos - frame.index.get_loc(r_time))
 
     return LiveSnapshot(
-        frame=frame, ltp=ltp, next_open=float(frame["Open"].iloc[-1]),
+        frame=frame, ltp=ltp, next_open=next_open,
         last_closed_time=frame.index[closed],
         last_closed_signal=int(frame["signal"].iloc[closed]),
         raw_signal=int(frame["raw_signal"].iloc[closed]),
-        status=strat.status(frame.iloc[:len(frame) + closed + 1], cfg["params"]),
+        status=strat.status(frame.iloc[:closed_pos + 1], cfg["params"]),
         filter_reports=reports, fetched_at=pd.Timestamp.now(), bars=len(frame),
         data_warnings=warnings, vix=vix, feed_age_seconds=age, stale=stale,
         quote_live=quote_live, ltp_source=ltp_source,
+        closed_index=closed, last_is_forming=last_is_forming,
         recent_signal=r_sig, recent_signal_time=r_time, recent_signal_bars_ago=r_ago)
 
 
@@ -4203,6 +4220,8 @@ def _live_fill_price(cfg: dict, snapshot: LiveSnapshot, ctx: BarCtx) -> float:
     if not cfg.get("prefer_candle_open"):
         return ltp
 
+    if not snapshot.last_is_forming:
+        return ltp                      # no candle is open; there is no open to use
     open_px = float(snapshot.next_open)
     if not np.isfinite(open_px) or open_px <= 0:
         return ltp
@@ -4333,7 +4352,7 @@ def run_cycle(cfg: dict) -> None:
                   f"moves the quoted price for reasons that have nothing to do with the market.",
                   "warn")
 
-    closed_ctx = bar_ctx(frame, len(frame) - 2)
+    closed_ctx = bar_ctx(frame, len(frame) + snapshot.closed_index)
     st.session_state.last_closed_bar = _bar_dict(closed_ctx)
 
     # A single bad print can hit a stop that the market never reached. A move of
@@ -5624,10 +5643,16 @@ def _heartbeat(cfg: dict, snapshot: LiveSnapshot) -> None:
 
     c = st.columns(6)
     c[0].metric("LTP", fmt(snapshot.ltp), help="Close of the most recent candle on the feed.")
-    c[1].metric("N+1 Open", fmt(snapshot.next_open),
-                fmt_signed(snapshot.ltp - snapshot.next_open),
-                help="Open of the candle after the signal candle: the backtest-consistent "
-                     "fill price. The delta is LTP minus that open.")
+    if snapshot.last_is_forming and np.isfinite(snapshot.next_open):
+        c[1].metric("Forming candle open", fmt(snapshot.next_open),
+                    fmt_signed(snapshot.ltp - snapshot.next_open),
+                    help="The open of the candle currently being built — already printed, not "
+                         "a forecast. Shown for reference only; live fills use the LTP, because "
+                         "that open has already happened and cannot be traded.")
+    else:
+        c[1].metric("Forming candle open", "--",
+                    help="The newest candle has already closed, so no later candle has opened "
+                         "yet. There is nothing to show, and nothing is guessed.")
     c[2].metric("Last Candle", pd.Timestamp(snapshot.last_closed_time).strftime("%d %b %H:%M"),
                 help=fmt_time(snapshot.last_closed_time))
     c[3].metric("Candle Age", _human_age(snapshot.feed_age_seconds),
@@ -9224,9 +9249,10 @@ def _test_no_phantom_entry_pnl():
     the candle opened.
     """
     class Snap:
-        def __init__(self, ltp, open_px):
+        def __init__(self, ltp, open_px, forming=True):
             self.ltp = ltp
             self.next_open = open_px
+            self.last_is_forming = forming
 
     ctx = _ctx(close=20000.0, atr=20.0)
 
@@ -9242,12 +9268,52 @@ def _test_no_phantom_entry_pnl():
     near = Snap(20000.50, 20000.00)
     assert _live_fill_price({"prefer_candle_open": True}, near, ctx) == near.next_open
 
+    # No candle is currently forming, so there is no open to fill against and
+    # none may be invented from a candle that finished earlier.
+    finished = Snap(20000.50, 20000.00, forming=False)
+    assert _live_fill_price({"prefer_candle_open": True}, finished, ctx) == finished.ltp
+
     # Whatever the fill, PnL at that price is zero by construction.
     for entry in (20013.52, 19828.68, 20000.0):
         risk = RiskConfig("Fixed Points", 100.0, "Fixed Points", 200.0, 1.0)
         mgr = ExitManager(risk, entry, 1, ctx)
         assert mgr.pnl(entry) == 0.0, "a position cannot open in profit"
     print("   live fills use an obtainable price; no phantom entry PnL  OK")
+
+
+def _test_forming_candle_detection():
+    """
+    The newest row is only "still forming" if its interval has not elapsed.
+
+    Assuming otherwise is wrong the moment the feed lags: a "5m" candle that is
+    hours old has FINISHED, and treating it as unfinished ignores a real closed
+    candle's signal and leaves the engine permanently one candle behind. It also
+    made the panel display an "N+1 open" belonging to a candle that closed long
+    ago, which reads as a forecast of a price nobody can know.
+    """
+    def resolve(age_seconds, bar_seconds):
+        forming = age_seconds < bar_seconds
+        return forming, (-2 if forming else -1)
+
+    assert resolve(60, 300) == (True, -2), "a 1-minute-old 5m candle is still forming"
+    assert resolve(299, 300)[0] is True, "just inside the interval, still forming"
+    assert resolve(300, 300) == (False, -1), "at the interval boundary it has closed"
+    assert resolve(6480, 300) == (False, -1), "a 1.8h-old 5m candle finished long ago"
+    assert resolve(3600, 86400) == (True, -2), "an hour into a daily candle, still forming"
+
+    # A finished newest row must not contribute a "next open": no later candle
+    # has opened, so there is nothing to report and nothing may be invented.
+    for age, bar, expect_open in ((60, 300, True), (6480, 300, False)):
+        forming, _ = resolve(age, bar)
+        assert forming == expect_open
+
+    # And the signal index must follow, so the newest closed candle is the one
+    # actually used rather than the one before it.
+    n = 100
+    for age, bar, expected_pos in ((60, 300, n - 2), (6480, 300, n - 1)):
+        forming, closed = resolve(age, bar)
+        assert n + closed == expected_pos, f"closed position wrong for age {age}"
+    print("   forming-candle detection on live and lagging feeds  OK")
 
 
 def _test_signal_detail():
@@ -9518,6 +9584,7 @@ def run_selftest() -> int:
         _test_screener_live_reconciliation()
         _test_volume_profile_and_depth()
         _test_no_phantom_entry_pnl()
+        _test_forming_candle_detection()
         print("-- filters --")
         _test_filters()
         _test_new_filters()
