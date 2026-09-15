@@ -3450,7 +3450,8 @@ class BacktestResult:
 
 def run_backtest(df: pd.DataFrame, strategy_name: str, params: dict, risk: RiskConfig,
                  filter_cfg: dict | None = None, extras: dict | None = None,
-                 warmup: int = WARMUP_BARS) -> BacktestResult:
+                 warmup: int = WARMUP_BARS,
+                 square_off_eod: bool | None = None) -> BacktestResult:
     strat = get_strategy(strategy_name)
     warnings: list[str] = []
 
@@ -3487,6 +3488,26 @@ def run_backtest(df: pd.DataFrame, strategy_name: str, params: dict, risk: RiskC
 
     sig = frame["signal"].to_numpy(int)
     n = len(frame)
+
+    # Intraday square-off.
+    #
+    # Without this an intraday profile carries a position across the close, the
+    # weekend and any holiday, then eats the next session's gap. That is not
+    # what an intraday system does, and the loss it books is not one the strategy
+    # would ever have taken: a short held over a weekend can exit a hundred points
+    # beyond its own stop on a 1-minute chart, which makes the backtest a report
+    # on gap risk rather than on the strategy.
+    intraday = bool(params.get("intraday", False))
+    if square_off_eod is None:
+        square_off_eod = intraday
+    square_off_eod = bool(square_off_eod) and intraday
+    if square_off_eod:
+        sessions = pd.DatetimeIndex(frame.index).normalize().to_numpy()
+        last_of_session = np.r_[sessions[1:] != sessions[:-1], True]
+    else:
+        last_of_session = np.zeros(n, dtype=bool)
+    eod_exits = 0
+
     trades: list[dict] = []
     pos: Position | None = None
     pending_signal_exit: str | None = None
@@ -3517,6 +3538,12 @@ def run_backtest(df: pd.DataFrame, strategy_name: str, params: dict, risk: RiskC
                                            _bar_dict(ctx)))
                 fallback_notes.update(mgr.notes)
                 pos, pending_signal_exit, just_exited = None, None, True
+            elif square_off_eod and last_of_session[i]:
+                eod_exits += 1
+                trades.append(_close_trade(pos, float(ctx.close), ctx.time,
+                                           "Session Close", _bar_dict(ctx)))
+                fallback_notes.update(pos.manager.notes)
+                pos, pending_signal_exit, just_exited = None, None, True
             else:
                 # Survived the candle: NOW advance the trail using its extremes.
                 mgr.update(ctx.high if pos.direction > 0 else ctx.low, ctx)
@@ -3545,7 +3572,18 @@ def run_backtest(df: pd.DataFrame, strategy_name: str, params: dict, risk: RiskC
     trades_df = pd.DataFrame(trades)
     equity = _equity_curve(trades_df, frame.index)
     stats = _statistics(trades_df, equity, risk)
-    stats.update(gap_exits=gap_exits, bars_tested=n - start, warmup_bars=start)
+    stats.update(gap_exits=gap_exits, bars_tested=n - start, warmup_bars=start,
+                 eod_exits=eod_exits)
+    if square_off_eod and eod_exits:
+        warnings.append(
+            f"{eod_exits} position(s) were squared off at the session close, as an intraday "
+            "profile should be. Carrying risk overnight means eating the next session's gap, "
+            "which on a fast timeframe can exit far beyond the stop.")
+    elif intraday and not square_off_eod:
+        warnings.append(
+            "Intraday square-off is OFF, so positions can be carried across the close, the "
+            "weekend and holidays. Any 'Stop-Loss (Gap)' exit far beyond its stop is that "
+            "carry, not the strategy.")
 
     if gap_exits:
         warnings.append(f"{gap_exits} exit(s) filled through a price gap rather than at the "
@@ -4793,6 +4831,13 @@ def render_sidebar() -> dict:
                               help="Off by default. When the venue is closed the LTP is just an "
                                    "old candle close, so an entry books a fictitious price and "
                                    "sits at 0.00 PnL until trading resumes.")
+    square_off_eod = sb.checkbox(
+        "Intraday: square off at the session close", value=True, disabled=live,
+        key="cfg_eod",
+        help="On for intraday timeframes. Carrying a position across the close means eating "
+             "the next session's gap, which on a 1-minute chart can exit a hundred points "
+             "beyond the stop and turn the backtest into a report on gap risk. Ignored on "
+             "daily and slower timeframes.")
     candle_seconds = sb.number_input("Candle re-download interval (seconds)", min_value=1.0,
                                      max_value=900.0, value=15.0, step=1.0, key="cfg_candle",
                                      help="How often the full candle history is re-downloaded and "
@@ -4983,6 +5028,7 @@ def render_sidebar() -> dict:
                                                    disabled=live, key="cfg_th_ref")
 
     params["intraday"] = interval in INTRADAY_INTERVALS
+    params["square_off_eod"] = bool(square_off_eod)
     params["symbol"], params["interval"] = symbol, interval
 
     sb.divider()
@@ -4996,7 +5042,7 @@ def render_sidebar() -> dict:
             "prefer_candle_open": bool(prefer_candle_open),
             "flip_entries": bool(flip),
             "allow_stale_entries": bool(allow_stale),
-            "entry_lookback": int(entry_lookback),
+            "entry_lookback": int(entry_lookback), "square_off_eod": bool(square_off_eod),
             "enter_on_start": bool(enter_on_start), "join_window": int(join_window),
             "square_off_on_stop": bool(square_off_on_stop),
             "candle_seconds": float(candle_seconds), "costs": costs,
@@ -5229,21 +5275,19 @@ def render_pnl_calendar(trades: pd.DataFrame, currency: str = "", max_months: in
     """
     Month-by-month PnL calendar, the way a broker statement shows it.
 
-    Days are shaded by result, with the shade scaled to the largest absolute day
-    in the sample so one outlier does not wash the rest out. A day with no
-    closed trade is left blank rather than coloured as flat -- being out of the
-    market is not a zero-PnL result, it is no result.
+    Drawn with Plotly rather than raw HTML: Streamlit sanitises injected <style>
+    blocks, so a hand-built table renders unstyled -- which is exactly why the
+    colours went missing. Shading is scaled to the largest absolute day so one
+    outlier does not wash out the rest, and a day with no closed trade is left
+    blank: being flat is not a zero-PnL result, it is no result.
     """
+    import calendar as _calendar
+    import plotly.graph_objects as go
+
     daily = calendar_pnl(trades)
     if daily.empty:
         st.info("No closed trades to lay out on a calendar.")
         return
-
-    peak = float(daily.abs().max()) or 1.0
-    months = sorted({(d.year, d.month) for d in daily.index})
-    if len(months) > max_months:
-        st.caption(f"Showing the most recent {max_months} of {len(months)} months.")
-        months = months[-max_months:]
 
     wins = int((daily > 0).sum())
     losses = int((daily < 0).sum())
@@ -5251,57 +5295,58 @@ def render_pnl_calendar(trades: pd.DataFrame, currency: str = "", max_months: in
     a.metric("Trading days", f"{len(daily):,}")
     b.metric("Green days", f"{wins:,}", f"{wins / len(daily) * 100:.0f}%")
     c.metric("Red days", f"{losses:,}")
-    best, worst = float(daily.max()), float(daily.min())
-    d.metric("Best / worst day", f"{fmt(best, 0)} / {fmt(worst, 0)}")
+    d.metric("Best / worst day", f"{fmt(float(daily.max()), 0)} / {fmt(float(daily.min()), 0)}")
 
-    import calendar as _calendar
+    peak = float(daily.abs().max()) or 1.0
+    months = sorted({(ts.year, ts.month) for ts in daily.index})
+    if len(months) > max_months:
+        st.caption(f"Showing the most recent {max_months} of {len(months)} months.")
+        months = months[-max_months:]
 
-    css = """
-    <style>
-    .pnlcal { border-collapse: separate; border-spacing: 3px; width: 100%;
-              font-family: inherit; }
-    .pnlcal th { font-size: 0.70rem; font-weight: 600; opacity: 0.55; padding: 2px;
-                 text-align: center; }
-    .pnlcal td { width: 14.2%; height: 46px; vertical-align: top; border-radius: 6px;
-                 padding: 3px 5px; font-size: 0.72rem; }
-    .pnlcal .d  { opacity: 0.55; font-size: 0.65rem; }
-    .pnlcal .v  { font-weight: 600; font-size: 0.74rem; }
-    .pnlcal .empty { background: rgba(128,128,128,0.06); }
-    .calmonth { font-weight: 600; margin: 10px 0 2px 2px; }
-    </style>"""
-    blocks = [css]
-
+    day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
     for year, month in months:
-        rows = _calendar.Calendar(firstweekday=0).monthdayscalendar(year, month)
-        total = float(daily[(daily.index.year == year) & (daily.index.month == month)].sum())
-        blocks.append(f"<div class='calmonth'>{_calendar.month_name[month]} {year} "
-                      f"&nbsp;·&nbsp; {currency}{fmt_signed(total)}</div>")
-        html = ["<table class='pnlcal'><tr>"]
-        html += [f"<th>{d}</th>" for d in ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")]
-        html.append("</tr>")
-        for week in rows:
-            html.append("<tr>")
+        weeks = _calendar.Calendar(firstweekday=0).monthdayscalendar(year, month)
+        z, text, hover = [], [], []
+        for week in weeks:
+            z_row, t_row, h_row = [], [], []
             for day in week:
                 if day == 0:
-                    html.append("<td></td>")
+                    z_row.append(None)
+                    t_row.append("")
+                    h_row.append("")
                     continue
                 stamp = pd.Timestamp(year=year, month=month, day=day)
                 if stamp not in daily.index:
-                    html.append(f"<td class='empty'><span class='d'>{day}</span></td>")
+                    z_row.append(None)
+                    t_row.append(f"<span style='color:#9aa0a6'>{day}</span>")
+                    h_row.append(f"{stamp:%d %b %Y}<br>no closed trade")
                     continue
                 value = float(daily.loc[stamp])
-                strength = min(abs(value) / peak, 1.0)
-                alpha = 0.15 + 0.55 * strength
-                colour = (f"rgba(38,166,154,{alpha:.2f})" if value >= 0
-                          else f"rgba(239,83,80,{alpha:.2f})")
-                html.append(f"<td style='background:{colour}'>"
-                            f"<span class='d'>{day}</span><br>"
-                            f"<span class='v'>{fmt_signed(value, 0)}</span></td>")
-            html.append("</tr>")
-        html.append("</table>")
-        blocks.append("".join(html))
+                z_row.append(value)
+                t_row.append(f"<b>{day}</b><br>{fmt_signed(value, 0)}")
+                h_row.append(f"{stamp:%d %b %Y}<br>{currency}{fmt_signed(value)}")
+            z.append(z_row)
+            text.append(t_row)
+            hover.append(h_row)
 
-    st.markdown("".join(blocks), unsafe_allow_html=True)
+        total = float(daily[(daily.index.year == year) & (daily.index.month == month)].sum())
+        fig = go.Figure(go.Heatmap(
+            z=z, text=text, texttemplate="%{text}", customdata=hover,
+            hovertemplate="%{customdata}<extra></extra>",
+            x=day_names, y=[f"W{i + 1}" for i in range(len(weeks))],
+            colorscale=[[0.0, "#ef5350"], [0.5, "#f5f5f5"], [1.0, "#26a69a"]],
+            zmid=0, zmin=-peak, zmax=peak, showscale=False,
+            xgap=3, ygap=3, textfont=dict(size=11)))
+        fig.update_yaxes(autorange="reversed", showgrid=False, ticks="")
+        fig.update_xaxes(side="top", showgrid=False, ticks="")
+        fig.update_layout(
+            title=dict(text=f"{_calendar.month_name[month]} {year} · "
+                            f"{currency}{fmt_signed(total)}",
+                       x=0.01, xanchor="left", font=dict(size=14)),
+            height=90 + 58 * len(weeks), margin=dict(l=10, r=10, t=60, b=10),
+            template="plotly_white")
+        st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
+
     st.caption("Shade depth is scaled to the largest absolute day in the sample. Blank days had "
                "no closed trade — being flat is not a zero result, it is no result.")
 
@@ -5339,7 +5384,8 @@ def _run_backtest_ui(cfg: dict) -> None:
                 st.write("Fetching India VIX for the volatility filter ...")
                 extras["vix"] = load_vix()
             result = run_backtest(bundle.frame, cfg["strategy"], cfg["params"], cfg["risk"],
-                                  cfg["filter_cfg"], extras, WARMUP_BARS)
+                                  cfg["filter_cfg"], extras, WARMUP_BARS,
+                                  square_off_eod=cfg.get("square_off_eod", True))
             result.warnings = list(bundle.warnings) + list(result.warnings)
             if cfg.get("walk_forward"):
                 st.write(f"Running {cfg['wf_folds']} stability segments ...")
@@ -8449,6 +8495,7 @@ def run_signal_lab(tickers: list[str], cfg: dict, objective: str, iterations: in
         params = dict(cfg["params"])
         params["symbol"], params["interval"] = ticker, interval
         params["intraday"] = interval in INTRADAY_INTERVALS
+        params["square_off_eod"] = cfg.get("square_off_eod", True)
         try:
             table = optimise(bundle.frame, params, cfg["quantity"], costs, objective,
                              min_trades, iterations, seed=11, safe_exits_only=safe_only,
@@ -8765,6 +8812,7 @@ def run_auto_screen(tickers: list[str], cfg: dict, min_accuracy: float, min_trad
         params = dict(cfg["params"])
         params["symbol"], params["interval"] = ticker, interval
         params["intraday"] = interval in INTRADAY_INTERVALS
+        params["square_off_eod"] = cfg.get("square_off_eod", True)
         try:
             table = optimise(bundle.frame, params, cfg["quantity"], costs,
                              "Win rate (accuracy)", int(min_trades), int(iterations),
@@ -8903,7 +8951,9 @@ def tab_auto_screener(cfg: dict) -> None:
                              "Price at Signal", "Price Now", "Move in Favour", "R Multiple Now",
                              "Strategy", "Stop-Loss", "SL Value", "Target", "TP Value", "Filter",
                              "Win %", "Trades", "Expectancy", "Profit Factor", "Sharpe",
-                             "Reliability", "Period"] if c in hot.columns]
+                             "Net PnL", "Reliability", "Period", "Signal Time",
+                             "Fill Price (next open)", "Suggested Stop", "Suggested Target",
+                             "Clears bar"] if c in hot.columns]
         hot = hot.sort_values("Quality", ascending=False)
         st.dataframe(hot[front], width="stretch", hide_index=True)
         labels = [f"{r['Ticker']} · {r['Timeframe']} · {r['Strategy'][:24]}"
@@ -8925,11 +8975,28 @@ def tab_auto_screener(cfg: dict) -> None:
     if quiet.empty:
         st.caption("Nothing else cleared the bar.")
     else:
-        cols = [c for c in ["Ticker", "Timeframe", "Quality", "Strategy", "Win %", "Trades",
-                            "Expectancy", "Profit Factor", "Sharpe", "Reliability", "Price Now",
-                            "Period"] if c in quiet.columns]
-        st.dataframe(quiet.sort_values("Quality", ascending=False)[cols], width="stretch",
-                     hide_index=True)
+        cols = [c for c in ["Ticker", "Timeframe", "Period", "Quality", "Strategy",
+                            "Stop-Loss", "SL Value", "Target", "TP Value", "Filter",
+                            "Win %", "Trades", "Expectancy", "Profit Factor", "Sharpe",
+                            "Net PnL", "Reliability", "Price Now", "Clears bar"]
+                if c in quiet.columns]
+        quiet = quiet.sort_values("Quality", ascending=False)
+        st.dataframe(quiet[cols], width="stretch", hide_index=True)
+        q_labels = [f"{r['Ticker']} · {r['Timeframe']} · {r['Strategy'][:24]} "
+                    f"({fmt(r['Win %'])}%)" for _, r in quiet.iterrows()]
+        q_pick = st.selectbox("Apply which qualified setup?", q_labels, key="auto_quiet_pick")
+        if st.button("Apply this qualified setup to the sidebar", width="stretch",
+                     key="auto_quiet_apply"):
+            row = quiet.iloc[q_labels.index(q_pick)]
+            st.session_state.pending_combo = {
+                "strategy": row["Strategy"], "sl_type": row["Stop-Loss"],
+                "sl_value": row["SL Value"], "tp_type": row["Target"],
+                "tp_value": row["TP Value"], "filter_key": str(row["Filter Key"] or ""),
+                "widgets": {"cfg_interval": row["Timeframe"]}}
+            st.session_state.pending_ticker = row["Ticker"]
+            st.rerun()
+        st.download_button("Download qualified (CSV)", quiet[cols].to_csv(index=False).encode(),
+                           "auto_screener_qualified.csv", "text/csv")
 
     st.markdown("#### Best available below the accuracy bar")
     if near.empty:
@@ -9874,6 +9941,61 @@ def _test_auto_screener_returns_best():
     print("   auto screener returns the best setup even below the bar  OK")
 
 
+def _test_intraday_session_squareoff():
+    """
+    An intraday profile must not carry risk across the session close.
+
+    This is the regression guard for a reported trade: a 1-minute SHORT opened on
+    a Friday, held through the close, and exited on the next session's gap 103
+    points BEYOND its own stop. The arithmetic was right; the model was not. No
+    intraday system holds over a weekend, and letting it makes the backtest a
+    report on gap risk rather than on the strategy.
+    """
+    def session(day, base, n=375):
+        idx = pd.date_range(f"2026-09-{day:02d} 09:15", periods=n, freq="1min",
+                            tz="Asia/Kolkata")
+        rng = np.random.default_rng(day)
+        close = base + np.cumsum(rng.normal(0, 3, n))
+        open_ = np.r_[close[0], close[:-1]]
+        return pd.DataFrame({"Open": open_, "High": np.maximum(open_, close) + 2,
+                             "Low": np.minimum(open_, close) - 2, "Close": close,
+                             "Volume": 1.0}, index=idx)
+
+    # Three sessions with a large gap across the break, as a weekend produces.
+    df = pd.concat([session(11, 23300), session(15, 23600), session(16, 23650)])
+    params = dict(DEFAULT_PARAMS)
+    params["intraday"] = True
+    risk = RiskConfig("Fixed Points", 232.0, "Fixed Points", 46.0, 1.0)
+
+    carried = run_backtest(df, "01 \u00b7 Dual EMA Crossover", params, risk,
+                           warmup=60, square_off_eod=False)
+    flat = run_backtest(df, "01 \u00b7 Dual EMA Crossover", params, risk,
+                        warmup=60, square_off_eod=True)
+
+    assert flat.stats["eod_exits"] > 0, "nothing was squared off at the close"
+    assert "Session Close" in set(flat.trades["Exit Reason"]), "no session-close exits recorded"
+    assert (flat.trades["Exit Reason"] != "Stop-Loss (Gap)").all(), \
+        "squaring off at the close must remove overnight gap exits"
+
+    if not carried.trades.empty:
+        worst_carried = float(carried.trades["Points"].min())
+        worst_flat = float(flat.trades["Points"].min())
+        assert worst_flat >= worst_carried, \
+            f"carrying overnight should be the worse outcome ({worst_flat} vs {worst_carried})"
+        # The carried run can lose more than the stop allows; the flat run cannot
+        # lose to a gap at all.
+        assert abs(worst_carried) >= abs(worst_flat)
+
+    # Daily and slower timeframes are unaffected: there is no intraday session.
+    params_daily = dict(DEFAULT_PARAMS)
+    params_daily["intraday"] = False
+    daily = run_backtest(_synthetic(600, seed=3), "01 \u00b7 Dual EMA Crossover",
+                         params_daily, risk, square_off_eod=True)
+    assert daily.stats["eod_exits"] == 0, "square-off must not apply to non-intraday data"
+    print(f"   intraday square-off: {flat.stats['eod_exits']} session-close exits, "
+          f"no overnight gap losses  OK")
+
+
 def _test_signal_detail():
     """
     The enriched signal columns must reconcile with each other exactly.
@@ -10154,6 +10276,7 @@ def run_selftest() -> int:
         _test_forming_candle_detection()
         _test_calendar_choch_and_overrides()
         _test_auto_screener_returns_best()
+        _test_intraday_session_squareoff()
         print("-- filters --")
         _test_filters()
         _test_new_filters()
@@ -10540,7 +10663,8 @@ def optimise(df: pd.DataFrame, base_params: dict, quantity: float, costs: CostMo
             fcfg[filt]["enabled"] = True
         risk = RiskConfig(sl_type, sl_val, tp_type, tp_val, quantity, costs=costs)
         try:
-            res = run_backtest(df, strategy, dict(base_params), risk, fcfg, {}, WARMUP_BARS)
+            res = run_backtest(df, strategy, dict(base_params), risk, fcfg, {}, WARMUP_BARS,
+                               square_off_eod=base_params.get("square_off_eod"))
         except (BacktestError, MarketDataError, Exception):          # noqa: BLE001
             continue
         st_ = res.stats
