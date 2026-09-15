@@ -880,6 +880,9 @@ FILTER_SPECS: list[dict] = [
      "help": "Positional filter against a 20/2.0 Bollinger."},
     {"key": "macd", "label": "MACD histogram", "kind": "toggle",
      "help": "Long needs a positive histogram, short a negative one."},
+    {"key": "choch", "label": "Change of character (CHoCH)", "kind": "toggle",
+     "help": "The bar where structure flips from higher-highs to lower-lows, or back. Direction "
+             "must agree with the most recent flip."},
     {"key": "smc", "label": "SMC break of structure", "kind": "toggle",
      "help": "Direction must agree with the last confirmed break of structure."},
     {"key": "ict", "label": "ICT premium / discount", "kind": "toggle",
@@ -957,6 +960,12 @@ def attach_filter_columns(df: pd.DataFrame, params: dict, intraday: bool) -> pd.
     out["f_macd_hist"] = hist
     bos, sh, sl_ = market_structure(out, int(p("pivot_left")), int(p("pivot_right")))
     out["f_bos"], out["f_swing_high"], out["f_swing_low"] = bos, sh, sl_
+    # Change of character: the bar where the prevailing structure actually flips.
+    # A break of structure in the SAME direction is continuation, not a change,
+    # so only a reversal of the carried direction counts.
+    flip = (bos != bos.shift(1)) & (bos != 0) & (bos.shift(1) != 0)
+    out["f_choch"] = bos.where(flip).ffill().fillna(0).astype(int)
+    out["f_choch_bar"] = flip.astype(bool)
     rng_hi = rolling_high(out["High"], int(p("structure_len")), exclude_current=False)
     rng_lo = rolling_low(out["Low"], int(p("structure_len")), exclude_current=False)
     out["f_range_mid"] = (rng_hi + rng_lo) / 2.0
@@ -1087,6 +1096,11 @@ def evaluate_filters(df: pd.DataFrame, fcfg: dict, extras: dict | None = None):
     if on("macd"):
         apply("macd", df["f_macd_hist"] > 0, df["f_macd_hist"] < 0,
               fmt(safe_last(df["f_macd_hist"]), 4))
+
+    if on("choch"):
+        last_flip = safe_last(df["f_choch"])
+        label = {1: "bullish flip", -1: "bearish flip"}.get(last_flip, "no flip yet")
+        apply("choch", df["f_choch"] == 1, df["f_choch"] == -1, label)
 
     if on("smc"):
         apply("smc", df["f_bos"] == 1, df["f_bos"] == -1,
@@ -3440,6 +3454,23 @@ def run_backtest(df: pd.DataFrame, strategy_name: str, params: dict, risk: RiskC
     strat = get_strategy(strategy_name)
     warnings: list[str] = []
 
+    # A young listing simply does not have 240 weekly candles, and refusing to
+    # test it at all is the wrong answer. Shrink the warm-up to what the history
+    # can support, and say so -- a shorter warm-up is a real cost, not a free
+    # pass: long averages such as the 200 EMA are less settled over a short window.
+    warmup = int(warmup)
+    available = len(df)
+    needed = max(warmup, strat.min_bars) + 5
+    if available <= needed:
+        relaxed = max(strat.min_bars, min(warmup, max(40, available // 3)))
+        if available > relaxed + strat.min_bars + 10:
+            warnings.append(
+                f"Only {available} candles available, short of the {needed} that a full "
+                f"{warmup}-bar warm-up needs. The warm-up was reduced to {relaxed} bars so the "
+                f"sample could be tested at all. Long averages are less settled over a window "
+                f"this short, so treat the result as indicative.")
+            warmup = relaxed
+
     required = max(warmup, strat.min_bars) + 5
     if len(df) <= required:
         raise BacktestError(
@@ -3881,7 +3912,7 @@ _STATE_DEFAULTS = {
     "order_book": None,
     "optimizer_results": None, "pattern_results": None, "pending_combo": None,
     "pattern_rows": None, "pattern_frames": None, "pattern_hits": None,
-    "pattern_errors": None, "lab_results": None,
+    "pattern_errors": None, "lab_results": None, "auto_results": None,
 }
 
 
@@ -5183,6 +5214,98 @@ def _running_banner() -> None:
 # =============================================================================
 # SECTION 13 -- TAB 1: BACKTESTING ENGINE STUDIO
 # =============================================================================
+def calendar_pnl(trades: pd.DataFrame) -> pd.Series:
+    """Net PnL per calendar day, keyed by date, from closed trades."""
+    if trades is None or trades.empty or "Exit Time" not in trades.columns:
+        return pd.Series(dtype=float)
+    frame = trades.copy()
+    frame["_day"] = pd.to_datetime(frame["Exit Time"]).dt.normalize()
+    daily = frame.groupby("_day")["PnL"].sum()
+    daily.index = pd.DatetimeIndex(daily.index)
+    return daily.sort_index()
+
+
+def render_pnl_calendar(trades: pd.DataFrame, currency: str = "", max_months: int = 12) -> None:
+    """
+    Month-by-month PnL calendar, the way a broker statement shows it.
+
+    Days are shaded by result, with the shade scaled to the largest absolute day
+    in the sample so one outlier does not wash the rest out. A day with no
+    closed trade is left blank rather than coloured as flat -- being out of the
+    market is not a zero-PnL result, it is no result.
+    """
+    daily = calendar_pnl(trades)
+    if daily.empty:
+        st.info("No closed trades to lay out on a calendar.")
+        return
+
+    peak = float(daily.abs().max()) or 1.0
+    months = sorted({(d.year, d.month) for d in daily.index})
+    if len(months) > max_months:
+        st.caption(f"Showing the most recent {max_months} of {len(months)} months.")
+        months = months[-max_months:]
+
+    wins = int((daily > 0).sum())
+    losses = int((daily < 0).sum())
+    a, b, c, d = st.columns(4)
+    a.metric("Trading days", f"{len(daily):,}")
+    b.metric("Green days", f"{wins:,}", f"{wins / len(daily) * 100:.0f}%")
+    c.metric("Red days", f"{losses:,}")
+    best, worst = float(daily.max()), float(daily.min())
+    d.metric("Best / worst day", f"{fmt(best, 0)} / {fmt(worst, 0)}")
+
+    import calendar as _calendar
+
+    css = """
+    <style>
+    .pnlcal { border-collapse: separate; border-spacing: 3px; width: 100%;
+              font-family: inherit; }
+    .pnlcal th { font-size: 0.70rem; font-weight: 600; opacity: 0.55; padding: 2px;
+                 text-align: center; }
+    .pnlcal td { width: 14.2%; height: 46px; vertical-align: top; border-radius: 6px;
+                 padding: 3px 5px; font-size: 0.72rem; }
+    .pnlcal .d  { opacity: 0.55; font-size: 0.65rem; }
+    .pnlcal .v  { font-weight: 600; font-size: 0.74rem; }
+    .pnlcal .empty { background: rgba(128,128,128,0.06); }
+    .calmonth { font-weight: 600; margin: 10px 0 2px 2px; }
+    </style>"""
+    blocks = [css]
+
+    for year, month in months:
+        rows = _calendar.Calendar(firstweekday=0).monthdayscalendar(year, month)
+        total = float(daily[(daily.index.year == year) & (daily.index.month == month)].sum())
+        blocks.append(f"<div class='calmonth'>{_calendar.month_name[month]} {year} "
+                      f"&nbsp;·&nbsp; {currency}{fmt_signed(total)}</div>")
+        html = ["<table class='pnlcal'><tr>"]
+        html += [f"<th>{d}</th>" for d in ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")]
+        html.append("</tr>")
+        for week in rows:
+            html.append("<tr>")
+            for day in week:
+                if day == 0:
+                    html.append("<td></td>")
+                    continue
+                stamp = pd.Timestamp(year=year, month=month, day=day)
+                if stamp not in daily.index:
+                    html.append(f"<td class='empty'><span class='d'>{day}</span></td>")
+                    continue
+                value = float(daily.loc[stamp])
+                strength = min(abs(value) / peak, 1.0)
+                alpha = 0.15 + 0.55 * strength
+                colour = (f"rgba(38,166,154,{alpha:.2f})" if value >= 0
+                          else f"rgba(239,83,80,{alpha:.2f})")
+                html.append(f"<td style='background:{colour}'>"
+                            f"<span class='d'>{day}</span><br>"
+                            f"<span class='v'>{fmt_signed(value, 0)}</span></td>")
+            html.append("</tr>")
+        html.append("</table>")
+        blocks.append("".join(html))
+
+    st.markdown("".join(blocks), unsafe_allow_html=True)
+    st.caption("Shade depth is scaled to the largest absolute day in the sample. Blank days had "
+               "no closed trade — being flat is not a zero result, it is no result.")
+
+
 def tab_backtest(cfg: dict) -> None:
     st.subheader("Backtesting Engine Studio")
     st.caption("Historical simulation only. Nothing here can reach the live ledger in Tab 3.")
@@ -5341,7 +5464,8 @@ def _render_backtest(result: BacktestResult, meta: dict) -> None:
     st.caption(f"The first {result.warmup_index:,} candles were reserved as the indicator warm-up "
                "window and produced no orders. Signals fire on a candle close and fill at the "
                "next candle's open.")
-    t1, t2, t3, t4 = st.tabs(["Simulated Trades", "Exit Reasons", "Gap Diagnostics", "Indicator Frame"])
+    t1, t2, t3, t4, t5 = st.tabs(["Simulated Trades", "PnL Calendar", "Exit Reasons",
+                                  "Gap Diagnostics", "Indicator Frame"])
     with t1:
         if result.trades.empty:
             st.info("No simulated trades for this configuration.")
@@ -5354,6 +5478,9 @@ def _render_backtest(result: BacktestResult, meta: dict) -> None:
                                f"backtest_{meta['symbol']}_{meta['interval']}.csv", "text/csv")
             st.caption("Simulation output. Deliberately NOT written to the live ledger.")
     with t2:
+        render_pnl_calendar(result.trades, cur)
+
+    with t3:
         if result.trades.empty:
             st.info("Nothing to break down yet.")
         else:
@@ -5362,11 +5489,11 @@ def _render_backtest(result: BacktestResult, meta: dict) -> None:
             st.dataframe(by.reset_index(), width="stretch", hide_index=True)
             st.caption("Where the exits actually came from. If almost everything closes on "
                        "'Stop-Loss (Gap)', the stop is too tight for this instrument's gaps.")
-    with t3:
+    with t4:
         gaps = gap_profile(result.frame, 0.3)
         st.metric("Gap candles in sample (>= 0.30%)", f"{len(gaps):,}")
         st.dataframe(gaps.tail(200), width="stretch")
-    with t4:
+    with t5:
         st.dataframe(result.frame.tail(300), width="stretch")
 
     render_analyst_panel(
@@ -6671,6 +6798,74 @@ def screen_universe(tickers: list[str], cfg: dict, lookback_bars: int, progress=
     return pd.DataFrame(rows), pd.DataFrame(errors)
 
 
+def render_scan_overrides(prefix: str, cfg: dict) -> dict:
+    """
+    Optional per-tab overrides. Every box is unticked, so leaving them alone
+    keeps the tab behaving exactly as it did before.
+
+    Returns only the keys the operator actually enabled; anything absent falls
+    back to the sidebar configuration.
+    """
+    out: dict = {}
+    with st.expander("Override the sidebar for this scan (all off by default)"):
+        st.caption("Tick only what you want to change. Everything unticked keeps the sidebar "
+                   "value, so the scan matches what the live engine would do.")
+        c1, c2 = st.columns(2)
+
+        if c1.checkbox("Select timeframes", value=False, key=f"{prefix}_ov_tf"):
+            out["timeframes"] = c1.multiselect("Timeframes", INTERVALS,
+                                               default=[cfg["interval"]], key=f"{prefix}_ov_tfv")
+        if c1.checkbox("Select period", value=False, key=f"{prefix}_ov_per"):
+            out["period"] = c1.selectbox("Period", PERIODS,
+                                         index=PERIODS.index(cfg["period"])
+                                         if cfg["period"] in PERIODS else 3,
+                                         key=f"{prefix}_ov_perv")
+        if c1.checkbox("Select strategies", value=False, key=f"{prefix}_ov_strat"):
+            out["strategies"] = c1.multiselect("Strategies", STRATEGY_NAMES,
+                                               default=[cfg["strategy"]],
+                                               key=f"{prefix}_ov_stratv")
+
+        if c2.checkbox("Select stop-loss", value=False, key=f"{prefix}_ov_sl"):
+            sl_type = c2.selectbox("Stop-loss type", SL_TYPES, key=f"{prefix}_ov_slt")
+            sl_value = 0.0 if sl_type in _SL_NO_VALUE else c2.number_input(
+                "Stop-loss value", 0.01, 1e9, 1.0, 0.1, key=f"{prefix}_ov_slv")
+            out["sl"] = (sl_type, float(sl_value))
+        if c2.checkbox("Select target", value=False, key=f"{prefix}_ov_tp"):
+            tp_type = c2.selectbox("Target type", TP_TYPES, key=f"{prefix}_ov_tpt")
+            tp_value = 0.0 if tp_type in _TP_NO_VALUE else c2.number_input(
+                "Target value", 0.01, 1e9, 2.0, 0.1, key=f"{prefix}_ov_tpv")
+            out["tp"] = (tp_type, float(tp_value))
+        if c2.checkbox("Select additional entry filters", value=False, key=f"{prefix}_ov_flt"):
+            out["filters"] = c2.multiselect(
+                "Entry filters", [spec["key"] for spec in FILTER_SPECS],
+                format_func=lambda k: FILTER_LABELS.get(k, k), key=f"{prefix}_ov_fltv")
+    return out
+
+
+def apply_scan_overrides(cfg: dict, overrides: dict) -> dict:
+    """Return a copy of cfg with only the enabled overrides applied."""
+    if not overrides:
+        return cfg
+    out = dict(cfg)
+    out["params"] = dict(cfg.get("params") or {})
+    if "period" in overrides:
+        out["period"] = overrides["period"]
+    if "strategies" in overrides and overrides["strategies"]:
+        out["strategy"] = overrides["strategies"][0]
+    if "sl" in overrides or "tp" in overrides:
+        risk = cfg["risk"]
+        sl_type, sl_value = overrides.get("sl", (risk.sl_type, risk.sl_value))
+        tp_type, tp_value = overrides.get("tp", (risk.tp_type, risk.tp_value))
+        out["risk"] = RiskConfig(sl_type, sl_value, tp_type, tp_value, risk.quantity,
+                                 risk.step_trigger)
+    if "filters" in overrides:
+        fcfg = default_filter_config()
+        for key in overrides["filters"]:
+            fcfg[key]["enabled"] = True
+        out["filter_cfg"] = fcfg
+    return out
+
+
 def tab_screener(cfg: dict) -> None:
     st.subheader("Signal Screener")
     st.caption(f"Runs the current sidebar configuration -- **{cfg['strategy']}** at "
@@ -6692,7 +6887,12 @@ def tab_screener(cfg: dict) -> None:
                                     key="scr_upload")
 
     with st.spinner(f"Resolving {universe} ..."):
-        tickers, note = _universe_tickers(universe, custom_text, uploaded)
+        overrides = render_scan_overrides("scr", cfg)
+    cfg = apply_scan_overrides(cfg, overrides)
+    scan_timeframes = overrides.get("timeframes") or [cfg["interval"]]
+    scan_strategies = overrides.get("strategies") or [cfg["strategy"]]
+
+    tickers, note = _universe_tickers(universe, custom_text, uploaded)
     tickers = tickers[:int(max_names)]
     if note:
         st.warning(f"{note} Index membership is reviewed periodically and this list is baked "
@@ -6719,8 +6919,23 @@ def tab_screener(cfg: dict) -> None:
         st.session_state.screener_error = None
         bar = st.progress(0.0, text="Starting ...")
         try:
-            results, errors = screen_universe(tickers, cfg, int(lookback), bar,
-                                              include_older=include_older)
+            frames, errs = [], []
+            for tf in scan_timeframes:
+                for strat_name in scan_strategies:
+                    scoped = dict(cfg)
+                    scoped["interval"] = tf
+                    scoped["strategy"] = strat_name
+                    scoped["params"] = dict(cfg["params"])
+                    scoped["params"]["intraday"] = tf in INTRADAY_INTERVALS
+                    part, part_err = screen_universe(tickers, scoped, int(lookback), bar,
+                                                     include_older=include_older)
+                    if not part.empty:
+                        part.insert(1, "Timeframe", tf)
+                        frames.append(part)
+                    if not part_err.empty:
+                        errs.append(part_err)
+            results = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+            errors = pd.concat(errs, ignore_index=True) if errs else pd.DataFrame()
             st.session_state.screener_results = (results, errors)
         except Exception as exc:                                    # noqa: BLE001
             st.session_state.screener_error = str(exc)
@@ -6741,7 +6956,7 @@ def tab_screener(cfg: dict) -> None:
         results = results.sort_values(["When", "Signal Time"], ascending=[True, False])
         st.success(f"{len(results)} ticker(s) signalling.")
         order = [c for c in [
-            "Ticker", "Signal", "When", "Bars Ago", "Signal Time", "Interval",
+            "Ticker", "Timeframe", "Signal", "When", "Bars Ago", "Signal Time", "Interval",
             "Price at Signal", "Fill Price (next open)", "Price Now",
             "Move Abs", "Move %", "Move in Favour", "Favour %", "R Multiple Now",
             "Best Since", "Worst Since",
@@ -8215,8 +8430,8 @@ def run_signal_lab(tickers: list[str], cfg: dict, objective: str, iterations: in
         else:
             period = _period_for_timeframe(interval, cfg["period"], WARMUP_BARS + 40)
         try:
-            bundle = load_market_data(ticker, period, interval,
-                                      freshness_seconds=300, min_bars=WARMUP_BARS + 40)
+            bundle = load_market_data(ticker, period, interval, freshness_seconds=300,
+                                      min_bars=80)
         except Exception as exc:                                    # noqa: BLE001
             errors.append({"Ticker": ticker, "Timeframe": interval, "Problem": str(exc)[:140]})
             continue
@@ -8387,7 +8602,7 @@ def tab_signal_lab(cfg: dict) -> None:
                        ". A month is thousands of 5m candles but only about 22 daily ones, so "
                        "each timeframe gets its own window rather than reusing the sidebar "
                        "period.")
-            for note in notes:
+            for note in dict.fromkeys(notes):
                 st.warning(note)
     else:
         timeframes = [cfg["interval"]]
@@ -8492,6 +8707,213 @@ def tab_signal_lab(cfg: dict) -> None:
             st.dataframe(errors, width="stretch", hide_index=True)
 
 
+# =============================================================================
+# SECTION 19d -- AUTO SCREENER  (pick a ticker, press run, get a shortlist)
+# =============================================================================
+def run_auto_screen(tickers: list[str], cfg: dict, min_accuracy: float, min_trades: int,
+                    iterations: int, timeframes: list[str], signal_window: int,
+                    safe_only: bool, progress=None):
+    """
+    Search every timeframe, strategy, stop, target and filter for configurations
+    that clear an accuracy bar, then split them by whether they are signalling now.
+
+    Nothing raises. A ticker/timeframe with too little history, or one that
+    errors for any other reason, is recorded and skipped -- a broad sweep should
+    never die on its weakest member.
+
+    READ THIS BEFORE ACTING ON THE OUTPUT: asking "show me only 90%+ accuracy"
+    across hundreds of combinations does not find good systems, it finds the
+    combinations that happened to fit. A 90% win rate is also usually bought
+    with a terrible reward:risk, which is why expectancy and profit factor are
+    shown beside it and why the sample size matters more than the percentage.
+    """
+    signalling, quiet, skipped = [], [], []
+    costs = cfg.get("costs") or CostModel()
+    jobs = [(t, tf) for t in tickers for tf in timeframes]
+    started = time.time()
+
+    for i, (ticker, interval) in enumerate(jobs):
+        if progress is not None:
+            done = (i + 1) / max(1, len(jobs))
+            elapsed = time.time() - started
+            eta = (elapsed / max(done, 1e-6)) - elapsed
+            progress.progress(done, text=f"{i + 1} of {len(jobs)} ({done * 100:.0f}%) — "
+                                         f"{ticker} · {interval} — about {eta:0.0f}s left")
+        period, _ = lab_period_for(interval, WARMUP_BARS + 40)
+        try:
+            bundle = load_market_data(ticker, period, interval, freshness_seconds=300,
+                                      min_bars=60)
+        except Exception as exc:                                    # noqa: BLE001
+            skipped.append({"Ticker": ticker, "Timeframe": interval,
+                            "Reason": str(exc)[:130]})
+            continue
+
+        params = dict(cfg["params"])
+        params["symbol"], params["interval"] = ticker, interval
+        params["intraday"] = interval in INTRADAY_INTERVALS
+        try:
+            table = optimise(bundle.frame, params, cfg["quantity"], costs,
+                             "Win rate (accuracy)", int(min_trades), int(iterations),
+                             seed=11, safe_exits_only=safe_only)
+        except Exception as exc:                                    # noqa: BLE001
+            skipped.append({"Ticker": ticker, "Timeframe": interval,
+                            "Reason": f"search failed: {str(exc)[:110]}"})
+            continue
+        if table.empty:
+            skipped.append({"Ticker": ticker, "Timeframe": interval,
+                            "Reason": f"no combination reached {int(min_trades)} trades"})
+            continue
+
+        hits = table[pd.to_numeric(table["Win %"], errors="coerce") >= float(min_accuracy)]
+        if hits.empty:
+            best = float(pd.to_numeric(table["Win %"], errors="coerce").max())
+            skipped.append({"Ticker": ticker, "Timeframe": interval,
+                            "Reason": f"best accuracy {best:.1f}% is below "
+                                      f"{float(min_accuracy):.0f}%"})
+            continue
+
+        best = hits.iloc[0]
+        fcfg = default_filter_config()
+        fkey = str(best.get("Filter Key") or "")
+        if fkey:
+            fcfg[fkey]["enabled"] = True
+        try:
+            frame, _ = prepare(bundle.frame, best["Strategy"], params, fcfg, {})
+        except Exception as exc:                                    # noqa: BLE001
+            skipped.append({"Ticker": ticker, "Timeframe": interval,
+                            "Reason": f"signal check failed: {str(exc)[:110]}"})
+            continue
+
+        window = frame["signal"].iloc[-(int(signal_window) + 1):-1]
+        fired = window[window != 0]
+        row = {
+            "Ticker": ticker, "Timeframe": interval, "Period": period,
+            "Strategy": best["Strategy"], "Stop-Loss": best["Stop-Loss"],
+            "SL Value": best["SL Value"], "Target": best["Target"],
+            "TP Value": best["TP Value"], "Filter": best["Filter"], "Filter Key": fkey,
+            "Win %": best["Win %"], "Trades": best["Trades"], "Sharpe": best["Sharpe"],
+            "Expectancy": best["Expectancy"], "Profit Factor": best["Profit Factor"],
+            "Net PnL": best["Net PnL"], "Reliability": best["Reliability"],
+            "Price Now": round(float(frame["Close"].iloc[-1]), 2),
+        }
+        row["Quality"] = _quality_score(row)
+        if fired.empty:
+            row["Signal"] = "-"
+            quiet.append(row)
+        else:
+            direction = int(fired.iloc[-1])
+            detail = signal_detail(frame, fired.index[-1], direction,
+                                   RiskConfig(best["Stop-Loss"], float(best["SL Value"] or 0),
+                                              best["Target"], float(best["TP Value"] or 0),
+                                              cfg["quantity"]), ticker, interval)
+            row["Signal"] = "LONG" if direction > 0 else "SHORT"
+            row.update(detail)
+            signalling.append(row)
+
+    return (pd.DataFrame(signalling), pd.DataFrame(quiet), pd.DataFrame(skipped))
+
+
+def tab_auto_screener(cfg: dict) -> None:
+    st.subheader("Auto Screener — find high-accuracy setups in one pass")
+    st.error("**A 90% accuracy filter does not find good systems; it finds combinations that "
+             "fit.** Searching every timeframe, strategy, stop, target and filter and then "
+             "keeping only the ones above a high bar is the purest form of the selection "
+             "problem in this app. A 90% win rate is also usually bought with a poor "
+             "reward:risk — many small wins funding a few large losses — which is why "
+             "expectancy and profit factor sit next to it below. Treat everything here as a "
+             "shortlist to validate on another period.")
+
+    c1, c2, c3 = st.columns(3)
+    universe = c1.selectbox("Universe", SCREENER_UNIVERSES, key="auto_universe")
+    min_accuracy = c2.number_input("Minimum accuracy %", 50.0, 100.0, 90.0, 1.0,
+                                   key="auto_acc")
+    signal_window = c3.number_input("Signal window (candles)", 1, 20, 3, key="auto_window")
+
+    custom_text = ""
+    if universe.startswith("Custom"):
+        custom_text = st.text_area("Tickers", "BTC-USD\nRELIANCE", key="auto_custom")
+    all_tickers, note = _universe_tickers(universe, custom_text, None)
+    chosen = st.multiselect("Tickers", all_tickers, default=all_tickers[:5], key="auto_tickers")
+    if note:
+        st.caption(note)
+
+    d1, d2, d3 = st.columns(3)
+    timeframes = d1.multiselect("Timeframes", INTERVALS, default=["15m", "60m", "1d"],
+                                key="auto_tfs")
+    iterations = d2.number_input("Combinations per ticker/timeframe", 10, 400, 80, 10,
+                                 key="auto_iters")
+    min_trades = d3.number_input("Minimum trades to qualify", 1, 200, 10, key="auto_min")
+    safe_only = st.checkbox("Backtest-safe exits only", value=True, key="auto_safe")
+
+    jobs = len(chosen) * max(1, len(timeframes))
+    st.caption(f"{len(chosen)} ticker(s) x {len(timeframes)} timeframe(s) x {int(iterations)} "
+               f"combinations = {jobs * int(iterations):,} backtests. Anything that cannot be "
+               f"tested is skipped and listed, never raised.")
+
+    if st.button("Run Auto Screener", type="primary", width="stretch"):
+        if not chosen or not timeframes:
+            st.error("Pick at least one ticker and one timeframe.")
+        else:
+            bar = st.progress(0.0, text="Starting ...")
+            st.session_state.auto_results = run_auto_screen(
+                chosen, cfg, float(min_accuracy), int(min_trades), int(iterations),
+                timeframes, int(signal_window), safe_only, bar)
+            bar.empty()
+
+    payload = st.session_state.get("auto_results")
+    if payload is None:
+        st.info("Choose tickers and run.")
+        return
+    hot, quiet, skipped = payload
+
+    a, b, c = st.columns(3)
+    a.metric("Signalling now", len(hot))
+    b.metric("Qualified but quiet", len(quiet))
+    c.metric("Skipped", len(skipped))
+
+    st.markdown("#### Currently signalling")
+    if hot.empty:
+        st.info("Nothing that clears the accuracy bar is signalling right now.")
+    else:
+        front = [c for c in ["Ticker", "Timeframe", "Quality", "Signal", "When", "Bars Ago",
+                             "Price at Signal", "Price Now", "Move in Favour", "R Multiple Now",
+                             "Strategy", "Stop-Loss", "SL Value", "Target", "TP Value", "Filter",
+                             "Win %", "Trades", "Expectancy", "Profit Factor", "Sharpe",
+                             "Reliability", "Period"] if c in hot.columns]
+        hot = hot.sort_values("Quality", ascending=False)
+        st.dataframe(hot[front], width="stretch", hide_index=True)
+        labels = [f"{r['Ticker']} · {r['Timeframe']} · {r['Strategy'][:24]}"
+                  for _, r in hot.iterrows()]
+        pick = st.selectbox("Apply which setup?", labels, key="auto_pick")
+        if st.button("Apply to the sidebar", type="primary", width="stretch", key="auto_apply"):
+            row = hot.iloc[labels.index(pick)]
+            st.session_state.pending_combo = {
+                "strategy": row["Strategy"], "sl_type": row["Stop-Loss"],
+                "sl_value": row["SL Value"], "tp_type": row["Target"],
+                "tp_value": row["TP Value"], "filter_key": str(row["Filter Key"] or ""),
+                "widgets": {"cfg_interval": row["Timeframe"]}}
+            st.session_state.pending_ticker = row["Ticker"]
+            st.rerun()
+        st.download_button("Download signalling (CSV)", hot[front].to_csv(index=False).encode(),
+                           "auto_screener_signalling.csv", "text/csv")
+
+    st.markdown("#### Qualified but not signalling")
+    if quiet.empty:
+        st.caption("Nothing else cleared the bar.")
+    else:
+        cols = [c for c in ["Ticker", "Timeframe", "Quality", "Strategy", "Win %", "Trades",
+                            "Expectancy", "Profit Factor", "Sharpe", "Reliability", "Price Now",
+                            "Period"] if c in quiet.columns]
+        st.dataframe(quiet.sort_values("Quality", ascending=False)[cols], width="stretch",
+                     hide_index=True)
+
+    if not skipped.empty:
+        with st.expander(f"Skipped ({len(skipped)}) — nothing here raised an error"):
+            st.dataframe(skipped, width="stretch", hide_index=True)
+    render_analyst_panel("auto", "these Auto Screener results",
+                         _frame_context(hot if not hot.empty else quiet))
+
+
 def main() -> None:
     st.set_page_config(page_title="Algo Trading Platform", layout="wide",
                        initial_sidebar_state="expanded")
@@ -8504,9 +8926,10 @@ def main() -> None:
     (status.success if st.session_state.live_running else status.info)(
         "LIVE CORE: RUNNING" if st.session_state.live_running else "LIVE CORE: IDLE")
 
-    t1, t2, t3, t4, t5, t6, t7 = st.tabs(
+    t1, t2, t3, t4, t5, t6, t7, t8 = st.tabs(
         ["Backtesting Engine Studio", "Live Sandbox Operations", "Live Trade Log Ledger",
-         "Signal Screener", "Strategy Optimiser", "Signal Lab", "Chart Patterns"])
+         "Signal Screener", "Auto Screener", "Strategy Optimiser", "Signal Lab",
+         "Chart Patterns"])
     with t1:
         tab_backtest(cfg)
     with t2:
@@ -8516,10 +8939,12 @@ def main() -> None:
     with t4:
         tab_screener(cfg)
     with t5:
-        tab_optimiser(cfg)
+        tab_auto_screener(cfg)
     with t6:
-        tab_signal_lab(cfg)
+        tab_optimiser(cfg)
     with t7:
+        tab_signal_lab(cfg)
+    with t8:
         tab_patterns(cfg)
 
 
@@ -9316,6 +9741,50 @@ def _test_forming_candle_detection():
     print("   forming-candle detection on live and lagging feeds  OK")
 
 
+def _test_calendar_choch_and_overrides():
+    """Calendar aggregation, the CHoCH filter, and override defaults."""
+    df = _synthetic(900, seed=11)
+    df.index = pd.date_range(end=pd.Timestamp("2026-09-12"), periods=900, freq="4h",
+                             tz="Asia/Kolkata")
+    params = dict(DEFAULT_PARAMS)
+    params["intraday"] = False
+    risk = RiskConfig("Fixed Percentage", 1.0, "Fixed Percentage", 2.0, 1.0)
+    res = run_backtest(df, "01 \u00b7 Dual EMA Crossover", params, risk)
+
+    daily = calendar_pnl(res.trades)
+    if not res.trades.empty:
+        assert abs(float(daily.sum()) - float(res.trades["PnL"].sum())) < 0.01, \
+            "the calendar must account for every closed trade exactly once"
+        assert daily.index.is_monotonic_increasing
+        # Days with no closed trade must be absent, not present as zeros: being
+        # flat is not a zero-PnL result, it is no result.
+        assert (daily != 0).any() or len(daily) == 0
+    assert calendar_pnl(pd.DataFrame()).empty, "an empty trade list yields an empty calendar"
+
+    # CHoCH only marks a genuine flip, never a break in the same direction.
+    frame = attach_filter_columns(prepare(df, "01 \u00b7 Dual EMA Crossover", params)[0],
+                                  params, False)
+    bos, choch = frame["f_bos"], frame["f_choch"]
+    flips = frame["f_choch_bar"]
+    assert flips.sum() > 0, "no structure flips detected at all"
+    for i in np.where(flips.to_numpy())[0]:
+        if i == 0:
+            continue
+        assert bos.iloc[i] != bos.iloc[i - 1], "a flip must actually change direction"
+        assert bos.iloc[i] != 0 and bos.iloc[i - 1] != 0, "an unset side is not a flip"
+    assert set(choch.unique()) <= {-1, 0, 1}
+
+    fcfg = default_filter_config()
+    assert all(not spec_cfg.get("enabled") for spec_cfg in fcfg.values()), \
+        "every filter, CHoCH included, must default to off"
+    assert "choch" in fcfg and any(s["key"] == "choch" for s in FILTER_SPECS)
+    assert any(s["key"] == "adx" for s in FILTER_SPECS), "ADX was already available"
+
+    assert apply_scan_overrides({"a": 1}, {}) == {"a": 1}, \
+        "no overrides means the config passes through untouched"
+    print("   PnL calendar, CHoCH flips and override defaults  OK")
+
+
 def _test_signal_detail():
     """
     The enriched signal columns must reconcile with each other exactly.
@@ -9513,12 +9982,21 @@ def _test_edge_cases():
     params = dict(DEFAULT_PARAMS)
     params["intraday"] = True
     risk = RiskConfig("Fixed Points", 25.0, "Fixed Points", 50.0, 1.0)
+    # A genuinely unusable sample must still refuse.
     try:
-        run_backtest(df.head(120), STRATEGY_NAMES[0], params, risk)
+        run_backtest(df.head(30), STRATEGY_NAMES[0], params, risk)
     except BacktestError as exc:
         print(f"   short-sample guard fired: {str(exc)[:62]}...")
     else:
-        raise AssertionError("short sample did not raise")
+        raise AssertionError("an unusably short sample did not raise")
+
+    # A merely SHORT sample (a young listing) is tested with a reduced warm-up
+    # rather than refused outright, and the reduction is declared.
+    short = run_backtest(df.head(160), STRATEGY_NAMES[0], params, risk)
+    assert short.warmup_index < WARMUP_BARS, "the warm-up should have been reduced"
+    assert any("warm-up was reduced" in w for w in short.warnings), \
+        "a reduced warm-up must be stated, not applied silently"
+    print(f"   young listing tested with a {short.warmup_index}-bar warm-up instead of refusing")
     res = run_backtest(df, STRATEGY_NAMES[3], params, risk)
     print(f"   gap-filled exits detected: {res.stats['gap_exits']}")
     trailing = RiskConfig("Trailing Points", 30.0, "Trailing Target (display only)", 40.0, 1.0)
@@ -9585,6 +10063,7 @@ def run_selftest() -> int:
         _test_volume_profile_and_depth()
         _test_no_phantom_entry_pnl()
         _test_forming_candle_detection()
+        _test_calendar_choch_and_overrides()
         print("-- filters --")
         _test_filters()
         _test_new_filters()
