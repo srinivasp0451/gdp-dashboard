@@ -61,6 +61,7 @@ import json
 import math
 import sys
 import time
+import traceback
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable
@@ -3498,9 +3499,18 @@ def run_backtest(df: pd.DataFrame, strategy_name: str, params: dict, risk: RiskC
     # beyond its own stop on a 1-minute chart, which makes the backtest a report
     # on gap risk rather than on the strategy.
     intraday = bool(params.get("intraday", False))
+    # Crypto and spot FX have no session to square off at. Treating a calendar
+    # date boundary as a "close" on a 24/7 instrument invents an exit at an
+    # arbitrary midnight, which is exactly the thing this rule exists to prevent.
+    has_sessions = not trades_around_the_clock(str(params.get("symbol", "")))
     if square_off_eod is None:
         square_off_eod = intraday
-    square_off_eod = bool(square_off_eod) and intraday
+    square_off_eod = bool(square_off_eod) and intraday and has_sessions
+    if intraday and not has_sessions:
+        warnings.append(
+            "This instrument trades around the clock, so there is no session close to square "
+            "off at and none was applied. Overnight gap risk does not exist here; weekend and "
+            "holiday gaps do not either.")
     if square_off_eod:
         sessions = pd.DatetimeIndex(frame.index).normalize().to_numpy()
         last_of_session = np.r_[sessions[1:] != sessions[:-1], True]
@@ -3947,7 +3957,7 @@ _STATE_DEFAULTS = {
     "last_seen_ltp": None, "last_ltp_change_ts": 0.0, "pending_ticker": None,
     "last_closed_bar": None, "option_metrics": None, "live_last_signal_time": None,
     "live_first_cycle": False, "last_good_quote": None, "suspect_ticks": 0,
-    "order_book": None,
+    "order_book": None, "live_panel_errors": 0,
     "optimizer_results": None, "pattern_results": None, "pending_combo": None,
     "pattern_rows": None, "pattern_frames": None, "pattern_hits": None,
     "pattern_errors": None, "lab_results": None, "auto_results": None,
@@ -5654,6 +5664,26 @@ def _idle_panel(cfg: dict) -> None:
 
 
 def _live_body() -> None:
+    """
+    Wrapper around the live panel.
+
+    An uncaught exception inside an auto-refreshing fragment takes the whole page
+    with it, and the only way back is a manual browser refresh. Whatever breaks,
+    the panel reports it and keeps ticking.
+    """
+    try:
+        _live_body_inner()
+    except Exception as exc:                                        # noqa: BLE001
+        st.session_state.live_panel_errors = \
+            int(st.session_state.get("live_panel_errors", 0)) + 1
+        st.error(f"The live panel hit an error and recovered: {exc}")
+        st.caption("The engine is still running and this panel keeps refreshing. If the same "
+                   "error repeats every tick, stop the engine and check the configuration.")
+        with st.expander("Details"):
+            st.code("".join(traceback.format_exc())[-2500:])
+
+
+def _live_body_inner() -> None:
     cfg = st.session_state.live_config or {}
     if not cfg:
         st.error("Live configuration was lost. Stop and restart the engine.")
@@ -5782,6 +5812,29 @@ def _market_data_panel(cfg: dict, snapshot: LiveSnapshot) -> None:
         c[4].metric("Crossover", "Bullish \u2191", f"+{fmt(fast - slow)}")
     else:
         c[4].metric("Crossover", "Bearish \u2193", f"-{fmt(slow - fast)}")
+
+    # Volume, and how it compares with its own average. Shown whenever the feed
+    # carries it, so a volume-gated rule can be read rather than guessed at.
+    vol = safe_last(frame["Volume"]) if "Volume" in frame else None
+    has_volume = float(frame["Volume"].tail(200).abs().sum()) > 0 if "Volume" in frame else False
+    v = st.columns(5)
+    if has_volume:
+        vma = safe_last(sma(frame["Volume"], int(_p(cfg.get("params") or {}, "vol_len"))))
+        ratio = (float(vol) / float(vma)) if (vol and vma) else None
+        needed = float(_p(cfg.get("params") or {}, "vol_mult"))
+        v[0].metric("Candle volume", fmt(vol, 0))
+        v[1].metric("Volume average", fmt(vma, 0))
+        v[2].metric("Volume x average", f"{fmt(ratio)}x" if ratio else "--",
+                    f"needs {fmt(needed)}x" if ratio else None)
+        v[3].metric("Volume gate", "met" if (ratio and ratio >= needed) else "not met")
+    else:
+        v[0].metric("Candle volume", "not reported",
+                    help="Indices and spot FX report no volume on Yahoo, so volume-gated "
+                         "rules cannot arm and VWAP degrades to a session TWAP.")
+    v[4].metric("Values as of", fmt_time(snapshot.last_closed_time),
+                "stale" if snapshot.stale else "current",
+                help="Every figure in this row except the price comes from the last CLOSED "
+                     "candle. If the feed is lagging, they lag with it.")
 
 
 def _feed_banner(cfg: dict, snapshot: LiveSnapshot) -> None:
@@ -5937,10 +5990,26 @@ class ConditionCheck:
     current: str = ""             # what the parameter reads right now
     need_long: str = ""           # what it would have to read for a LONG
     need_short: str = ""
+    gap_long: float | None = None   # points still needed for the LONG side
+    gap_short: float | None = None
 
 
-def _ck(label, long_ok, short_ok, detail="", current="", need_long="", need_short=""):
-    return ConditionCheck(label, long_ok, short_ok, detail, current, need_long, need_short)
+def _ck(label, long_ok, short_ok, detail="", current="", need_long="", need_short="",
+        gap_long=None, gap_short=None):
+    return ConditionCheck(label, long_ok, short_ok, detail, current, need_long, need_short,
+                          gap_long, gap_short)
+
+
+def _gap(value, target, direction_up: bool):
+    """Points still to travel, or 0.0 when already there. None when unknowable."""
+    if value is None or target is None:
+        return None
+    try:
+        distance = (float(target) - float(value)) if direction_up else \
+            (float(value) - float(target))
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, distance)
 
 
 def _mark(value) -> str:
@@ -6077,7 +6146,9 @@ def strategy_checks(name: str, frame: pd.DataFrame, params: dict) -> list[Condit
                            current=f"fast {fmt(fast)} / slow {fmt(slow)} "
                                    f"(spread {fmt_signed(spread)})",
                            need_long=f"fast above slow — {_need(fast, slow, True)}",
-                           need_short=f"fast below slow — {_need(fast, slow, False)}"))
+                           need_short=f"fast below slow — {_need(fast, slow, False)}",
+                           gap_long=_gap(fast, slow, True),
+                           gap_short=_gap(fast, slow, False)))
             angle = ema_angle_degrees(frame)
             if angle is not None:
                 out.append(_ck("Crossover angle", True, True, f"{angle:.2f}\u00b0",
@@ -6150,6 +6221,21 @@ def strategy_checks(name: str, frame: pd.DataFrame, params: dict) -> list[Condit
                        current=f"price {fmt(close)}, range {fmt(lo)} - {fmt(hi)}",
                        need_long=f"above {fmt(hi)} — {_need(close, hi, True)}",
                        need_short=f"below {fmt(lo)} — {_need(close, lo, False)}"))
+    if name.startswith(("20 ", "41 ")):
+        blo, bhi = last("fvg_bull_lo"), last("fvg_bull_hi")
+        slo, shi = last("fvg_bear_lo"), last("fvg_bear_hi")
+        bull_ok = None if (blo is None or bhi is None) else (close <= bhi and close >= blo * 0.99)
+        bear_ok = None if (slo is None or shi is None) else (close >= slo * 0.99 and close <= shi)
+        out.append(_ck(
+            "Fair value gap", bull_ok, bear_ok,
+            f"bull {fmt(blo)}-{fmt(bhi)} · bear {fmt(slo)}-{fmt(shi)}",
+            current=f"price {fmt(close)} | bullish gap {fmt(blo)} - {fmt(bhi)} | "
+                    f"bearish gap {fmt(slo)} - {fmt(shi)}",
+            need_long=f"price inside the bullish gap {fmt(blo)} - {fmt(bhi)} — "
+                      f"{_need(close, bhi, False) if close and bhi else ''}",
+            need_short=f"price inside the bearish gap {fmt(slo)} - {fmt(shi)} — "
+                       f"{_need(close, slo, True) if close and slo else ''}"))
+
     if name.startswith(("35 ", "36 ", "37 ", "38 ", "39 ", "40 ", "41 ")):
         gh, gl = last("fib_golden_hi"), last("fib_golden_lo")
         up_leg = last("fib_up_leg")
@@ -6160,7 +6246,11 @@ def strategy_checks(name: str, frame: pd.DataFrame, params: dict) -> list[Condit
                            f"leg is {'up' if up_leg else 'down'}",
                            current=f"price {fmt(close)}, zone {fmt(gl)} - {fmt(gh)}",
                            need_long=f"a rising leg with price inside {fmt(gl)} - {fmt(gh)}",
-                           need_short=f"a falling leg with price inside {fmt(gl)} - {fmt(gh)}"))
+                           need_short=f"a falling leg with price inside {fmt(gl)} - {fmt(gh)}",
+                           gap_long=_gap(close, gh, False) if (close and gh and close > gh)
+                           else 0.0,
+                           gap_short=_gap(close, gl, True) if (close and gl and close < gl)
+                           else 0.0))
     if name.startswith("28 "):
         lvl = last("threshold")
         out.append(_ck("Price threshold",
@@ -6169,7 +6259,8 @@ def strategy_checks(name: str, frame: pd.DataFrame, params: dict) -> list[Condit
                        f"UP {_need(close, lvl, True)} · DOWN {_need(close, lvl, False)}",
                        current=f"price {fmt(close)}, threshold {fmt(lvl)}",
                        need_long=f"above {fmt(lvl)} — {_need(close, lvl, True)}",
-                       need_short=f"below {fmt(lvl)} — {_need(close, lvl, False)}"))
+                       need_short=f"below {fmt(lvl)} — {_need(close, lvl, False)}",
+                       gap_long=_gap(close, lvl, True), gap_short=_gap(close, lvl, False)))
     if name.startswith("29 "):
         up, dn = last("threshold_up"), last("threshold_dn")
         out.append(_ck("Percentage bands",
@@ -6178,7 +6269,8 @@ def strategy_checks(name: str, frame: pd.DataFrame, params: dict) -> list[Condit
                        f"UP {_need(close, up, True)} · DOWN {_need(close, dn, False)}",
                        current=f"price {fmt(close)}, bands {fmt(dn)} - {fmt(up)}",
                        need_long=f"above {fmt(up)} — {_need(close, up, True)}",
-                       need_short=f"below {fmt(dn)} — {_need(close, dn, False)}"))
+                       need_short=f"below {fmt(dn)} — {_need(close, dn, False)}",
+                       gap_long=_gap(close, up, True), gap_short=_gap(close, dn, False)))
     if name.startswith("43 "):
         votes_l, votes_s = last("hybrid_long_votes"), last("hybrid_short_votes")
         members = int(last("hybrid_members") or 0)
@@ -6196,8 +6288,14 @@ def strategy_checks(name: str, frame: pd.DataFrame, params: dict) -> list[Condit
 def render_condition_checklist(cfg: dict, snapshot: LiveSnapshot) -> None:
     """The whole entry gate, one line per condition, with the distance to each."""
     strat = get_strategy(cfg["strategy"])
-    checks = engine_checks(cfg, snapshot) + strategy_checks(cfg["strategy"], snapshot.frame,
-                                                            cfg.get("params") or {})
+    engine = engine_checks(cfg, snapshot)
+    strategy_side = strategy_checks(cfg["strategy"], snapshot.frame, cfg.get("params") or {})
+    # Strategy conditions first, then the filters that can veto them, then the
+    # engine plumbing. The question being answered is "what does this profile
+    # need", so the profile's own conditions belong at the top.
+    filters = [c for c in engine if c.label.startswith("Filter \u00b7")]
+    plumbing = [c for c in engine if not c.label.startswith("Filter \u00b7")]
+    checks = strategy_side + filters + plumbing
     long_ready = all(c.long_ok is not False for c in checks)
     short_ready = all(c.short_ok is not False for c in checks)
 
@@ -6215,6 +6313,21 @@ def render_condition_checklist(cfg: dict, snapshot: LiveSnapshot) -> None:
                      f"{detail}")
     st.markdown("\n".join(lines))
 
+    # How close each side is, as a bar rather than a paragraph.
+    total = len(checks)
+    met_long = sum(1 for c in checks if c.long_ok is not False)
+    met_short = sum(1 for c in checks if c.short_ok is not False)
+    far_long = [c.gap_long for c in checks if c.gap_long not in (None, 0.0)]
+    far_short = [c.gap_short for c in checks if c.gap_short not in (None, 0.0)]
+
+    pl, ps = st.columns(2)
+    pl.progress(met_long / total if total else 0.0,
+                text=f"LONG — {met_long} of {total} conditions met"
+                     + (f" · furthest is {fmt(max(far_long))} points away" if far_long else ""))
+    ps.progress(met_short / total if total else 0.0,
+                text=f"SHORT — {met_short} of {total} conditions met"
+                     + (f" · furthest is {fmt(max(far_short))} points away" if far_short else ""))
+
     st.markdown("##### Required vs current")
     rows = []
     for i, c in enumerate(checks, start=1):
@@ -6224,8 +6337,12 @@ def render_condition_checklist(cfg: dict, snapshot: LiveSnapshot) -> None:
             "Current value": c.current or c.detail or "--",
             "Required for LONG": c.need_long or "--",
             "LONG": _mark(c.long_ok),
+            "Points to LONG": "--" if c.gap_long is None else
+                              ("met" if c.gap_long == 0 else fmt(c.gap_long)),
             "Required for SHORT": c.need_short or "--",
             "SHORT": _mark(c.short_ok),
+            "Points to SHORT": "--" if c.gap_short is None else
+                               ("met" if c.gap_short == 0 else fmt(c.gap_short)),
         })
     st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
     st.caption("Shown for both directions at all times, whether or not a position is open, so "
@@ -6273,7 +6390,23 @@ def _searching_widget(cfg: dict, snapshot: LiveSnapshot) -> None:
     r.markdown(f"**Short entry requires**\n\n{snapshot.status.short_condition}")
 
     risk = cfg["risk"]
-    st.caption(f"On a fill at {fmt(snapshot.ltp)} the exit engine would apply -- {risk.as_summary()}")
+    sl_dist, tp_dist = risk.distances(snapshot.ltp)
+    e = st.columns(4)
+    e[0].metric("If filled now", fmt(snapshot.ltp))
+    e[1].metric("Stop would sit at", f"{fmt(snapshot.ltp - sl_dist)} / {fmt(snapshot.ltp + sl_dist)}",
+                f"{fmt(sl_dist)} pts — {risk.sl_type}",
+                help="Long stop / short stop at the current price.")
+    e[2].metric("Target would sit at",
+                f"{fmt(snapshot.ltp + tp_dist)} / {fmt(snapshot.ltp - tp_dist)}",
+                f"{fmt(tp_dist)} pts — {risk.tp_type}",
+                help="Long target / short target at the current price.")
+    rr = (tp_dist / sl_dist) if sl_dist else None
+    e[3].metric("Reward : risk", fmt(rr) if rr else "--",
+                None if not rr or rr >= 1 else "target is smaller than the stop")
+    if rr and rr < 0.5:
+        st.warning(f"The target is only {fmt(rr)}x the stop. A setup like this needs roughly "
+                   f"{100 / (1 + rr):.0f}% accuracy just to break even, which is why a high win "
+                   f"rate here is not the same thing as making money.")
 
 
 def _live_chart(cfg: dict, snapshot: LiveSnapshot) -> None:
@@ -9996,6 +10129,52 @@ def _test_intraday_session_squareoff():
           f"no overnight gap losses  OK")
 
 
+def _test_status_panel_completeness():
+    """
+    The live status must answer "how far am I from a signal", not just "no".
+
+    Also a regression guard: session square-off must not fire on a 24/7
+    instrument, where a calendar-date boundary is not a session close and
+    exiting at an arbitrary midnight is an invented trade.
+    """
+    df = _synthetic(600, seed=11)
+    params = dict(DEFAULT_PARAMS)
+    params["intraday"] = True
+
+    # Fibonacci + FVG must expose BOTH of its components with real numbers.
+    frame, _ = prepare(df, "41 \u00b7 Fibonacci + Fair Value Gap", params)
+    checks = strategy_checks("41 \u00b7 Fibonacci + Fair Value Gap", frame, params)
+    labels = [c.label for c in checks]
+    assert "Fair value gap" in labels, "the FVG half of the profile was not reported"
+    assert "Fibonacci golden zone" in labels, "the Fibonacci half was not reported"
+    for c in checks:
+        assert c.current and c.need_long and c.need_short, f"{c.label}: incomplete"
+
+    # Distance to the trigger, in points, wherever distance is meaningful.
+    assert _gap(100.0, 110.0, True) == 10.0
+    assert _gap(110.0, 100.0, True) == 0.0, "already there means zero, not negative"
+    assert _gap(None, 100.0, True) is None
+    ema_check = strategy_checks("01 \u00b7 Dual EMA Crossover", frame, params)[0]
+    assert ema_check.gap_long is not None and ema_check.gap_short is not None
+    assert min(ema_check.gap_long, ema_check.gap_short) == 0.0, \
+        "one side of a crossover is always already satisfied"
+
+    # 24/7 instruments have no session close to square off at.
+    risk = RiskConfig("Fixed Percentage", 1.0, "Fixed Points", 121.0, 1.0)
+    for symbol, expect_exits in (("BTC-USD", False), ("^NSEI", True)):
+        p2 = dict(params)
+        p2["symbol"] = symbol
+        res = run_backtest(df, "01 \u00b7 Dual EMA Crossover", p2, risk, warmup=60)
+        fired = res.stats["eod_exits"] > 0
+        if expect_exits:
+            assert fired or res.trades.empty, f"{symbol} should square off at the close"
+        else:
+            assert not fired, f"{symbol} trades around the clock; it has no session close"
+            assert any("around the clock" in w for w in res.warnings), \
+                "the exemption must be stated"
+    print("   status panel completeness and the 24/7 square-off exemption  OK")
+
+
 def _test_signal_detail():
     """
     The enriched signal columns must reconcile with each other exactly.
@@ -10277,6 +10456,7 @@ def run_selftest() -> int:
         _test_calendar_choch_and_overrides()
         _test_auto_screener_returns_best()
         _test_intraday_session_squareoff()
+        _test_status_panel_completeness()
         print("-- filters --")
         _test_filters()
         _test_new_filters()
