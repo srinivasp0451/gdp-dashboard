@@ -3092,6 +3092,35 @@ class RiskConfig:
     min_stop_atr: float = 0.25       # fallback distance when a structural stop is invalid
     costs: CostModel = field(default_factory=CostModel)
 
+    def distances(self, price: float) -> tuple[float, float]:
+        """
+        Stop and target distances in POINTS at a given price.
+
+        Percentage and R:R exits only become point distances once a price is
+        known, which is why this takes one. Structural exits (a swing, a candle
+        extreme) have no distance until a position exists, so they report an
+        ATR-scaled placeholder rather than a number that pretends to be exact.
+        """
+        price = float(price)
+
+        def resolve(kind: str, value: float, reference: float | None) -> float:
+            if kind in ("Fixed Percentage", "Trailing Percentage"):
+                return abs(price * float(value) / 100.0)
+            if kind in ("Fixed Points", "Trailing Points",
+                        "Step Trail (trigger k, trail N)"):
+                return abs(float(value))
+            if kind in ("ATR Multiple", "Trailing ATR (Chandelier)"):
+                return abs(float(value)) * max(price * 0.002, 1e-9)
+            if kind == "Risk : Reward Multiple" and reference:
+                return abs(float(value)) * reference
+            if kind in ("No Stop-Loss", "No Target"):
+                return 0.0
+            return abs(price * 0.005)          # structural: an honest placeholder
+
+        sl = resolve(self.sl_type, self.sl_value, None)
+        tp = resolve(self.tp_type, self.tp_value, sl)
+        return sl, tp
+
     def as_summary(self) -> str:
         sl = self.sl_type if self.sl_type in _SL_NO_VALUE else f"{self.sl_type} {fmt(self.sl_value)}"
         tp = self.tp_type if self.tp_type in _TP_NO_VALUE else f"{self.tp_type} {fmt(self.tp_value)}"
@@ -5275,7 +5304,17 @@ def calendar_pnl(trades: pd.DataFrame) -> pd.Series:
     if trades is None or trades.empty or "Exit Time" not in trades.columns:
         return pd.Series(dtype=float)
     frame = trades.copy()
-    frame["_day"] = pd.to_datetime(frame["Exit Time"]).dt.normalize()
+    stamps = pd.to_datetime(frame["Exit Time"])
+    # Drop the timezone before bucketing by day.
+    #
+    # Exit times are tz-aware, so the index came back tz-aware too, while the
+    # calendar builds naive Timestamps to look each day up. A naive timestamp
+    # never matches a tz-aware index, so every lookup missed, every cell resolved
+    # to None, and the heatmap rendered completely blank beneath a correct
+    # month header.
+    if getattr(stamps.dt, "tz", None) is not None:
+        stamps = stamps.dt.tz_localize(None)
+    frame["_day"] = stamps.dt.normalize()
     daily = frame.groupby("_day")["PnL"].sum()
     daily.index = pd.DatetimeIndex(daily.index)
     return daily.sort_index()
@@ -8904,9 +8943,19 @@ def tab_signal_lab(cfg: dict) -> None:
 # =============================================================================
 # SECTION 19d -- AUTO SCREENER  (pick a ticker, press run, get a shortlist)
 # =============================================================================
-def run_auto_screen(tickers: list[str], cfg: dict, min_accuracy: float, min_trades: int,
+# The qualifying metric, its column, and the objective the search optimises for.
+AUTO_METRICS = {
+    "Accuracy (win rate %)": ("Win %", "Win rate (accuracy)", 90.0),
+    "Sharpe ratio": ("Sharpe", "Sharpe ratio", 1.0),
+    "Net PnL": ("Net PnL", "Net PnL", 0.0),
+    "Profit factor": ("Profit Factor", "Profit factor", 1.5),
+    "Expectancy per trade": ("Expectancy", "Expectancy per trade", 0.0),
+}
+
+
+def run_auto_screen(tickers: list[str], cfg: dict, min_value: float, min_trades: int,
                     iterations: int, timeframes: list[str], signal_window: int,
-                    safe_only: bool, progress=None):
+                    safe_only: bool, progress=None, metric: str = "Accuracy (win rate %)"):
     """
     Search every timeframe, strategy, stop, target and filter for configurations
     that clear an accuracy bar, then split them by whether they are signalling now.
@@ -8947,9 +8996,10 @@ def run_auto_screen(tickers: list[str], cfg: dict, min_accuracy: float, min_trad
         params["intraday"] = interval in INTRADAY_INTERVALS
         params["square_off_eod"] = cfg.get("square_off_eod", True)
         try:
-            table = optimise(bundle.frame, params, cfg["quantity"], costs,
-                             "Win rate (accuracy)", int(min_trades), int(iterations),
-                             seed=11, safe_exits_only=safe_only)
+            column, objective, _ = AUTO_METRICS.get(metric, AUTO_METRICS["Accuracy (win rate %)"])
+            table = optimise(bundle.frame, params, cfg["quantity"], costs, objective,
+                             int(min_trades), int(iterations), seed=11,
+                             safe_exits_only=safe_only)
         except Exception as exc:                                    # noqa: BLE001
             skipped.append({"Ticker": ticker, "Timeframe": interval,
                             "Reason": f"search failed: {str(exc)[:110]}"})
@@ -8963,7 +9013,9 @@ def run_auto_screen(tickers: list[str], cfg: dict, min_accuracy: float, min_trad
         # throws away the answer. The best available combination is returned
         # either way; it is simply labelled as below the bar so the distinction
         # stays visible.
-        hits = table[pd.to_numeric(table["Win %"], errors="coerce") >= float(min_accuracy)]
+        measured = pd.to_numeric(table[column], errors="coerce").replace(
+            [np.inf, -np.inf], np.nan)
+        hits = table[measured >= float(min_value)]
         clears_bar = not hits.empty
         best = hits.iloc[0] if clears_bar else table.iloc[0]
         fcfg = default_filter_config()
@@ -8989,6 +9041,7 @@ def run_auto_screen(tickers: list[str], cfg: dict, min_accuracy: float, min_trad
             "Net PnL": best["Net PnL"], "Reliability": best["Reliability"],
             "Price Now": round(float(frame["Close"].iloc[-1]), 2),
             "Clears bar": "yes" if clears_bar else "no",
+            "Bar metric": metric, "Bar value": best[column],
         }
         row["Quality"] = _quality_score(row)
         if not clears_bar:
@@ -9022,11 +9075,21 @@ def tab_auto_screener(cfg: dict) -> None:
              "expectancy and profit factor sit next to it below. Treat everything here as a "
              "shortlist to validate on another period.")
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     universe = c1.selectbox("Universe", SCREENER_UNIVERSES, key="auto_universe")
-    min_accuracy = c2.number_input("Minimum accuracy %", 50.0, 100.0, 90.0, 1.0,
-                                   key="auto_acc")
-    signal_window = c3.number_input("Signal window (candles)", 1, 20, 3, key="auto_window")
+    metric = c2.selectbox("Qualify on", list(AUTO_METRICS), index=0, key="auto_metric",
+                          help="The search optimises for this metric and the bar below is "
+                               "applied to it. Accuracy is the default, but it is the weakest "
+                               "of the five on its own — a high win rate says nothing about the "
+                               "size of the losses paying for it.")
+    default_bar = AUTO_METRICS[metric][2]
+    min_value = c3.number_input(f"Minimum {metric.lower()}", -1e9, 1e9, float(default_bar),
+                                0.5 if default_bar < 10 else 1.0, key=f"auto_bar_{metric}")
+    signal_window = c4.number_input("Signal window (candles)", 1, 20, 3, key="auto_window")
+    if metric.startswith("Accuracy") and min_value >= 85:
+        st.warning("An accuracy bar this high almost always selects setups with a tiny target "
+                   "and a wide stop. Check the expectancy and profit factor columns before "
+                   "believing the win rate.")
 
     custom_text = ""
     if universe.startswith("Custom"):
@@ -9060,8 +9123,8 @@ def tab_auto_screener(cfg: dict) -> None:
         else:
             bar = st.progress(0.0, text="Starting ...")
             st.session_state.auto_results = run_auto_screen(
-                chosen, cfg, float(min_accuracy), int(min_trades), int(iterations),
-                timeframes, int(signal_window), safe_only, bar)
+                chosen, cfg, float(min_value), int(min_trades), int(iterations),
+                timeframes, int(signal_window), safe_only, bar, metric=metric)
             bar.empty()
 
     payload = st.session_state.get("auto_results")
@@ -9078,13 +9141,14 @@ def tab_auto_screener(cfg: dict) -> None:
 
     st.markdown("#### Currently signalling")
     if hot.empty:
-        st.info("Nothing that clears the accuracy bar is signalling right now.")
+        st.info(f"Nothing that clears the {metric.lower()} bar is signalling right now.")
     else:
         front = [c for c in ["Ticker", "Timeframe", "Quality", "Signal", "When", "Bars Ago",
                              "Price at Signal", "Price Now", "Move in Favour", "R Multiple Now",
                              "Strategy", "Stop-Loss", "SL Value", "Target", "TP Value", "Filter",
                              "Win %", "Trades", "Expectancy", "Profit Factor", "Sharpe",
-                             "Net PnL", "Reliability", "Period", "Signal Time",
+                             "Net PnL", "Reliability", "Bar metric", "Bar value",
+                             "Period", "Signal Time",
                              "Fill Price (next open)", "Suggested Stop", "Suggested Target",
                              "Clears bar"] if c in hot.columns]
         hot = hot.sort_values("Quality", ascending=False)
@@ -9111,8 +9175,8 @@ def tab_auto_screener(cfg: dict) -> None:
         cols = [c for c in ["Ticker", "Timeframe", "Period", "Quality", "Strategy",
                             "Stop-Loss", "SL Value", "Target", "TP Value", "Filter",
                             "Win %", "Trades", "Expectancy", "Profit Factor", "Sharpe",
-                            "Net PnL", "Reliability", "Price Now", "Clears bar"]
-                if c in quiet.columns]
+                            "Net PnL", "Reliability", "Bar metric", "Bar value",
+                            "Price Now", "Clears bar"] if c in quiet.columns]
         quiet = quiet.sort_values("Quality", ascending=False)
         st.dataframe(quiet[cols], width="stretch", hide_index=True)
         q_labels = [f"{r['Ticker']} · {r['Timeframe']} · {r['Strategy'][:24]} "
@@ -9131,19 +9195,19 @@ def tab_auto_screener(cfg: dict) -> None:
         st.download_button("Download qualified (CSV)", quiet[cols].to_csv(index=False).encode(),
                            "auto_screener_qualified.csv", "text/csv")
 
-    st.markdown("#### Best available below the accuracy bar")
+    st.markdown(f"#### Best available below the {metric.lower()} bar")
     if near.empty:
         st.caption("Every tested ticker either cleared the bar or could not be tested.")
     else:
-        st.caption(f"These did not reach {float(min_accuracy):.0f}% accuracy, but the best "
+        st.caption(f"These did not reach {fmt(min_value)} on {metric.lower()}, but the best "
                    f"configuration found is still shown so you can apply and judge it yourself. "
-                   f"A near miss on accuracy is not necessarily the worse system: check "
+                   f"A near miss is not necessarily the worse system: check "
                    f"expectancy and profit factor, which often favour a lower win rate.")
         near_cols = [c for c in ["Ticker", "Timeframe", "Quality", "Signal", "Strategy",
                                  "Stop-Loss", "SL Value", "Target", "TP Value", "Filter",
                                  "Win %", "Trades", "Expectancy", "Profit Factor", "Sharpe",
-                                 "Net PnL", "Reliability", "Price Now", "Period"]
-                     if c in near.columns]
+                                 "Net PnL", "Reliability", "Bar metric", "Bar value",
+                                 "Price Now", "Period"] if c in near.columns]
         near = near.sort_values("Quality", ascending=False)
         st.dataframe(near[near_cols], width="stretch", hide_index=True)
         near_labels = [f"{r['Ticker']} · {r['Timeframe']} · {r['Strategy'][:24]} "
@@ -10175,6 +10239,46 @@ def _test_status_panel_completeness():
     print("   status panel completeness and the 24/7 square-off exemption  OK")
 
 
+def _test_calendar_timezone_and_risk_distances():
+    """
+    Two regression guards.
+
+    1. Exit times are tz-aware, so the daily index was tz-aware while the
+       calendar looked days up with naive timestamps. A naive timestamp never
+       matches a tz-aware index, so every cell resolved to None and the heatmap
+       rendered blank beneath a perfectly correct month header.
+    2. RiskConfig.distances() was dropped in an earlier rewrite, which crashed
+       the live panel the moment it tried to show where a stop would sit.
+    """
+    for tz in (None, "Asia/Kolkata", "UTC"):
+        trades = pd.DataFrame([
+            {"Exit Time": pd.Timestamp(f"2026-09-{d:02d} 10:00", tz=tz), "PnL": v,
+             "Direction": "LONG"}
+            for d, v in ((1, 1695.0), (2, -826.0), (3, 45.2), (8, -15.0))])
+        daily = calendar_pnl(trades)
+        assert daily.index.tz is None, f"tz={tz}: the calendar index must be naive"
+        for day in (1, 2, 3, 8):
+            assert pd.Timestamp(year=2026, month=9, day=day) in daily.index, \
+                f"tz={tz}: day {day} is unreachable, so its cell would render blank"
+        assert abs(float(daily.sum()) - float(trades["PnL"].sum())) < 1e-9
+
+    risk = RiskConfig("Fixed Percentage", 1.0, "Fixed Points", 121.0, 1.0)
+    sl, tp = risk.distances(77000.0)
+    assert abs(sl - 770.0) < 1e-9 and abs(tp - 121.0) < 1e-9
+    rr = RiskConfig("Fixed Points", 50.0, "Risk : Reward Multiple", 2.0, 1.0)
+    sl2, tp2 = rr.distances(100.0)
+    assert abs(sl2 - 50.0) < 1e-9 and abs(tp2 - 100.0) < 1e-9, "R:R must key off the stop"
+    for kind in SL_TYPES:
+        d_sl, _ = RiskConfig(kind, 1.0, "No Target", 0.0, 1.0).distances(1000.0)
+        assert d_sl >= 0 and np.isfinite(d_sl), f"{kind}: unusable distance"
+
+    assert set(AUTO_METRICS) >= {"Accuracy (win rate %)", "Sharpe ratio", "Net PnL",
+                                 "Profit factor", "Expectancy per trade"}
+    for label, (column, objective, _) in AUTO_METRICS.items():
+        assert objective in OPTIMISER_OBJECTIVES, f"{label}: unknown objective {objective}"
+    print("   calendar timezone handling, risk distances and metric bars  OK")
+
+
 def _test_signal_detail():
     """
     The enriched signal columns must reconcile with each other exactly.
@@ -10457,6 +10561,7 @@ def run_selftest() -> int:
         _test_auto_screener_returns_best()
         _test_intraday_session_squareoff()
         _test_status_panel_completeness()
+        _test_calendar_timezone_and_risk_distances()
         print("-- filters --")
         _test_filters()
         _test_new_filters()
