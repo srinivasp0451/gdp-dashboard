@@ -5834,16 +5834,24 @@ def _metric_style() -> None:
 def _market_data_panel(cfg: dict, snapshot: LiveSnapshot) -> None:
     """The market half of the dashboard: price and where the EMAs stand."""
     frame = snapshot.frame
-    fast = safe_last(frame["ema_fast"]) if "ema_fast" in frame else None
-    slow = safe_last(frame["ema_slow"]) if "ema_slow" in frame else None
+    params = cfg.get("params") or {}
+    fast_closed = safe_last(frame["ema_fast"]) if "ema_fast" in frame else None
+    slow_closed = safe_last(frame["ema_slow"]) if "ema_slow" in frame else None
+    # Projected to the live price, so they move between candles instead of
+    # sitting frozen while the market runs.
+    fast = project_ema(fast_closed, snapshot.ltp, int(_p(params, "ema_fast"))) or fast_closed
+    slow = project_ema(slow_closed, snapshot.ltp, int(_p(params, "ema_slow"))) or slow_closed
     angle = ema_angle_degrees(frame)
     cur = cfg["currency"]
 
     st.markdown("#### \U0001F4C8 Current Market Data")
     c = st.columns(5)
     c[0].metric("Current Price", f"{cur}{fmt(snapshot.ltp)}")
-    c[1].metric("Fast EMA", f"{cur}{fmt(fast)}")
-    c[2].metric("Slow EMA", f"{cur}{fmt(slow)}")
+    c[1].metric("Fast EMA", f"{cur}{fmt(fast)}",
+                f"closed {fmt(fast_closed)}",
+                help="Projected to the live price: where the average would sit if this candle "
+                     "closed now. The delta is its value at the last candle close.")
+    c[2].metric("Slow EMA", f"{cur}{fmt(slow)}", f"closed {fmt(slow_closed)}")
     c[3].metric("EMA Angle", "--" if angle is None else f"{angle:.2f}\u00b0")
     if fast is None or slow is None:
         c[4].metric("Crossover", "--")
@@ -6039,6 +6047,31 @@ def _ck(label, long_ok, short_ok, detail="", current="", need_long="", need_shor
                           gap_long, gap_short)
 
 
+def _gap_to_band(value, low, high):
+    """
+    Distance to the nearest edge of a band, 0.0 when already inside.
+
+    A one-sided comparison is wrong for a zone: price BELOW the band is just as
+    far outside it as price above, and reporting the low side as "met" hides a
+    condition that is not satisfied at all.
+    """
+    if value is None or low is None or high is None:
+        return None
+    try:
+        v, lo, hi = float(value), float(low), float(high)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite([v, lo, hi]).all():
+        return None
+    if lo > hi:
+        lo, hi = hi, lo
+    if v > hi:
+        return v - hi
+    if v < lo:
+        return lo - v
+    return 0.0
+
+
 def _gap(value, target, direction_up: bool):
     """Points still to travel, or 0.0 when already there. None when unknowable."""
     if value is None or target is None:
@@ -6163,27 +6196,57 @@ def _need(value, target, direction_up: bool) -> str:
     return "cleared" if gap <= 0 else f"needs {abs(gap):,.2f} more"
 
 
-def strategy_checks(name: str, frame: pd.DataFrame, params: dict) -> list[ConditionCheck]:
+def project_ema(previous: float | None, price: float | None, length: int) -> float | None:
+    """
+    Where an EMA would sit if the current candle closed at the live price.
+
+    A closed-candle EMA cannot move between candles, so on a slow or lagging feed
+    every EMA reading freezes for minutes at a time and the distance to a
+    crossover looks static even while price runs. Advancing the average by one
+    step at the live price gives a value that moves with the market, which is the
+    number you actually want when asking "how far am I from a cross".
+    """
+    if previous is None or price is None:
+        return None
+    try:
+        prev, px = float(previous), float(price)
+    except (TypeError, ValueError):
+        return None
+    if not (np.isfinite(prev) and np.isfinite(px)) or length <= 0:
+        return None
+    alpha = 2.0 / (float(length) + 1.0)
+    return prev + alpha * (px - prev)
+
+
+def strategy_checks(name: str, frame: pd.DataFrame, params: dict,
+                    ltp: float | None = None) -> list[ConditionCheck]:
     """
     Per-profile conditions, with the distance to each one.
 
-    Only profiles whose conditions decompose cleanly are covered; anything else
-    falls back to the prose description, which is still shown underneath.
+    PRICE comes from the live tick when one is supplied, so the distances move
+    on every refresh. LEVELS (EMAs, Fibonacci zones, gaps, boxes) are derived
+    from closed candles and legitimately step only at a candle close — except
+    the EMAs, which are projected to the live price so a crossover distance is
+    not frozen between bars. The actual signal is still evaluated on the closed
+    candle; that is what condition "Signal fresh enough to act on" reports.
     """
     def last(col):
         return safe_last(frame[col]) if col in frame.columns else None
 
-    close = last("Close")
+    close = last("Close") if ltp is None else float(ltp)
     out: list[ConditionCheck] = []
 
     if name.startswith(("01 ", "32 ", "34 ")):
-        fast, slow = last("ema_fast"), last("ema_slow")
+        fast_closed, slow_closed = last("ema_fast"), last("ema_slow")
+        fast = project_ema(fast_closed, close, int(_p(params, "ema_fast"))) or fast_closed
+        slow = project_ema(slow_closed, close, int(_p(params, "ema_slow"))) or slow_closed
         if fast is not None and slow is not None:
             spread = fast - slow
             out.append(_ck("Fast EMA vs slow EMA", spread > 0, spread < 0,
                            f"spread {fmt_signed(spread)}; a cross needs {fmt(abs(spread))} more",
-                           current=f"fast {fmt(fast)} / slow {fmt(slow)} "
-                                   f"(spread {fmt_signed(spread)})",
+                           current=f"fast {fmt(fast)} / slow {fmt(slow)} at the live price "
+                                   f"(spread {fmt_signed(spread)}; at last close "
+                                   f"{fmt(fast_closed)} / {fmt(slow_closed)})",
                            need_long=f"fast above slow — {_need(fast, slow, True)}",
                            need_short=f"fast below slow — {_need(fast, slow, False)}",
                            gap_long=_gap(fast, slow, True),
@@ -6273,7 +6336,9 @@ def strategy_checks(name: str, frame: pd.DataFrame, params: dict) -> list[Condit
             need_long=f"price inside the bullish gap {fmt(blo)} - {fmt(bhi)} — "
                       f"{_need(close, bhi, False) if close and bhi else ''}",
             need_short=f"price inside the bearish gap {fmt(slo)} - {fmt(shi)} — "
-                       f"{_need(close, slo, True) if close and slo else ''}"))
+                       f"{_need(close, slo, True) if close and slo else ''}",
+            gap_long=_gap_to_band(close, blo, bhi),
+            gap_short=_gap_to_band(close, slo, shi)))
 
     if name.startswith(("35 ", "36 ", "37 ", "38 ", "39 ", "40 ", "41 ")):
         gh, gl = last("fib_golden_hi"), last("fib_golden_lo")
@@ -6286,10 +6351,8 @@ def strategy_checks(name: str, frame: pd.DataFrame, params: dict) -> list[Condit
                            current=f"price {fmt(close)}, zone {fmt(gl)} - {fmt(gh)}",
                            need_long=f"a rising leg with price inside {fmt(gl)} - {fmt(gh)}",
                            need_short=f"a falling leg with price inside {fmt(gl)} - {fmt(gh)}",
-                           gap_long=_gap(close, gh, False) if (close and gh and close > gh)
-                           else 0.0,
-                           gap_short=_gap(close, gl, True) if (close and gl and close < gl)
-                           else 0.0))
+                           gap_long=_gap_to_band(close, gl, gh),
+                           gap_short=_gap_to_band(close, gl, gh)))
     if name.startswith("28 "):
         lvl = last("threshold")
         out.append(_ck("Price threshold",
@@ -6328,7 +6391,8 @@ def render_condition_checklist(cfg: dict, snapshot: LiveSnapshot) -> None:
     """The whole entry gate, one line per condition, with the distance to each."""
     strat = get_strategy(cfg["strategy"])
     engine = engine_checks(cfg, snapshot)
-    strategy_side = strategy_checks(cfg["strategy"], snapshot.frame, cfg.get("params") or {})
+    strategy_side = strategy_checks(cfg["strategy"], snapshot.frame, cfg.get("params") or {},
+                                    ltp=snapshot.ltp)
     # Strategy conditions first, then the filters that can veto them, then the
     # engine plumbing. The question being answered is "what does this profile
     # need", so the profile's own conditions belong at the top.
@@ -6394,7 +6458,11 @@ def render_condition_checklist(cfg: dict, snapshot: LiveSnapshot) -> None:
         st.caption(f"Blocking a LONG: {', '.join(blocked_long[:4])}. "
                    f"Blocking a SHORT: {', '.join(blocked_short[:4])}.")
     st.caption(f"{TICK_YES} met · {TICK_NO} not met · {TICK_NA} not applicable to this profile "
-               "(treated as met rather than blocking every trade).")
+               "(treated as met rather than blocking every trade). Price and the distances "
+               "update on every tick; EMAs are projected to the live price; zones, gaps and "
+               "boxes are drawn from closed candles and step only when a candle closes. The "
+               "trade itself still triggers on a closed candle, which is what condition "
+               "*Signal fresh enough to act on* reports.")
 
 
 def _searching_widget(cfg: dict, snapshot: LiveSnapshot) -> None:
@@ -10279,6 +10347,56 @@ def _test_calendar_timezone_and_risk_distances():
     print("   calendar timezone handling, risk distances and metric bars  OK")
 
 
+def _test_live_status_moves_with_price():
+    """
+    The status panel must track the tick, not sit frozen until a candle closes.
+
+    Price-based distances now use the live quote, and EMAs are projected to it,
+    so "how far am I from a signal" changes on every refresh. Levels themselves
+    still come from closed candles, which is correct -- a Fibonacci zone does not
+    move intra-bar.
+    """
+    df = _synthetic(600, seed=11)
+    params = dict(DEFAULT_PARAMS)
+    params["intraday"] = True
+    frame, _ = prepare(df, "41 \u00b7 Fibonacci + Fair Value Gap", params)
+
+    def zone_gap(price):
+        checks = strategy_checks("41 \u00b7 Fibonacci + Fair Value Gap", frame, params, ltp=price)
+        by = {c.label: c for c in checks}
+        return by["Fibonacci golden zone"].gap_long
+
+    base = float(frame["Close"].iloc[-1])
+    gaps = [zone_gap(base + offset) for offset in (0.0, 25.0, 50.0, 75.0)]
+    assert all(g is not None for g in gaps), "the zone distance must be computable"
+    assert len(set(gaps)) > 1, "the distance did not move when the price moved"
+
+    # A band is two-sided: below it is just as far outside as above it.
+    assert _gap_to_band(90.0, 100.0, 110.0) == 10.0, "below the band is not 'met'"
+    assert _gap_to_band(120.0, 100.0, 110.0) == 10.0
+    assert _gap_to_band(105.0, 100.0, 110.0) == 0.0, "inside the band is met"
+    assert _gap_to_band(105.0, 110.0, 100.0) == 0.0, "edges given backwards must still work"
+    assert _gap_to_band(None, 100.0, 110.0) is None
+
+    # A projected EMA moves toward the live price and never past it.
+    prev = 100.0
+    up = project_ema(prev, 110.0, 9)
+    down = project_ema(prev, 90.0, 9)
+    assert prev < up < 110.0, "an EMA cannot overshoot the price it is chasing"
+    assert 90.0 < down < prev
+    assert project_ema(prev, 110.0, 21) < up, "a longer EMA must move more slowly"
+    assert project_ema(None, 110.0, 9) is None
+
+    # EMA-based distances move with the quote too.
+    ema_gaps = []
+    for offset in (0.0, 40.0, 80.0):
+        checks = strategy_checks("01 \u00b7 Dual EMA Crossover", frame, params,
+                                 ltp=base + offset)
+        ema_gaps.append((checks[0].gap_long, checks[0].gap_short))
+    assert len(set(ema_gaps)) > 1, "the crossover distance did not respond to the price"
+    print("   live status distances move with the tick; bands measured on both sides  OK")
+
+
 def _test_signal_detail():
     """
     The enriched signal columns must reconcile with each other exactly.
@@ -10562,6 +10680,7 @@ def run_selftest() -> int:
         _test_intraday_session_squareoff()
         _test_status_panel_completeness()
         _test_calendar_timezone_and_risk_distances()
+        _test_live_status_moves_with_price()
         print("-- filters --")
         _test_filters()
         _test_new_filters()
