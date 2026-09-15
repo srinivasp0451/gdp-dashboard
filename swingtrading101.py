@@ -6807,9 +6807,13 @@ def render_scan_overrides(prefix: str, cfg: dict) -> dict:
     back to the sidebar configuration.
     """
     out: dict = {}
-    with st.expander("Override the sidebar for this scan (all off by default)"):
-        st.caption("Tick only what you want to change. Everything unticked keeps the sidebar "
-                   "value, so the scan matches what the live engine would do.")
+    if not st.checkbox("Customise this scan (timeframe, period, strategy, stop, target, filters)",
+                       value=False, key=f"{prefix}_ov_master",
+                       help="Off: the scan uses the sidebar exactly, so it matches what the live "
+                            "engine would do. On: tick only the parts you want to change."):
+        return out
+    with st.container(border=True):
+        st.caption("Everything left unticked keeps its sidebar value.")
         c1, c2 = st.columns(2)
 
         if c1.checkbox("Select timeframes", value=False, key=f"{prefix}_ov_tf"):
@@ -7963,6 +7967,7 @@ def tab_optimiser(cfg: dict) -> None:
                             help="Excludes distance-based trailing stops, whose backtested "
                                  "results are systematically optimistic.")
 
+    cfg = apply_scan_overrides(cfg, render_scan_overrides("opt", cfg))
     grid, exhaustive, grid_note, scale_points = render_search_grid("opt", cfg, safe_only)
     if grid_note:
         st.info(grid_note)
@@ -8197,6 +8202,11 @@ def tab_patterns(cfg: dict) -> None:
     max_names = c1.number_input(f"Test at most (of {len(symbols)} listed)", 1,
                                 max(1, len(all_tickers)), min(25, max(1, len(symbols))),
                                 key="pat_max")
+
+    pat_over = render_scan_overrides("pat", cfg)
+    cfg = apply_scan_overrides(cfg, pat_over)
+    if pat_over.get("timeframes"):
+        timeframes = pat_over["timeframes"]
 
     catalog = [p for p, fam in PATTERN_CATALOG.items() if fam in families]
     patterns = st.multiselect("Patterns", catalog, default=catalog, key="pat_patterns")
@@ -8614,6 +8624,10 @@ def tab_signal_lab(cfg: dict) -> None:
                                  "so including them lets an optimiser pick a configuration whose "
                                  "backtest is systematically optimistic.")
 
+    lab_over = render_scan_overrides("lab2", cfg)
+    cfg = apply_scan_overrides(cfg, lab_over)
+    if lab_over.get("timeframes"):
+        timeframes = lab_over["timeframes"]
     grid, exhaustive, grid_note, scale_points = render_search_grid("lab", cfg, safe_only)
     if grid_note:
         st.info(grid_note)
@@ -8727,7 +8741,7 @@ def run_auto_screen(tickers: list[str], cfg: dict, min_accuracy: float, min_trad
     with a terrible reward:risk, which is why expectancy and profit factor are
     shown beside it and why the sample size matters more than the percentage.
     """
-    signalling, quiet, skipped = [], [], []
+    signalling, quiet, near, skipped = [], [], [], []
     costs = cfg.get("costs") or CostModel()
     jobs = [(t, tf) for t in tickers for tf in timeframes]
     started = time.time()
@@ -8764,15 +8778,13 @@ def run_auto_screen(tickers: list[str], cfg: dict, min_accuracy: float, min_trad
                             "Reason": f"no combination reached {int(min_trades)} trades"})
             continue
 
+        # Reporting only "88.9% is below 90%" and discarding the configuration
+        # throws away the answer. The best available combination is returned
+        # either way; it is simply labelled as below the bar so the distinction
+        # stays visible.
         hits = table[pd.to_numeric(table["Win %"], errors="coerce") >= float(min_accuracy)]
-        if hits.empty:
-            best = float(pd.to_numeric(table["Win %"], errors="coerce").max())
-            skipped.append({"Ticker": ticker, "Timeframe": interval,
-                            "Reason": f"best accuracy {best:.1f}% is below "
-                                      f"{float(min_accuracy):.0f}%"})
-            continue
-
-        best = hits.iloc[0]
+        clears_bar = not hits.empty
+        best = hits.iloc[0] if clears_bar else table.iloc[0]
         fcfg = default_filter_config()
         fkey = str(best.get("Filter Key") or "")
         if fkey:
@@ -8795,9 +8807,14 @@ def run_auto_screen(tickers: list[str], cfg: dict, min_accuracy: float, min_trad
             "Expectancy": best["Expectancy"], "Profit Factor": best["Profit Factor"],
             "Net PnL": best["Net PnL"], "Reliability": best["Reliability"],
             "Price Now": round(float(frame["Close"].iloc[-1]), 2),
+            "Clears bar": "yes" if clears_bar else "no",
         }
         row["Quality"] = _quality_score(row)
-        if fired.empty:
+        if not clears_bar:
+            row["Signal"] = ("-" if fired.empty else
+                             ("LONG" if int(fired.iloc[-1]) > 0 else "SHORT"))
+            near.append(row)
+        elif fired.empty:
             row["Signal"] = "-"
             quiet.append(row)
         else:
@@ -8810,7 +8827,8 @@ def run_auto_screen(tickers: list[str], cfg: dict, min_accuracy: float, min_trad
             row.update(detail)
             signalling.append(row)
 
-    return (pd.DataFrame(signalling), pd.DataFrame(quiet), pd.DataFrame(skipped))
+    return (pd.DataFrame(signalling), pd.DataFrame(quiet), pd.DataFrame(near),
+            pd.DataFrame(skipped))
 
 
 def tab_auto_screener(cfg: dict) -> None:
@@ -8845,6 +8863,11 @@ def tab_auto_screener(cfg: dict) -> None:
     min_trades = d3.number_input("Minimum trades to qualify", 1, 200, 10, key="auto_min")
     safe_only = st.checkbox("Backtest-safe exits only", value=True, key="auto_safe")
 
+    auto_over = render_scan_overrides("auto", cfg)
+    cfg = apply_scan_overrides(cfg, auto_over)
+    if auto_over.get("timeframes"):
+        timeframes = auto_over["timeframes"]
+
     jobs = len(chosen) * max(1, len(timeframes))
     st.caption(f"{len(chosen)} ticker(s) x {len(timeframes)} timeframe(s) x {int(iterations)} "
                f"combinations = {jobs * int(iterations):,} backtests. Anything that cannot be "
@@ -8864,12 +8887,13 @@ def tab_auto_screener(cfg: dict) -> None:
     if payload is None:
         st.info("Choose tickers and run.")
         return
-    hot, quiet, skipped = payload
+    hot, quiet, near, skipped = payload
 
-    a, b, c = st.columns(3)
+    a, b, c, d = st.columns(4)
     a.metric("Signalling now", len(hot))
     b.metric("Qualified but quiet", len(quiet))
-    c.metric("Skipped", len(skipped))
+    c.metric("Below the bar", len(near))
+    d.metric("Skipped", len(skipped))
 
     st.markdown("#### Currently signalling")
     if hot.empty:
@@ -8907,11 +8931,43 @@ def tab_auto_screener(cfg: dict) -> None:
         st.dataframe(quiet.sort_values("Quality", ascending=False)[cols], width="stretch",
                      hide_index=True)
 
+    st.markdown("#### Best available below the accuracy bar")
+    if near.empty:
+        st.caption("Every tested ticker either cleared the bar or could not be tested.")
+    else:
+        st.caption(f"These did not reach {float(min_accuracy):.0f}% accuracy, but the best "
+                   f"configuration found is still shown so you can apply and judge it yourself. "
+                   f"A near miss on accuracy is not necessarily the worse system: check "
+                   f"expectancy and profit factor, which often favour a lower win rate.")
+        near_cols = [c for c in ["Ticker", "Timeframe", "Quality", "Signal", "Strategy",
+                                 "Stop-Loss", "SL Value", "Target", "TP Value", "Filter",
+                                 "Win %", "Trades", "Expectancy", "Profit Factor", "Sharpe",
+                                 "Net PnL", "Reliability", "Price Now", "Period"]
+                     if c in near.columns]
+        near = near.sort_values("Quality", ascending=False)
+        st.dataframe(near[near_cols], width="stretch", hide_index=True)
+        near_labels = [f"{r['Ticker']} · {r['Timeframe']} · {r['Strategy'][:24]} "
+                       f"({fmt(r['Win %'])}%)" for _, r in near.iterrows()]
+        near_pick = st.selectbox("Apply which near-miss setup?", near_labels, key="auto_near_pick")
+        if st.button("Apply this near-miss setup to the sidebar", width="stretch",
+                     key="auto_near_apply"):
+            row = near.iloc[near_labels.index(near_pick)]
+            st.session_state.pending_combo = {
+                "strategy": row["Strategy"], "sl_type": row["Stop-Loss"],
+                "sl_value": row["SL Value"], "tp_type": row["Target"],
+                "tp_value": row["TP Value"], "filter_key": str(row["Filter Key"] or ""),
+                "widgets": {"cfg_interval": row["Timeframe"]}}
+            st.session_state.pending_ticker = row["Ticker"]
+            st.rerun()
+        st.download_button("Download below-bar results (CSV)",
+                           near[near_cols].to_csv(index=False).encode(),
+                           "auto_screener_below_bar.csv", "text/csv")
+
     if not skipped.empty:
         with st.expander(f"Skipped ({len(skipped)}) — nothing here raised an error"):
             st.dataframe(skipped, width="stretch", hide_index=True)
-    render_analyst_panel("auto", "these Auto Screener results",
-                         _frame_context(hot if not hot.empty else quiet))
+    context = hot if not hot.empty else (quiet if not quiet.empty else near)
+    render_analyst_panel("auto", "these Auto Screener results", _frame_context(context))
 
 
 def main() -> None:
@@ -9785,6 +9841,39 @@ def _test_calendar_choch_and_overrides():
     print("   PnL calendar, CHoCH flips and override defaults  OK")
 
 
+def _test_auto_screener_returns_best():
+    """
+    A near miss must return the configuration, not just the verdict.
+
+    Reporting "best accuracy 88.9% is below 90%" and discarding the combination
+    throws away the answer the search just computed. The best available result
+    is returned either way and labelled, so the distinction stays visible while
+    the setup remains usable.
+    """
+    table = pd.DataFrame({
+        "Strategy": ["A", "B"], "Win %": [88.9, 70.0], "Trades": [9, 40],
+        "Expectancy": [1.0, 3.0], "Profit Factor": [1.2, 2.4], "Sharpe": [0.5, 1.1],
+        "Net PnL": [50.0, 400.0], "Stop-Loss": ["Fixed Percentage"] * 2,
+        "SL Value": [1.0, 1.0], "Target": ["Fixed Points"] * 2, "TP Value": [40.0, 40.0],
+        "Filter": ["none"] * 2, "Filter Key": ["", ""], "Reliability": ["Backtest-safe"] * 2,
+    })
+    for bar, expect_clear in ((90.0, False), (80.0, True)):
+        hits = table[pd.to_numeric(table["Win %"], errors="coerce") >= bar]
+        clears = not hits.empty
+        best = hits.iloc[0] if clears else table.iloc[0]
+        assert clears == expect_clear, f"bar {bar} classified wrongly"
+        # Either way a full configuration comes back, never just a message.
+        for column in ("Strategy", "Stop-Loss", "SL Value", "Target", "TP Value", "Filter"):
+            assert best[column] is not None, f"{column} missing from the returned setup"
+        assert float(best["Win %"]) > 0
+
+    # The higher win rate is not automatically the better system.
+    assert float(table.iloc[1]["Expectancy"]) > float(table.iloc[0]["Expectancy"])
+    assert _quality_score(dict(table.iloc[1])) > _quality_score(dict(table.iloc[0])), \
+        "40 trades at 70% should outrank 9 trades at 88.9%"
+    print("   auto screener returns the best setup even below the bar  OK")
+
+
 def _test_signal_detail():
     """
     The enriched signal columns must reconcile with each other exactly.
@@ -10064,6 +10153,7 @@ def run_selftest() -> int:
         _test_no_phantom_entry_pnl()
         _test_forming_candle_detection()
         _test_calendar_choch_and_overrides()
+        _test_auto_screener_returns_best()
         print("-- filters --")
         _test_filters()
         _test_new_filters()
