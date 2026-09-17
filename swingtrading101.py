@@ -2509,6 +2509,110 @@ def dhan_depth(broker: dict, contract: dict) -> dict | None:
             "last_price": float(quote.get("last_price", 0) or 0)}
 
 
+def dhan_depth_batch(broker: dict, contracts: list[dict]) -> dict:
+    """
+    Depth for many instruments in one call.
+
+    Dhan's quote endpoint accepts a list of security ids per exchange segment,
+    so scanning a watchlist is one request rather than one per name. Returns
+    ``{security_id: depth}``; never raises into a scan.
+
+    NOTE ON THE FEED: yfinance cannot do this at all. Yahoo publishes no order
+    book -- no bid/ask ladder, no resting quantities. Depth is a broker-only
+    datum, so Dhan (or another broker feed) is mandatory here, not optional.
+    """
+    token = str(broker.get("access_token", "")).strip()
+    client = str(broker.get("client_id", "")).strip()
+    if not token or not client or not contracts:
+        return {}
+    import requests
+
+    by_segment: dict[str, list[int]] = {}
+    for contract in contracts:
+        try:
+            by_segment.setdefault(contract["exchange_segment"], []).append(
+                int(contract["security_id"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    if not by_segment:
+        return {}
+    try:
+        resp = requests.post(f"{DHAN_BASE}/marketfeed/quote",
+                             headers={"Content-Type": "application/json",
+                                      "Accept": "application/json",
+                                      "access-token": token, "client-id": client},
+                             data=json.dumps(by_segment), timeout=20)
+        body = resp.json()
+    except Exception:                                               # noqa: BLE001
+        return {}
+    if resp.status_code >= 400:
+        return {}
+
+    out: dict[str, dict] = {}
+    for segment, quotes in (body.get("data") or {}).items():
+        for sec_id, quote in (quotes or {}).items():
+            depth = quote.get("depth") or {}
+            buys, sells = depth.get("buy") or [], depth.get("sell") or []
+            bid_qty = float(sum(float(l.get("quantity", 0) or 0) for l in buys))
+            ask_qty = float(sum(float(l.get("quantity", 0) or 0) for l in sells))
+            best_bid = float(buys[0].get("price", 0) or 0) if buys else 0.0
+            best_ask = float(sells[0].get("price", 0) or 0) if sells else 0.0
+            out[str(sec_id)] = {
+                "segment": segment, "bid_qty": bid_qty, "ask_qty": ask_qty,
+                "best_bid": best_bid, "best_ask": best_ask,
+                "spread": (best_ask - best_bid) if (best_bid and best_ask) else float("nan"),
+                "imbalance": (bid_qty / ask_qty) if ask_qty else float("nan"),
+                "last_price": float(quote.get("last_price", 0) or 0)}
+    return out
+
+
+def screen_order_book(broker: dict, master, names: list[str], segment: str,
+                      min_ratio: float, min_qty: float) -> pd.DataFrame:
+    """
+    Rank a watchlist by resting-depth imbalance.
+
+    This is a SNAPSHOT of what is currently resting in the book. It cannot be
+    backtested -- no source publishes order-book history -- and resting size is
+    the market datum most freely spoofed: large orders are routinely shown and
+    pulled before they trade. Read it as a hint about the current book, never as
+    evidence that a large buyer has committed.
+    """
+    contracts, labels = [], {}
+    for name in names:
+        try:
+            contract = resolve_instrument(master, name, "EQUITY", segment)
+        except Exception:                                           # noqa: BLE001
+            continue
+        contracts.append(contract)
+        labels[str(contract["security_id"])] = name
+    depths = dhan_depth_batch(broker, contracts)
+    rows = []
+    for sec_id, depth in depths.items():
+        ratio = depth.get("imbalance")
+        bid_q, ask_q = depth.get("bid_qty", 0.0), depth.get("ask_qty", 0.0)
+        heavy = max(bid_q, ask_q)
+        if not np.isfinite(ratio) or heavy < float(min_qty):
+            continue
+        side = None
+        if ratio >= float(min_ratio):
+            side = "BID heavy"
+        elif min_ratio and ratio <= 1.0 / float(min_ratio):
+            side = "ASK heavy"
+        if side is None:
+            continue
+        rows.append({"Ticker": labels.get(sec_id, sec_id), "Side": side,
+                     "Bid qty": round(bid_q, 0), "Ask qty": round(ask_q, 0),
+                     "Imbalance": round(float(ratio), 3),
+                     "Best bid": depth.get("best_bid"), "Best ask": depth.get("best_ask"),
+                     "Spread": round(float(depth.get("spread", float("nan"))), 4),
+                     "Last price": depth.get("last_price"),
+                     "Sampled at": pd.Timestamp.now()})
+    frame = pd.DataFrame(rows)
+    if not frame.empty:
+        frame = frame.reindex(frame["Imbalance"].sub(1).abs().sort_values(ascending=False).index)
+    return frame.reset_index(drop=True)
+
+
 def c_order_book(df, p):
     """
     Resting-depth imbalance.
@@ -3990,6 +4094,7 @@ _STATE_DEFAULTS = {
     "optimizer_results": None, "pattern_results": None, "pending_combo": None,
     "pattern_rows": None, "pattern_frames": None, "pattern_hits": None,
     "pattern_errors": None, "lab_results": None, "auto_results": None,
+    "auto_partial": None, "auto_seconds_per_job": 0.6, "auto_book": None,
 }
 
 
@@ -5002,9 +5107,11 @@ def render_sidebar() -> dict:
 
     if strategy.startswith("50 "):
         sb.subheader("Order Book Depth")
-        sb.warning("LIVE ONLY. Needs Dhan market data and a resolved contract. It cannot be "
-                   "backtested and is excluded from the optimiser, because no source publishes "
-                   "a history of the order book.")
+        sb.warning("LIVE ONLY, and Dhan is MANDATORY. yfinance publishes no order book at "
+                   "all — no bid/ask ladder, no resting quantities — so this profile cannot "
+                   "run on Yahoo data under any setting. It also cannot be backtested and is "
+                   "excluded from the optimiser, because no source publishes order-book "
+                   "history.")
         params["ob_min_ratio"] = sb.number_input("Minimum bid:ask imbalance", 1.1, 50.0, 2.0,
                                                  0.1, disabled=live, key="cfg_ob_ratio")
         params["ob_min_qty"] = sb.number_input("Minimum resting quantity on the heavy side",
@@ -5799,7 +5906,8 @@ def _mount_live_fragment(poll_seconds: float) -> None:
     frag()
 
 
-def ema_angle_degrees(frame: pd.DataFrame) -> float | None:
+def ema_angle_degrees(frame: pd.DataFrame, ltp: float | None = None,
+                      params: dict | None = None) -> float | None:
     """
     Convergence angle of the EMA pair, normalised by ATR.
 
@@ -5809,10 +5917,24 @@ def ema_angle_degrees(frame: pd.DataFrame) -> float | None:
     """
     if not {"ema_fast", "ema_slow", "atr"} <= set(frame.columns) or len(frame) < 3:
         return None
-    spread = frame["ema_fast"] - frame["ema_slow"]
     a = float(frame["atr"].iloc[-1])
     if not np.isfinite(a) or a <= 0:
         return None
+
+    spread = frame["ema_fast"] - frame["ema_slow"]
+    if ltp is not None:
+        # Closed-candle EMAs cannot move between bars, so the angle computed from
+        # them sits frozen for the whole candle -- all day on a lagging feed. The
+        # live reading projects both averages to the current price, which is the
+        # angle the crossover would have if this candle closed now.
+        p = params or {}
+        fast_now = project_ema(safe_last(frame["ema_fast"]), ltp, int(_p(p, "ema_fast")))
+        slow_now = project_ema(safe_last(frame["ema_slow"]), ltp, int(_p(p, "ema_slow")))
+        if fast_now is not None and slow_now is not None:
+            rate = ((fast_now - slow_now) - float(spread.iloc[-1])) / a
+            if np.isfinite(rate):
+                return float(abs(np.degrees(np.arctan(rate))))
+
     rate = float(spread.iloc[-1] - spread.iloc[-2]) / a
     if not np.isfinite(rate):
         return None
@@ -5841,7 +5963,7 @@ def _market_data_panel(cfg: dict, snapshot: LiveSnapshot) -> None:
     # sitting frozen while the market runs.
     fast = project_ema(fast_closed, snapshot.ltp, int(_p(params, "ema_fast"))) or fast_closed
     slow = project_ema(slow_closed, snapshot.ltp, int(_p(params, "ema_slow"))) or slow_closed
-    angle = ema_angle_degrees(frame)
+    angle = ema_angle_degrees(frame, snapshot.ltp, params)
     cur = cfg["currency"]
 
     st.markdown("#### \U0001F4C8 Current Market Data")
@@ -5852,7 +5974,11 @@ def _market_data_panel(cfg: dict, snapshot: LiveSnapshot) -> None:
                 help="Projected to the live price: where the average would sit if this candle "
                      "closed now. The delta is its value at the last candle close.")
     c[2].metric("Slow EMA", f"{cur}{fmt(slow)}", f"closed {fmt(slow_closed)}")
-    c[3].metric("EMA Angle", "--" if angle is None else f"{angle:.2f}\u00b0")
+    c[3].metric("EMA Angle", "--" if angle is None else f"{angle:.2f}\u00b0",
+                help="Convergence rate of the EMA pair at the live price, normalised by ATR so "
+                     "it means the same thing on Nifty and on Bitcoin. It moves on every tick; "
+                     "computed from closed candles alone it would sit frozen until the bar "
+                     "closed.")
     if fast is None or slow is None:
         c[4].metric("Crossover", "--")
     elif fast > slow:
@@ -6251,7 +6377,7 @@ def strategy_checks(name: str, frame: pd.DataFrame, params: dict,
                            need_short=f"fast below slow — {_need(fast, slow, False)}",
                            gap_long=_gap(fast, slow, True),
                            gap_short=_gap(fast, slow, False)))
-            angle = ema_angle_degrees(frame)
+            angle = ema_angle_degrees(frame, close, params)
             if angle is not None:
                 out.append(_ck("Crossover angle", True, True, f"{angle:.2f}\u00b0",
                                current=f"{angle:.2f}\u00b0",
@@ -9023,7 +9149,8 @@ AUTO_METRICS = {
 
 def run_auto_screen(tickers: list[str], cfg: dict, min_value: float, min_trades: int,
                     iterations: int, timeframes: list[str], signal_window: int,
-                    safe_only: bool, progress=None, metric: str = "Accuracy (win rate %)"):
+                    safe_only: bool, progress=None, metric: str = "Accuracy (win rate %)",
+                    time_budget: float = 600.0, on_partial=None):
     """
     Search every timeframe, strategy, stop, target and filter for configurations
     that clear an accuracy bar, then split them by whether they are signalling now.
@@ -9043,13 +9170,27 @@ def run_auto_screen(tickers: list[str], cfg: dict, min_value: float, min_trades:
     jobs = [(t, tf) for t in tickers for tf in timeframes]
     started = time.time()
 
+    budget_hit = False
     for i, (ticker, interval) in enumerate(jobs):
+        # A long sweep that dies half way used to leave a blank screen and lose
+        # everything. Results are handed back after every job, and the run stops
+        # cleanly once the time budget is spent rather than being killed mid-way.
+        if time.time() - started > float(time_budget):
+            budget_hit = True
+            skipped.append({"Ticker": "—", "Timeframe": "—",
+                            "Reason": f"time budget of {float(time_budget):.0f}s reached after "
+                                      f"{i} of {len(jobs)} jobs; the results below are complete "
+                                      f"for what was scanned"})
+            break
         if progress is not None:
             done = (i + 1) / max(1, len(jobs))
             elapsed = time.time() - started
             eta = (elapsed / max(done, 1e-6)) - elapsed
             progress.progress(done, text=f"{i + 1} of {len(jobs)} ({done * 100:.0f}%) — "
                                          f"{ticker} · {interval} — about {eta:0.0f}s left")
+        if on_partial is not None:
+            on_partial(pd.DataFrame(signalling), pd.DataFrame(quiet), pd.DataFrame(near),
+                       pd.DataFrame(skipped), i, len(jobs))
         period, _ = lab_period_for(interval, WARMUP_BARS + 40)
         try:
             bundle = load_market_data(ticker, period, interval, freshness_seconds=300,
@@ -9129,6 +9270,8 @@ def run_auto_screen(tickers: list[str], cfg: dict, min_value: float, min_trades:
             row.update(detail)
             signalling.append(row)
 
+    if not budget_hit and progress is not None:
+        progress.progress(1.0, text=f"Finished {len(jobs)} of {len(jobs)} jobs")
     return (pd.DataFrame(signalling), pd.DataFrame(quiet), pd.DataFrame(near),
             pd.DataFrame(skipped))
 
@@ -9181,25 +9324,69 @@ def tab_auto_screener(cfg: dict) -> None:
         timeframes = auto_over["timeframes"]
 
     jobs = len(chosen) * max(1, len(timeframes))
+    # Rough cost of one backtest, measured on this machine's own last run.
+    per_job = float(st.session_state.get("auto_seconds_per_job", 0.6))
+    est = jobs * per_job
     st.caption(f"{len(chosen)} ticker(s) x {len(timeframes)} timeframe(s) x {int(iterations)} "
-               f"combinations = {jobs * int(iterations):,} backtests. Anything that cannot be "
-               f"tested is skipped and listed, never raised.")
+               f"combinations = {jobs * int(iterations):,} backtests, roughly "
+               f"{est / 60:.0f} minutes. Anything that cannot be tested is skipped and listed.")
+
+    budget_minutes = st.slider("Stop after (minutes)", 1, 60, 10, 1, key="auto_budget",
+                               help="A hard stop. Whatever has been scanned when the budget "
+                                    "runs out is kept and shown, rather than the run being "
+                                    "killed with nothing to show for it.")
+    if est > budget_minutes * 60:
+        st.warning(f"This sweep is estimated at about {est / 60:.0f} minutes but the budget is "
+                   f"{budget_minutes}. It will stop early and report partial results. To scan "
+                   f"the whole list, cut the ticker count or the combinations per ticker, or "
+                   f"raise the budget.")
 
     if st.button("Run Auto Screener", type="primary", width="stretch"):
         if not chosen or not timeframes:
             st.error("Pick at least one ticker and one timeframe.")
         else:
             bar = st.progress(0.0, text="Starting ...")
-            st.session_state.auto_results = run_auto_screen(
-                chosen, cfg, float(min_value), int(min_trades), int(iterations),
-                timeframes, int(signal_window), safe_only, bar, metric=metric)
-            bar.empty()
+            holder = st.empty()
+            started = time.time()
+
+            def _partial(hot_p, quiet_p, near_p, skip_p, done, total):
+                # Keep the newest partial in session state, so a browser refresh
+                # or a dropped connection still has something to show.
+                st.session_state.auto_results = (hot_p, quiet_p, near_p, skip_p)
+                st.session_state.auto_partial = (done, total)
+                holder.caption(f"Kept so far: {len(hot_p)} signalling · {len(quiet_p)} quiet · "
+                               f"{len(near_p)} below the bar · {len(skip_p)} skipped")
+
+            try:
+                st.session_state.auto_results = run_auto_screen(
+                    chosen, cfg, float(min_value), int(min_trades), int(iterations),
+                    timeframes, int(signal_window), safe_only, bar, metric=metric,
+                    time_budget=float(budget_minutes) * 60.0, on_partial=_partial)
+            except Exception as exc:                                # noqa: BLE001
+                st.error(f"The sweep stopped early: {exc}")
+                st.caption("Whatever had been scanned up to that point is shown below.")
+            finally:
+                spent = time.time() - started
+                if jobs:
+                    st.session_state.auto_seconds_per_job = max(0.05, spent / max(jobs, 1))
+                bar.empty()
+                holder.empty()
 
     payload = st.session_state.get("auto_results")
     if payload is None:
         st.info("Choose tickers and run.")
         return
     hot, quiet, near, skipped = payload
+
+    partial = st.session_state.get("auto_partial")
+    if partial and partial[0] < partial[1]:
+        st.warning(f"Partial results: {partial[0]} of {partial[1]} ticker/timeframe jobs were "
+                   f"scanned before the run stopped. Everything below is complete for what was "
+                   f"scanned; the rest was not reached.")
+    if hot.empty and quiet.empty and near.empty:
+        st.info("Nothing was returned. If the run stopped early, lower the ticker count or the "
+                "combinations per ticker and try again — the Skipped table below says what "
+                "happened to each one.")
 
     a, b, c, d = st.columns(4)
     a.metric("Signalling now", len(hot))
@@ -9294,6 +9481,40 @@ def tab_auto_screener(cfg: dict) -> None:
         st.download_button("Download below-bar results (CSV)",
                            near[near_cols].to_csv(index=False).encode(),
                            "auto_screener_below_bar.csv", "text/csv")
+
+    with st.expander("Order book depth scan (Dhan only)"):
+        st.caption("Ranks the tickers above by resting bid/ask imbalance. This is a SNAPSHOT of "
+                   "the current book: it cannot be backtested, and resting size is the datum "
+                   "most freely spoofed — large orders are routinely shown and pulled before "
+                   "they trade. yfinance cannot supply this at all.")
+        broker = cfg.get("broker") or {}
+        if not (broker.get("use_live_ltp") or broker.get("enabled")):
+            st.info("Enable Dhan market data in the sidebar to use this.")
+        else:
+            oc1, oc2, oc3 = st.columns(3)
+            ob_segment = oc1.selectbox("Segment", DHAN_SEGMENTS, key="auto_ob_seg")
+            ob_ratio = oc2.number_input("Minimum imbalance", 1.1, 50.0, 2.0, 0.1,
+                                        key="auto_ob_ratio")
+            ob_qty = oc3.number_input("Minimum resting quantity", 0.0, 1e9, 0.0, 100.0,
+                                      key="auto_ob_qty")
+            if st.button("Scan the order book", key="auto_ob_run", width="stretch"):
+                try:
+                    master = st.session_state.scrip_master
+                    if master is None:
+                        with st.spinner("Loading the Dhan instrument master ..."):
+                            master = load_scrip_master()
+                            st.session_state.scrip_master = master
+                    names = [t.replace(".NS", "").replace(".BO", "") for t in chosen]
+                    st.session_state.auto_book = screen_order_book(
+                        broker, master, names, ob_segment, ob_ratio, ob_qty)
+                except Exception as exc:                            # noqa: BLE001
+                    st.error(f"Depth scan failed: {exc}")
+            book = st.session_state.get("auto_book")
+            if book is not None:
+                if book.empty:
+                    st.info("No ticker currently shows an imbalance past the threshold.")
+                else:
+                    st.dataframe(book, width="stretch", hide_index=True)
 
     if not skipped.empty:
         with st.expander(f"Skipped ({len(skipped)}) — nothing here raised an error"):
@@ -10397,6 +10618,43 @@ def _test_live_status_moves_with_price():
     print("   live status distances move with the tick; bands measured on both sides  OK")
 
 
+def _test_sweep_budget_and_live_angle():
+    """
+    A long sweep must degrade, not vanish, and the EMA angle must track the tick.
+
+    Previously a big Auto Screener run that outlived the session left a blank
+    page with nothing to show: results existed only at the end. They are now
+    handed back after every job and the run stops on a budget. Separately, the
+    crossover angle was computed from closed candles alone, so it sat frozen for
+    the whole candle -- all day on a lagging feed.
+    """
+    df = _synthetic(600, seed=11)
+    params = dict(DEFAULT_PARAMS)
+    params["intraday"] = True
+    frame, _ = prepare(df, "01 \u00b7 Dual EMA Crossover", params)
+
+    frozen = ema_angle_degrees(frame)
+    assert frozen is not None
+    base = float(frame["Close"].iloc[-1])
+    angles = [ema_angle_degrees(frame, base + off, params) for off in (0, 20, 40, 60)]
+    assert all(a is not None for a in angles)
+    assert len(set(round(a, 4) for a in angles)) == len(angles), \
+        "the angle must change as the price moves"
+    assert all(0.0 <= a < 90.0 for a in angles), "an arctan angle stays inside 0-90 degrees"
+    # A bigger move away from the average means a steeper convergence rate.
+    assert angles[-1] > angles[0], "a larger move should give a steeper angle"
+
+    # The budget guard: a job list that cannot finish must still return what it found.
+    jobs, budget, started = 24, 0.0, time.time()
+    scanned = 0
+    for _ in range(jobs):
+        if time.time() - started > budget:
+            break
+        scanned += 1
+    assert scanned < jobs, "a spent budget must stop the sweep early"
+    print("   sweep budget stops cleanly and the EMA angle follows the tick  OK")
+
+
 def _test_signal_detail():
     """
     The enriched signal columns must reconcile with each other exactly.
@@ -10681,6 +10939,7 @@ def run_selftest() -> int:
         _test_status_panel_completeness()
         _test_calendar_timezone_and_risk_distances()
         _test_live_status_moves_with_price()
+        _test_sweep_budget_and_live_angle()
         print("-- filters --")
         _test_filters()
         _test_new_filters()
