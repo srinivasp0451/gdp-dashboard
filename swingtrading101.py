@@ -1005,6 +1005,9 @@ class FilterReport:
     value: str
     long_ok: bool
     short_ok: bool
+    current: str = ""          # the reading in full, with absolute numbers
+    need_long: str = ""        # what it would have to read to allow a LONG
+    need_short: str = ""
 
 
 def evaluate_filters(df: pd.DataFrame, fcfg: dict, extras: dict | None = None):
@@ -1021,7 +1024,8 @@ def evaluate_filters(df: pd.DataFrame, fcfg: dict, extras: dict | None = None):
     ok_short = pd.Series(True, index=idx)
     reports: list[FilterReport] = []
 
-    def apply(key: str, lmask: pd.Series, smask: pd.Series, value: str):
+    def apply(key: str, lmask: pd.Series, smask: pd.Series, value: str,
+              current: str = "", need_long: str = "", need_short: str = ""):
         nonlocal ok_long, ok_short
         lmask = lmask.fillna(False)
         smask = smask.fillna(False)
@@ -1029,7 +1033,8 @@ def evaluate_filters(df: pd.DataFrame, fcfg: dict, extras: dict | None = None):
         ok_short &= smask
         reports.append(FilterReport(key, FILTER_LABELS[key], value,
                                     bool(lmask.iloc[-1]) if len(lmask) else False,
-                                    bool(smask.iloc[-1]) if len(smask) else False))
+                                    bool(smask.iloc[-1]) if len(smask) else False,
+                                    current or value, need_long, need_short))
 
     def on(key: str) -> bool:
         return bool(fcfg.get(key, {}).get("enabled", False))
@@ -1039,7 +1044,9 @@ def evaluate_filters(df: pd.DataFrame, fcfg: dict, extras: dict | None = None):
     if on("adx"):
         cfg = fcfg["adx"]
         m = df["f_adx"].between(cfg["min"], cfg["max"])
-        apply("adx", m, m, fmt(safe_last(df["f_adx"])))
+        band = f"between {fmt(cfg['min'])} and {fmt(cfg['max'])}"
+        apply("adx", m, m, fmt(safe_last(df["f_adx"])),
+              current=f"ADX {fmt(safe_last(df['f_adx']))}", need_long=band, need_short=band)
 
     if on("rsi"):
         cfg = fcfg["rsi"]
@@ -1056,7 +1063,9 @@ def evaluate_filters(df: pd.DataFrame, fcfg: dict, extras: dict | None = None):
             sm = r.between(100.0 - hi, 100.0 - lo)
         else:
             lm, sm = r >= lo, r <= hi
-        apply("rsi", lm, sm, f"{fmt(safe_last(r))} ({mode.split(' =')[0].lower()})")
+        apply("rsi", lm, sm, f"{fmt(safe_last(r))} ({mode.split(' =')[0].lower()})",
+              current=f"RSI {fmt(safe_last(r))} · reading: {mode}",
+              need_long=f"{fmt(lo)} (long level)", need_short=f"{fmt(hi)} (short level)")
 
     if on("crossover"):
         cfg = fcfg["crossover"]
@@ -1078,10 +1087,16 @@ def evaluate_filters(df: pd.DataFrame, fcfg: dict, extras: dict | None = None):
               f"range {fmt(safe_last(df['f_candle_range']))} {size_txt}")
 
     if on("ema20"):
-        apply("ema20", c > df["f_ema20"], c < df["f_ema20"], fmt(safe_last(df["f_ema20"])))
+        apply("ema20", c > df["f_ema20"], c < df["f_ema20"], fmt(safe_last(df["f_ema20"])),
+              current=f"price {fmt(safe_last(c))} vs EMA20 {fmt(safe_last(df['f_ema20']))}",
+              need_long=f"price above {fmt(safe_last(df['f_ema20']))}",
+              need_short=f"price below {fmt(safe_last(df['f_ema20']))}")
 
     if on("sma20"):
-        apply("sma20", c > df["f_sma20"], c < df["f_sma20"], fmt(safe_last(df["f_sma20"])))
+        apply("sma20", c > df["f_sma20"], c < df["f_sma20"], fmt(safe_last(df["f_sma20"])),
+              current=f"price {fmt(safe_last(c))} vs SMA20 {fmt(safe_last(df['f_sma20']))}",
+              need_long=f"price above {fmt(safe_last(df['f_sma20']))}",
+              need_short=f"price below {fmt(safe_last(df['f_sma20']))}")
 
     if on("bb"):
         mode = fcfg["bb"].get("mode", "Above / below middle band")
@@ -1092,33 +1107,56 @@ def evaluate_filters(df: pd.DataFrame, fcfg: dict, extras: dict | None = None):
             lm = sm = inside
         else:
             lm, sm = c > df["f_bb_up"], c < df["f_bb_lo"]
-        apply("bb", lm, sm, f"mid {fmt(safe_last(df['f_bb_mid']))}")
+        apply("bb", lm, sm, f"mid {fmt(safe_last(df['f_bb_mid']))}",
+              current=f"price {fmt(safe_last(c))} · bands {fmt(safe_last(df['f_bb_lo']))} - "
+                      f"{fmt(safe_last(df['f_bb_up']))} · mid {fmt(safe_last(df['f_bb_mid']))}",
+              need_long=f"{mode} (long side)", need_short=f"{mode} (short side)")
 
     if on("macd"):
         apply("macd", df["f_macd_hist"] > 0, df["f_macd_hist"] < 0,
-              fmt(safe_last(df["f_macd_hist"]), 4))
+              fmt(safe_last(df["f_macd_hist"]), 4),
+              current=f"histogram {fmt(safe_last(df['f_macd_hist']), 4)}",
+              need_long="histogram above 0", need_short="histogram below 0")
 
     if on("choch"):
         last_flip = safe_last(df["f_choch"])
         label = {1: "bullish flip", -1: "bearish flip"}.get(last_flip, "no flip yet")
-        apply("choch", df["f_choch"] == 1, df["f_choch"] == -1, label)
+        apply("choch", df["f_choch"] == 1, df["f_choch"] == -1, label,
+              current=f"last flip: {label}", need_long="a bullish flip",
+              need_short="a bearish flip")
 
     if on("smc"):
-        apply("smc", df["f_bos"] == 1, df["f_bos"] == -1,
-              {1: "bullish BOS", -1: "bearish BOS"}.get(safe_last(df["f_bos"]), "none"))
+        state = {1: "bullish BOS", -1: "bearish BOS"}.get(safe_last(df["f_bos"]), "none")
+        apply("smc", df["f_bos"] == 1, df["f_bos"] == -1, state,
+              current=f"last break of structure: {state}",
+              need_long="a bullish break of structure",
+              need_short="a bearish break of structure")
 
     if on("ict"):
         apply("ict", c < df["f_range_mid"], c > df["f_range_mid"],
-              f"range mid {fmt(safe_last(df['f_range_mid']))}")
+              f"range mid {fmt(safe_last(df['f_range_mid']))}",
+              current=f"price {fmt(safe_last(c))} vs range mid "
+                      f"{fmt(safe_last(df['f_range_mid']))}",
+              need_long=f"price below {fmt(safe_last(df['f_range_mid']))} (discount)",
+              need_short=f"price above {fmt(safe_last(df['f_range_mid']))} (premium)")
 
     if on("volspike"):
         mult = float(fcfg["volspike"].get("value", 1.5))
         ratio = df["Volume"] / df["f_vol_ma"].replace(0.0, np.nan)
         m = ratio >= mult
+        vol_now = safe_last(df["Volume"])
+        vol_avg = safe_last(df["f_vol_ma"])
         note = fmt(safe_last(ratio)) + "x"
+        needed_abs = (float(vol_avg) * mult) if vol_avg else None
+        current = (f"{fmt(vol_now, 0)} traded vs {fmt(vol_avg, 0)} average = "
+                   f"{fmt(safe_last(ratio))}x")
+        need = (f"{fmt(mult)}x average"
+                + (f" = {fmt(needed_abs, 0)}" if needed_abs else ""))
         if float(df["Volume"].abs().sum()) == 0.0:
             note = "no volume on feed -- filter blocks everything"
-        apply("volspike", m, m, note)
+            current = "this feed reports no volume at all"
+            need = "a feed that reports volume"
+        apply("volspike", m, m, note, current=current, need_long=need, need_short=need)
 
     if on("regime"):
         trending = fcfg["regime"].get("mode", "").startswith("Trending")
@@ -1128,16 +1166,26 @@ def evaluate_filters(df: pd.DataFrame, fcfg: dict, extras: dict | None = None):
     if on("atrpct"):
         cfg = fcfg["atrpct"]
         m = df["f_atr_pct"].between(cfg["min"], cfg["max"])
-        apply("atrpct", m, m, fmt(safe_last(df["f_atr_pct"]), 3) + "%")
+        band = f"ATR between {fmt(cfg['min'])}% and {fmt(cfg['max'])}% of price"
+        apply("atrpct", m, m, fmt(safe_last(df["f_atr_pct"]), 3) + "%",
+              current=f"ATR {fmt(safe_last(df['f_atr']))} = "
+                      f"{fmt(safe_last(df['f_atr_pct']), 3)}% of price",
+              need_long=band, need_short=band)
 
     if on("supertrend"):
         apply("supertrend", df["f_st_dir"] == 1, df["f_st_dir"] == -1,
-              "up" if safe_last(df["f_st_dir"]) == 1 else "down")
+              "up" if safe_last(df["f_st_dir"]) == 1 else "down",
+              current=f"SuperTrend is {'up' if safe_last(df['f_st_dir']) == 1 else 'down'}",
+              need_long="an up SuperTrend", need_short="a down SuperTrend")
 
     if on("vwap"):
         vol_ok = bool(df.attrs.get("vwap_is_volume_weighted", True))
         label = fmt(safe_last(df["f_vwap"])) + ("" if vol_ok else "  (TWAP fallback, no volume)")
-        apply("vwap", c > df["f_vwap"], c < df["f_vwap"], label)
+        apply("vwap", c > df["f_vwap"], c < df["f_vwap"], label,
+              current=f"price {fmt(safe_last(c))} vs {'VWAP' if vol_ok else 'TWAP'} "
+                      f"{fmt(safe_last(df['f_vwap']))}",
+              need_long=f"price above {fmt(safe_last(df['f_vwap']))}",
+              need_short=f"price below {fmt(safe_last(df['f_vwap']))}")
 
     if on("vix"):
         cfg = fcfg["vix"]
@@ -5994,12 +6042,27 @@ def _market_data_panel(cfg: dict, snapshot: LiveSnapshot) -> None:
     if has_volume:
         vma = safe_last(sma(frame["Volume"], int(_p(cfg.get("params") or {}, "vol_len"))))
         ratio = (float(vol) / float(vma)) if (vol and vma) else None
-        needed = float(_p(cfg.get("params") or {}, "vol_mult"))
+        # The requirement shown must be the one actually enforced. When the
+        # Volume spike FILTER is on it owns the threshold; the strategy's own
+        # vol_mult only applies when it does not. Reading the strategy default
+        # while the filter enforced something else displayed "needs 1.50x" to an
+        # operator who had set 3x.
+        fcfg = (cfg.get("filter_cfg") or {}).get("volspike") or {}
+        if fcfg.get("enabled"):
+            needed = float(fcfg.get("value", 1.5))
+            source = "Volume spike filter"
+        else:
+            needed = float(_p(cfg.get("params") or {}, "vol_mult"))
+            source = "strategy parameter"
         v[0].metric("Candle volume", fmt(vol, 0))
         v[1].metric("Volume average", fmt(vma, 0))
         v[2].metric("Volume x average", f"{fmt(ratio)}x" if ratio else "--",
-                    f"needs {fmt(needed)}x" if ratio else None)
-        v[3].metric("Volume gate", "met" if (ratio and ratio >= needed) else "not met")
+                    f"needs {fmt(needed)}x" if ratio else None,
+                    help=f"Threshold comes from the {source}.")
+        v[3].metric("Volume gate", "met" if (ratio and ratio >= needed) else "not met",
+                    f"{fmt(float(vma) * needed, 0)} required" if vma else None,
+                    help=f"Absolute volume this candle would need: "
+                         f"{fmt(float(vma) * needed, 0) if vma else '--'}.")
     else:
         v[0].metric("Candle volume", "not reported",
                     help="Indices and spot FX report no volume on Yahoo, so volume-gated "
@@ -6233,9 +6296,9 @@ def engine_checks(cfg: dict, snapshot: LiveSnapshot) -> list[ConditionCheck]:
 
     for rep in snapshot.filter_reports:
         checks.append(_ck(f"Filter · {rep.label}", rep.long_ok, rep.short_ok, rep.value,
-                          current=rep.value,
-                          need_long="filter must allow a long",
-                          need_short="filter must allow a short"))
+                          current=rep.current or rep.value,
+                          need_long=rep.need_long or "filter must allow a long",
+                          need_short=rep.need_short or "filter must allow a short"))
 
     ago = snapshot.recent_signal_bars_ago
     lookback = int(cfg.get("entry_lookback", 0) or 0)
@@ -6524,7 +6587,11 @@ def render_condition_checklist(cfg: dict, snapshot: LiveSnapshot) -> None:
     # need", so the profile's own conditions belong at the top.
     filters = [c for c in engine if c.label.startswith("Filter \u00b7")]
     plumbing = [c for c in engine if not c.label.startswith("Filter \u00b7")]
-    checks = strategy_side + filters + plumbing
+    # What the operator configured comes first and on its own; the engine's own
+    # housekeeping is real but is not a strategy condition, so it sits apart
+    # instead of being interleaved with the settings being reasoned about.
+    configured = strategy_side + filters
+    checks = configured + plumbing
     long_ready = all(c.long_ok is not False for c in checks)
     short_ready = all(c.short_ok is not False for c in checks)
 
@@ -6535,12 +6602,21 @@ def render_condition_checklist(cfg: dict, snapshot: LiveSnapshot) -> None:
     else:
         st.info(headline)
 
-    lines = []
-    for i, c in enumerate(checks, start=1):
-        detail = f" — {c.detail}" if c.detail else ""
-        lines.append(f"- **{i}. {c.label}**: LONG {_mark(c.long_ok)} · SHORT {_mark(c.short_ok)}"
-                     f"{detail}")
-    st.markdown("\n".join(lines))
+    def _lines(items, start=1):
+        out_lines = []
+        for offset, c in enumerate(items):
+            detail = f" — {c.detail}" if c.detail else ""
+            out_lines.append(f"- **{start + offset}. {c.label}**: LONG {_mark(c.long_ok)} · "
+                             f"SHORT {_mark(c.short_ok)}{detail}")
+        return "\n".join(out_lines)
+
+    st.markdown("**Your strategy and filter conditions**")
+    st.markdown(_lines(configured) or "- _this profile has no decomposable conditions_")
+    blocking = sum(1 for c in plumbing if c.long_ok is False or c.short_ok is False)
+    with st.expander(f"Engine checks ({blocking} blocking of {len(plumbing)})", expanded=False):
+        st.caption("Housekeeping the engine applies to every profile: is the feed alive, is the "
+                   "book flat, is the signal fresh and untraded. Not strategy settings.")
+        st.markdown(_lines(plumbing, start=len(configured) + 1))
 
     # How close each side is, as a bar rather than a paragraph.
     total = len(checks)
@@ -6699,8 +6775,10 @@ def _strategy_status_panel(cfg: dict, snapshot: LiveSnapshot) -> None:
     r.markdown(f"**Short needs**\n\n{snapshot.status.short_condition}")
 
     if snapshot.filter_reports:
-        rows = [{"Filter": rep.label, "Now": rep.value,
+        rows = [{"Filter": rep.label, "Now": rep.current or rep.value,
+                 "Required for long": rep.need_long or "--",
                  "Long": "PASS" if rep.long_ok else "BLOCK",
+                 "Required for short": rep.need_short or "--",
                  "Short": "PASS" if rep.short_ok else "BLOCK"}
                 for rep in snapshot.filter_reports]
         st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
@@ -10655,6 +10733,48 @@ def _test_sweep_budget_and_live_angle():
     print("   sweep budget stops cleanly and the EMA angle follows the tick  OK")
 
 
+def _test_filter_thresholds_are_the_operators():
+    """
+    Displayed thresholds must be the ones actually enforced.
+
+    The volume gate was ENFORCED at the filter's configured multiple but
+    DISPLAYED using the strategy's own vol_mult default, so an operator who set
+    3x was told "needs 1.50x". The gate was right and the label was wrong, which
+    is the worse of the two failures: it teaches you to distrust a correct number.
+    """
+    df = _synthetic(600, seed=11)
+    params = dict(DEFAULT_PARAMS)
+    params["intraday"] = True
+
+    for configured in (1.5, 3.0, 5.0):
+        fcfg = default_filter_config()
+        fcfg["volspike"]["enabled"] = True
+        fcfg["volspike"]["value"] = configured
+        out, reports = prepare(df, "01 \u00b7 Dual EMA Crossover", params, fcfg, {})
+        rep = next(r for r in reports if r.key == "volspike")
+
+        frame = attach_filter_columns(out, params, True)
+        ratio = frame["Volume"] / frame["f_vol_ma"]
+        expected = int((ratio >= configured).sum())
+        assert int(out["filters_long_ok"].sum()) == expected, \
+            f"the gate must enforce {configured}x, not the strategy default"
+        assert f"{configured:,.2f}x" in rep.need_long, \
+            f"the requirement shown ({rep.need_long}) must state {configured}x"
+        assert "traded vs" in rep.current and "average" in rep.current, \
+            "the reading must carry absolute volume, not just a ratio"
+
+    # Every enabled filter has to describe itself in full, both directions.
+    fcfg = default_filter_config()
+    for key in ("adx", "rsi", "ema20", "sma20", "macd", "smc", "choch", "ict",
+                "atrpct", "supertrend", "vwap", "volspike"):
+        fcfg[key]["enabled"] = True
+    _, reports = prepare(df, "01 \u00b7 Dual EMA Crossover", params, fcfg, {})
+    for rep in reports:
+        assert rep.current, f"{rep.label}: no current reading"
+        assert rep.need_long and rep.need_short, f"{rep.label}: a requirement is missing"
+    print(f"   filter thresholds honour the operator's settings ({len(reports)} filters)  OK")
+
+
 def _test_signal_detail():
     """
     The enriched signal columns must reconcile with each other exactly.
@@ -10940,6 +11060,7 @@ def run_selftest() -> int:
         _test_calendar_timezone_and_risk_distances()
         _test_live_status_moves_with_price()
         _test_sweep_budget_and_live_angle()
+        _test_filter_thresholds_are_the_operators()
         print("-- filters --")
         _test_filters()
         _test_new_filters()
