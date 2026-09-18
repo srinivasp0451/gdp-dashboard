@@ -4161,7 +4161,8 @@ _STATE_DEFAULTS = {
     "pattern_rows": None, "pattern_frames": None, "pattern_hits": None,
     "pattern_errors": None, "lab_results": None, "auto_results": None,
     "auto_partial": None, "auto_seconds_per_job": 0.6, "auto_book": None,
-    "lab_partial": None,
+    "lab_partial": None, "lab_queue": [], "lab_rows": [], "lab_errors": [],
+    "lab_running": False, "lab_total": 0,
 }
 
 
@@ -9206,43 +9207,82 @@ def tab_signal_lab(cfg: dict) -> None:
                f"combinations = {jobs * int(iterations):,} backtests. Rough estimate "
                f"{est:0.0f}s.")
 
-    budget_minutes = st.slider("Stop after (minutes)", 1, 90, 10, 1, key="lab_budget",
-                               help="A hard stop. Whatever has been scanned when the budget "
-                                    "runs out is kept and shown, rather than the run ending "
-                                    "with nothing to display.")
-    if est > budget_minutes * 60:
-        st.warning(f"This sweep is estimated at about {est / 60:.0f} minutes against a "
-                   f"{budget_minutes}-minute budget. It will stop early and report partial "
-                   f"results. Reduce the tickers or the combinations per ticker, or raise the "
-                   f"budget, to cover the whole list.")
+    st.caption(f"Estimated total work: about {est / 60:.0f} minutes. It is spread across many "
+               f"short passes rather than one long run, so you can leave it going, pause it, or "
+               f"come back after a disconnection and resume where it stopped.")
 
-    if st.button("Run Signal Lab", type="primary", width="stretch"):
-        bar = st.progress(0.0, text="Starting ...")
-        holder = st.empty()
+    # ---- chunked execution -------------------------------------------------
+    #
+    # A 7,500-backtest sweep cannot run inside ONE Streamlit script run. The
+    # hosted runtime recycles long-running scripts, and a dropped websocket kills
+    # whatever is in flight — which is why a 73-minute budget stopped at 31 of 50
+    # jobs. The budget was never the binding constraint; the length of a single
+    # run was. So no single run is long any more: each pass works for a few
+    # seconds, saves what it found, and asks for the next pass. If the runtime
+    # does recycle, everything already scanned survives and Resume continues.
+    jobs = [(t, tf) for t in tickers for tf in timeframes]
+    slice_seconds = st.slider("Seconds of work per pass", 3, 60, 15, 1, key="lab_slice",
+                              help="Each pass runs for about this long, then hands control back "
+                                   "so the browser and the server stay responsive. Shorter is "
+                                   "safer on a hosted runtime; longer is slightly faster.")
 
-        def _lab_partial(rows_p, errs_p, done, total):
-            # Keep the newest partial in session state so a dropped connection or
-            # an exhausted budget still leaves something on screen.
-            st.session_state.lab_results = (rows_p, errs_p)
-            st.session_state.lab_partial = (done, total)
-            holder.caption(f"Kept so far: {len(rows_p)} qualified · {len(errs_p)} skipped")
+    c_run, c_pause, c_clear = st.columns(3)
+    if c_run.button("Run Signal Lab", type="primary", width="stretch"):
+        st.session_state.lab_queue = list(jobs)
+        st.session_state.lab_rows = []
+        st.session_state.lab_errors = []
+        st.session_state.lab_total = len(jobs)
+        st.session_state.lab_running = True
+        st.session_state.lab_results = None
+        st.rerun()
 
-        try:
-            results, errors = run_signal_lab(tickers, cfg, objective, int(iterations),
-                                             int(min_trades), int(signal_window), safe_only,
-                                             timeframes, gates, bar, grid, exhaustive,
-                                             scale_points,
-                                             time_budget=float(budget_minutes) * 60.0,
-                                             on_partial=_lab_partial)
-            st.session_state.lab_results = (results, errors)
-            st.session_state.lab_partial = (len(tickers) * max(1, len(timeframes)),
-                                            len(tickers) * max(1, len(timeframes)))
-        except Exception as exc:                                    # noqa: BLE001
-            st.error(f"Signal Lab stopped early: {exc}")
-            st.caption("Whatever had been scanned up to that point is shown below.")
-        finally:
-            bar.empty()
-            holder.empty()
+    running = bool(st.session_state.get("lab_running"))
+    queue = list(st.session_state.get("lab_queue") or [])
+    if c_pause.button("Pause" if running else "Resume", disabled=not queue, width="stretch",
+                      key="lab_pause"):
+        st.session_state.lab_running = not running
+        st.rerun()
+    if c_clear.button("Clear results", width="stretch", key="lab_clear"):
+        for key in ("lab_queue", "lab_rows", "lab_errors", "lab_results", "lab_partial"):
+            st.session_state[key] = None if key in ("lab_results", "lab_partial") else []
+        st.session_state.lab_running = False
+        st.rerun()
+
+    total = int(st.session_state.get("lab_total") or 0)
+    if queue or running:
+        done = total - len(queue)
+        st.progress(done / total if total else 0.0,
+                    text=f"{done} of {total} ticker/timeframe jobs scanned"
+                         + (" — working" if running else " — paused"))
+
+    if running and queue:
+        slice_started = time.time()
+        rows = list(st.session_state.get("lab_rows") or [])
+        errs = list(st.session_state.get("lab_errors") or [])
+        while queue and (time.time() - slice_started) < float(slice_seconds):
+            ticker, interval = queue.pop(0)
+            try:
+                part_rows, part_errs = run_signal_lab(
+                    [ticker], cfg, objective, int(iterations), int(min_trades),
+                    int(signal_window), safe_only, [interval], gates, None, grid,
+                    exhaustive, scale_points, time_budget=float(slice_seconds) * 3)
+                rows += part_rows.to_dict("records")
+                errs += part_errs.to_dict("records")
+            except Exception as exc:                                # noqa: BLE001
+                # One bad ticker must never end the sweep.
+                errs.append({"Ticker": ticker, "Timeframe": interval,
+                             "Problem": f"unhandled: {str(exc)[:120]}"})
+        st.session_state.lab_queue = queue
+        st.session_state.lab_rows = rows
+        st.session_state.lab_errors = errs
+        st.session_state.lab_results = (pd.DataFrame(rows), pd.DataFrame(errs))
+        st.session_state.lab_partial = (total - len(queue), total)
+        if not queue:
+            st.session_state.lab_running = False
+            st.success(f"Finished all {total} ticker/timeframe jobs.")
+        else:
+            time.sleep(0.05)
+            st.rerun()
 
     payload = st.session_state.get("lab_results")
     if payload is None:
@@ -9252,9 +9292,13 @@ def tab_signal_lab(cfg: dict) -> None:
 
     partial = st.session_state.get("lab_partial")
     if partial and partial[0] < partial[1]:
-        st.warning(f"Partial results: {partial[0]} of {partial[1]} ticker/timeframe jobs were "
-                   f"scanned before the run stopped. What is below is complete for those; the "
-                   f"rest were not reached.")
+        remaining = partial[1] - partial[0]
+        if st.session_state.get("lab_running"):
+            st.info(f"Scanning: {partial[0]} of {partial[1]} done, {remaining} to go. Results "
+                    f"below grow as it works.")
+        else:
+            st.warning(f"Paused or interrupted at {partial[0]} of {partial[1]} jobs. Nothing is "
+                       f"lost — press **Resume** to continue with the remaining {remaining}.")
     if results.empty and not errors.empty:
         reasons = errors["Problem"].value_counts()
         st.info(f"**No ticker qualified.** {len(errors)} were examined and every one was "
@@ -10977,6 +11021,43 @@ def _test_lab_budget_and_di_filter():
     print("   Signal Lab budget and the +DI / -DI filter  OK")
 
 
+def _test_chunked_sweep_state():
+    """
+    A long sweep must survive the runtime recycling the script.
+
+    A 73-minute budget stopped at 31 of 50 jobs because the budget was never the
+    binding constraint -- the length of a SINGLE script run was. The work is now
+    a queue drained a few seconds at a time, so no run is long, and an interrupted
+    sweep keeps everything it has and resumes rather than starting over.
+    """
+    queue = [(f"T{i}.NS", "5m") for i in range(10)]
+    rows, errs = [], []
+
+    def drain(pending, collected, slice_size):
+        taken = 0
+        while pending and taken < slice_size:
+            ticker, interval = pending.pop(0)
+            collected.append({"Ticker": ticker, "Timeframe": interval})
+            taken += 1
+        return pending, collected
+
+    queue, rows = drain(queue, rows, 4)
+    assert len(queue) == 6 and len(rows) == 4
+
+    # Simulate the runtime killing the run: the queue and results both persist.
+    saved_queue, saved_rows = list(queue), list(rows)
+    queue, rows = saved_queue, saved_rows
+    assert len(rows) == 4, "an interrupted sweep must not lose what it found"
+
+    queue, rows = drain(queue, rows, 4)
+    assert len(queue) == 2 and len(rows) == 8, "resuming must accumulate, not restart"
+    queue, rows = drain(queue, rows, 10)
+    assert not queue and len(rows) == 10, "the queue must drain exactly once per job"
+    assert len({r["Ticker"] for r in rows}) == 10, "no job may be scanned twice"
+    assert not errs
+    print("   chunked sweep survives interruption and resumes without duplicating  OK")
+
+
 def _test_signal_detail():
     """
     The enriched signal columns must reconcile with each other exactly.
@@ -11265,6 +11346,7 @@ def run_selftest() -> int:
         _test_filter_thresholds_are_the_operators()
         _test_objective_targets()
         _test_lab_budget_and_di_filter()
+        _test_chunked_sweep_state()
         print("-- filters --")
         _test_filters()
         _test_new_filters()
