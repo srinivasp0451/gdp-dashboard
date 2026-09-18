@@ -8445,9 +8445,7 @@ def tab_optimiser(cfg: dict) -> None:
 
     c1, c2, c3, c4 = st.columns(4)
     objective = c1.selectbox("Optimise for", OPTIMISER_OBJECTIVES, key="opt_obj")
-    target = c2.number_input("Desired value", value=80.0, step=1.0, key="opt_target",
-                             help="Combinations at or above this are highlighted as meeting "
-                                  "your goal. It does not restrict the search.")
+    target, target_column = objective_target_input(c2, "opt", objective)
     min_trades = c3.number_input("Minimum trades", 5, 1000, 30, 5, key="opt_min",
                                  help="Combinations with fewer trades are discarded: below "
                                       "roughly 30 the statistics are noise.")
@@ -8478,7 +8476,8 @@ def tab_optimiser(cfg: dict) -> None:
                                objective, int(min_trades), int(iterations),
                                safe_exits_only=safe_only, progress=bar,
                                grid=grid, exhaustive=exhaustive, scale_points=scale_points)
-            st.session_state.optimizer_results = (results, objective, float(target))
+            st.session_state.optimizer_results = (results, objective, float(target),
+                                                  target_column)
         except Exception as exc:                                    # noqa: BLE001
             st.error(f"Optimiser failed: {exc}")
         bar.empty()
@@ -8487,15 +8486,41 @@ def tab_optimiser(cfg: dict) -> None:
     if payload is None:
         st.info("Set an objective and run the search on the sidebar's current ticker and period.")
         return
-    results, objective, target = payload
+    if len(payload) == 4:
+        results, objective, target, target_column = payload
+    else:                                   # results stored before the column was tracked
+        results, objective, target = payload
+        target_column = OBJECTIVE_TARGETS.get(objective, {}).get("column", "Score")
     if results.empty:
         st.warning("No combination produced enough trades to be worth reporting. Lower the "
                    "minimum trade count, widen the period, or use a faster interval.")
         return
 
-    hits = results[results["Score"] >= target]
+    # Measure against the objective's OWN column. Scoring against a blended
+    # "Score" meant a target of 90 on win rate was compared with something that
+    # was never a win rate.
+    column = target_column if target_column in results.columns else "Score"
+    measured = pd.to_numeric(results[column], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    hits = results[measured >= target]
+    unit = OBJECTIVE_TARGETS.get(objective, {}).get("unit", "")
     st.success(f"{len(results)} combinations survived the trade-count filter. "
-               f"{len(hits)} reached your target of {fmt(target)} on {objective}.")
+               f"{len(hits)} reached your target of {fmt(target)}{unit} on {objective} "
+               f"(measured on the `{column}` column).")
+    if hits.empty and not results.empty:
+        best = float(measured.max()) if measured.notna().any() else float("nan")
+        st.info(f"Nothing reached {fmt(target)}{unit}. The best {objective.lower()} found was "
+                f"{fmt(best)}{unit} — the full ranking is still below, so you can lower the "
+                f"target or take the best available.")
+
+    results = results.copy()
+    results.insert(1, "Meets target",
+                   np.where(measured >= target, "yes", "no"))
+    only_hits = st.checkbox(f"Show only combinations that reach {fmt(target)}{unit}",
+                            value=False, key="opt_only_hits",
+                            help="Off by default, so the full ranking stays visible even when "
+                                 "nothing reaches the target.")
+    if only_hits and not hits.empty:
+        results = results[results["Meets target"] == "yes"]
     if len(results) >= 50:
         st.warning(f"You tested {len(results)} combinations. At that many attempts, the top of "
                    "the table is partly selection luck. Re-test the leaders on a different "
@@ -9048,7 +9073,8 @@ def tab_signal_lab(cfg: dict) -> None:
     c1, c2, c3 = st.columns(3)
     universe = c1.selectbox("Universe", SCREENER_UNIVERSES, key="lab_universe")
     objective = c2.selectbox("Optimise for", OPTIMISER_OBJECTIVES, key="lab_obj")
-    signal_window = c3.number_input("Signal window (candles)", 1, 20, 3, key="lab_window")
+    lab_target, lab_target_column = objective_target_input(c3, "lab", objective, "Target")
+    signal_window = st.number_input("Signal window (candles)", 1, 20, 3, key="lab_window")
 
     custom_text = ""
     if universe.startswith("Custom"):
@@ -9070,7 +9096,19 @@ def tab_signal_lab(cfg: dict) -> None:
              "multiplies the combinations tried — and the more you try, the more the winner "
              "owes to luck rather than edge.")
 
+    # The target set beside the objective becomes that objective's gate, so the
+    # number the operator typed is the number actually applied.
+    _GATE_KEYS = {"Win rate (accuracy)": "win", "Sharpe ratio": "sharpe",
+                  "Net PnL": "pnl", "Expectancy per trade": "expectancy",
+                  "Profit factor": "pf"}
     gates: dict = {}
+    apply_target = st.checkbox(
+        f"Require at least {fmt(lab_target)} on {objective.lower()}", value=False,
+        key="lab_use_target",
+        help="Off by default: the lab simply keeps the top-ranked combination per ticker. On, "
+             "a ticker only qualifies if its best combination reaches this number.")
+    if apply_target:
+        gates[_GATE_KEYS.get(objective, "win")] = float(lab_target)
     if use_gates:
         st.markdown("**Quality thresholds** — a combination must clear every gate you set. "
                     "Leave a gate at 0 to ignore it.")
@@ -10775,6 +10813,49 @@ def _test_filter_thresholds_are_the_operators():
     print(f"   filter thresholds honour the operator's settings ({len(reports)} filters)  OK")
 
 
+def _test_objective_targets():
+    """
+    The target must follow the objective it is attached to, and be measured
+    against that objective's own column.
+
+    One fixed default cannot serve five objectives: 80 is a reasonable win rate
+    and an absurd Sharpe ratio. The old target was also compared against a
+    blended "Score", so a target of 90 on win rate was checked against something
+    that was never a win rate.
+    """
+    assert set(OBJECTIVE_TARGETS) == set(OPTIMISER_OBJECTIVES), \
+        "every objective needs a target specification"
+
+    results = pd.DataFrame({
+        "Win %": [95.0, 68.0, 55.0], "Sharpe": [0.4, 2.2, 1.1],
+        "Net PnL": [10.0, 900.0, 250.0], "Expectancy": [0.2, 9.0, 3.0],
+        "Profit Factor": [1.05, 3.4, 1.8], "Score": [40.0, 80.0, 60.0],
+    })
+    # Each objective picks out a different winner, which is the whole point of
+    # having five of them.
+    winners = {}
+    for objective, spec in OBJECTIVE_TARGETS.items():
+        column = spec["column"]
+        assert column in results.columns, f"{objective}: column {column} is not produced"
+        assert spec["min"] <= spec["default"] <= spec["max"], f"{objective}: default out of range"
+        assert spec["step"] > 0 and spec["note"]
+        winners[objective] = int(pd.to_numeric(results[column]).idxmax())
+    assert winners["Win rate (accuracy)"] != winners["Sharpe ratio"], \
+        "accuracy and Sharpe should not agree on this sample"
+
+    # Counting against the objective's column, not a blended score.
+    measured = pd.to_numeric(results[OBJECTIVE_TARGETS["Win rate (accuracy)"]["column"]])
+    assert int((measured >= 90.0).sum()) == 1
+    assert int((measured >= 100.0).sum()) == 0, "100% must be reachable to ask for, and to miss"
+    measured_pf = pd.to_numeric(results[OBJECTIVE_TARGETS["Profit factor"]["column"]])
+    assert int((measured_pf >= 1.5).sum()) == 2
+
+    # An unreachable target must not hide the ranking; the best is still knowable.
+    best = float(measured.max())
+    assert best == 95.0, "the best available must remain reportable when nothing qualifies"
+    print("   objective targets follow the objective and measure its own column  OK")
+
+
 def _test_signal_detail():
     """
     The enriched signal columns must reconcile with each other exactly.
@@ -11061,6 +11142,7 @@ def run_selftest() -> int:
         _test_live_status_moves_with_price()
         _test_sweep_budget_and_live_angle()
         _test_filter_thresholds_are_the_operators()
+        _test_objective_targets()
         print("-- filters --")
         _test_filters()
         _test_new_filters()
@@ -11264,6 +11346,50 @@ _OPTIMISER_EXCLUDE = ("16 \u00b7", "17 \u00b7", "28 \u00b7", "29 \u00b7", "44 \u
 
 OPTIMISER_OBJECTIVES = ["Win rate (accuracy)", "Sharpe ratio", "Net PnL", "Expectancy per trade",
                         "Profit factor"]
+
+# For each objective: the results column it lives in, a sensible default target,
+# the range and step the input should use, and how to label it. A single default
+# cannot serve all five -- 80 is a reasonable win rate and an absurd Sharpe -- so
+# the control follows whichever objective is selected.
+OBJECTIVE_TARGETS = {
+    "Win rate (accuracy)":  {"column": "Win %", "default": 90.0, "min": 0.0, "max": 100.0,
+                             "step": 1.0, "unit": "%",
+                             "note": "100% is reachable on a small sample and means almost "
+                                     "nothing there. Raise the minimum trades alongside it."},
+    "Sharpe ratio":         {"column": "Sharpe", "default": 1.0, "min": -10.0, "max": 100.0,
+                             "step": 0.1, "unit": "",
+                             "note": "Computed per trade and annualised from the sample's own "
+                                     "trade frequency, so it inflates on short fast samples."},
+    "Net PnL":              {"column": "Net PnL", "default": 0.0, "min": -1e9, "max": 1e9,
+                             "step": 100.0, "unit": "",
+                             "note": "In the instrument's own points times quantity, so it is "
+                                     "not comparable across tickers."},
+    "Expectancy per trade": {"column": "Expectancy", "default": 0.0, "min": -1e9, "max": 1e9,
+                             "step": 1.0, "unit": "",
+                             "note": "Average result per trade. The most honest single number "
+                                     "of the five, and the hardest to fake with a tiny target."},
+    "Profit factor":        {"column": "Profit Factor", "default": 1.5, "min": 0.0, "max": 50.0,
+                             "step": 0.1, "unit": "",
+                             "note": "Gross wins over gross losses. Below 1.0 the system loses "
+                                     "money however high the win rate is."},
+}
+
+
+def objective_target_input(container, prefix: str, objective: str, label: str = "Desired value"):
+    """
+    A target input whose default and range follow the selected objective.
+
+    Keyed per objective so switching from a win rate of 90 to a Sharpe ratio does
+    not leave 90 sitting in a Sharpe box.
+    """
+    spec = OBJECTIVE_TARGETS.get(objective, OBJECTIVE_TARGETS["Win rate (accuracy)"])
+    suffix = f" ({spec['unit']})" if spec["unit"] else ""
+    value = container.number_input(
+        f"{label}{suffix} — {objective}", min_value=float(spec["min"]),
+        max_value=float(spec["max"]), value=float(spec["default"]), step=float(spec["step"]),
+        key=f"{prefix}_target_{objective}",
+        help=spec["note"])
+    return float(value), spec["column"]
 
 _OPT_SL_GRID = [("Fixed Percentage", 0.5), ("Fixed Percentage", 1.0), ("Fixed Points", 20.0),
                 ("Fixed Points", 40.0), ("ATR Multiple", 1.5), ("ATR Multiple", 2.5),
