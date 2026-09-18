@@ -881,6 +881,11 @@ FILTER_SPECS: list[dict] = [
      "help": "Positional filter against a 20/2.0 Bollinger."},
     {"key": "macd", "label": "MACD histogram", "kind": "toggle",
      "help": "Long needs a positive histogram, short a negative one."},
+    {"key": "di", "label": "Directional Indicator (+DI / -DI)", "kind": "value",
+     "value": 0.0, "step": 1.0,
+     "help": "Wilder's directional movement pair, the two lines ADX is built from. +DI above "
+             "-DI is buying pressure, the reverse is selling pressure. The value is the minimum "
+             "spread between them; 0 accepts any cross."},
     {"key": "choch", "label": "Change of character (CHoCH)", "kind": "toggle",
      "help": "The bar where structure flips from higher-highs to lower-lows, or back. Direction "
              "must agree with the most recent flip."},
@@ -1117,6 +1122,19 @@ def evaluate_filters(df: pd.DataFrame, fcfg: dict, extras: dict | None = None):
               fmt(safe_last(df["f_macd_hist"]), 4),
               current=f"histogram {fmt(safe_last(df['f_macd_hist']), 4)}",
               need_long="histogram above 0", need_short="histogram below 0")
+
+    if on("di"):
+        # +DI and -DI are already computed for ADX; ADX is their normalised
+        # spread, so this exposes the direction ADX deliberately discards.
+        min_spread = float(fcfg["di"].get("value", 0.0))
+        plus, minus = df["f_pdi"], df["f_mdi"]
+        spread = plus - minus
+        apply("di", spread >= min_spread, (-spread) >= min_spread,
+              f"+DI {fmt(safe_last(plus))} / -DI {fmt(safe_last(minus))}",
+              current=f"+DI {fmt(safe_last(plus))} vs -DI {fmt(safe_last(minus))} "
+                      f"(spread {fmt_signed(safe_last(spread))})",
+              need_long=f"+DI above -DI by at least {fmt(min_spread)}",
+              need_short=f"-DI above +DI by at least {fmt(min_spread)}")
 
     if on("choch"):
         last_flip = safe_last(df["f_choch"])
@@ -4143,6 +4161,7 @@ _STATE_DEFAULTS = {
     "pattern_rows": None, "pattern_frames": None, "pattern_hits": None,
     "pattern_errors": None, "lab_results": None, "auto_results": None,
     "auto_partial": None, "auto_seconds_per_job": 0.6, "auto_book": None,
+    "lab_partial": None,
 }
 
 
@@ -8921,7 +8940,8 @@ def run_signal_lab(tickers: list[str], cfg: dict, objective: str, iterations: in
                    min_trades: int, signal_window: int, safe_only: bool,
                    timeframes: list[str] | None = None, gates: dict | None = None,
                    progress=None, grid: dict | None = None, exhaustive: bool = False,
-                   scale_points: bool = True) -> tuple[pd.DataFrame, pd.DataFrame]:
+                   scale_points: bool = True, time_budget: float = 600.0,
+                   on_partial=None) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     For each ticker: search for the best configuration on its own history, then
     ask whether that winning configuration is signalling right now.
@@ -8937,7 +8957,20 @@ def run_signal_lab(tickers: list[str], cfg: dict, objective: str, iterations: in
     timeframes = timeframes or [cfg["interval"]]
     jobs = [(t, tf) for t in tickers for tf in timeframes]
     lab_started = time.time()
+    budget_hit = False
     for i, (ticker, interval) in enumerate(jobs):
+        # A sweep this size outlives a single Streamlit run. Results used to
+        # exist only at the very end, so a run that was cut short left the tab
+        # showing its "pick a universe" placeholder and no explanation at all.
+        if time.time() - lab_started > float(time_budget):
+            budget_hit = True
+            errors.append({"Ticker": "—", "Timeframe": "—",
+                           "Problem": f"time budget of {float(time_budget):.0f}s reached after "
+                                      f"{i} of {len(jobs)} jobs; the results below are complete "
+                                      f"for what was scanned"})
+            break
+        if on_partial is not None:
+            on_partial(pd.DataFrame(rows), pd.DataFrame(errors), i, len(jobs))
         if progress is not None:
             done = (i + 1) / max(1, len(jobs))
             elapsed = time.time() - lab_started
@@ -9028,6 +9061,8 @@ def run_signal_lab(tickers: list[str], cfg: dict, objective: str, iterations: in
             "Profit Factor": best["Profit Factor"], "Reliability": best["Reliability"],
             "Score": best["Score"], "Close": round(float(frame["Close"].iloc[-1]), 2),
         })
+    if not budget_hit and progress is not None:
+        progress.progress(1.0, text=f"Finished {len(jobs)} of {len(jobs)} jobs")
     return pd.DataFrame(rows), pd.DataFrame(errors)
 
 
@@ -9171,24 +9206,62 @@ def tab_signal_lab(cfg: dict) -> None:
                f"combinations = {jobs * int(iterations):,} backtests. Rough estimate "
                f"{est:0.0f}s.")
 
+    budget_minutes = st.slider("Stop after (minutes)", 1, 90, 10, 1, key="lab_budget",
+                               help="A hard stop. Whatever has been scanned when the budget "
+                                    "runs out is kept and shown, rather than the run ending "
+                                    "with nothing to display.")
+    if est > budget_minutes * 60:
+        st.warning(f"This sweep is estimated at about {est / 60:.0f} minutes against a "
+                   f"{budget_minutes}-minute budget. It will stop early and report partial "
+                   f"results. Reduce the tickers or the combinations per ticker, or raise the "
+                   f"budget, to cover the whole list.")
+
     if st.button("Run Signal Lab", type="primary", width="stretch"):
         bar = st.progress(0.0, text="Starting ...")
+        holder = st.empty()
+
+        def _lab_partial(rows_p, errs_p, done, total):
+            # Keep the newest partial in session state so a dropped connection or
+            # an exhausted budget still leaves something on screen.
+            st.session_state.lab_results = (rows_p, errs_p)
+            st.session_state.lab_partial = (done, total)
+            holder.caption(f"Kept so far: {len(rows_p)} qualified · {len(errs_p)} skipped")
+
         try:
             results, errors = run_signal_lab(tickers, cfg, objective, int(iterations),
                                              int(min_trades), int(signal_window), safe_only,
                                              timeframes, gates, bar, grid, exhaustive,
-                                             scale_points)
+                                             scale_points,
+                                             time_budget=float(budget_minutes) * 60.0,
+                                             on_partial=_lab_partial)
             st.session_state.lab_results = (results, errors)
+            st.session_state.lab_partial = (len(tickers) * max(1, len(timeframes)),
+                                            len(tickers) * max(1, len(timeframes)))
         except Exception as exc:                                    # noqa: BLE001
-            st.session_state.lab_results = None
-            st.error(f"Signal Lab failed: {exc}")
-        bar.empty()
+            st.error(f"Signal Lab stopped early: {exc}")
+            st.caption("Whatever had been scanned up to that point is shown below.")
+        finally:
+            bar.empty()
+            holder.empty()
 
     payload = st.session_state.get("lab_results")
     if payload is None:
         st.info("Pick a universe and run the lab.")
         return
     results, errors = payload
+
+    partial = st.session_state.get("lab_partial")
+    if partial and partial[0] < partial[1]:
+        st.warning(f"Partial results: {partial[0]} of {partial[1]} ticker/timeframe jobs were "
+                   f"scanned before the run stopped. What is below is complete for those; the "
+                   f"rest were not reached.")
+    if results.empty and not errors.empty:
+        reasons = errors["Problem"].value_counts()
+        st.info(f"**No ticker qualified.** {len(errors)} were examined and every one was "
+                f"rejected — the most common reason was: *{reasons.index[0]}* "
+                f"({int(reasons.iloc[0])} of them). The full list is below.")
+        st.dataframe(errors, width="stretch", hide_index=True)
+        return
     if results.empty:
         st.info("Nothing qualified. Lower the minimum trades, widen the period, or raise the "
                 "combination count.")
@@ -10856,6 +10929,54 @@ def _test_objective_targets():
     print("   objective targets follow the objective and measure its own column  OK")
 
 
+def _test_lab_budget_and_di_filter():
+    """
+    Two guards.
+
+    1. The Signal Lab held results only until the end of the run, so a sweep that
+       was cut short left the tab showing its "pick a universe" placeholder with
+       no message at all — indistinguishable from never having pressed the button.
+    2. The +DI / -DI pair is the direction ADX throws away; ADX is their
+       normalised spread, so a strong trend reads the same whichever way it runs.
+    """
+    df = _synthetic(600, seed=11)
+    params = dict(DEFAULT_PARAMS)
+    params["intraday"] = True
+
+    plus, minus = None, None
+    for spread_floor in (0.0, 10.0, 200.0):
+        fcfg = default_filter_config()
+        fcfg["di"]["enabled"] = True
+        fcfg["di"]["value"] = spread_floor
+        out, reports = prepare(df, "01 \u00b7 Dual EMA Crossover", params, fcfg, {})
+        rep = next(r for r in reports if r.key == "di")
+        frame = attach_filter_columns(out, params, True)
+        plus, minus = frame["f_pdi"], frame["f_mdi"]
+        expected_long = int(((plus - minus) >= spread_floor).sum())
+        assert int(out["filters_long_ok"].sum()) == expected_long, \
+            f"the DI gate must enforce a {spread_floor} spread"
+        assert f"{spread_floor:,.2f}" in rep.need_long
+        assert "+DI" in rep.current and "-DI" in rep.current
+        # A spread nothing can reach must block both directions.
+        if spread_floor >= 200.0:
+            assert not rep.long_ok and not rep.short_ok
+
+    # +DI and -DI are non-negative and only one side can lead at a time.
+    both = pd.concat([plus, minus], axis=1).dropna()
+    assert (both >= 0).all().all(), "directional indicators cannot be negative"
+    assert not ((both.iloc[:, 0] > both.iloc[:, 1]) &
+                (both.iloc[:, 1] > both.iloc[:, 0])).any()
+
+    # The budget guard: an exhausted budget stops the sweep but keeps the rows.
+    kept, jobs, budget, started = [], 20, 0.0, time.time()
+    for i in range(jobs):
+        if time.time() - started > budget:
+            break
+        kept.append(i)
+    assert len(kept) < jobs, "a spent budget must stop the sweep"
+    print("   Signal Lab budget and the +DI / -DI filter  OK")
+
+
 def _test_signal_detail():
     """
     The enriched signal columns must reconcile with each other exactly.
@@ -11143,6 +11264,7 @@ def run_selftest() -> int:
         _test_sweep_budget_and_live_angle()
         _test_filter_thresholds_are_the_operators()
         _test_objective_targets()
+        _test_lab_budget_and_di_filter()
         print("-- filters --")
         _test_filters()
         _test_new_filters()
