@@ -7390,7 +7390,9 @@ def tab_screener(cfg: dict) -> None:
     universe = c1.selectbox("Universe", SCREENER_UNIVERSES, key="scr_universe")
     lookback = c2.number_input("Signal window (candles)", 1, 20, 3, key="scr_look",
                                help="How far back a signal still counts as recent.")
-    max_names = c3.number_input("Max tickers", 1, 500, 50, key="scr_max")
+    max_names = c3.number_input("Max tickers", 1, 2000, 50, key="scr_max",
+                                help="Lower this to keep a scan quick. It is capped by the "
+                                     "size of the universe you picked.")
 
     custom_text, uploaded = "", None
     if universe.startswith("Custom"):
@@ -9118,7 +9120,13 @@ def tab_signal_lab(cfg: dict) -> None:
     tickers, note = _universe_tickers(universe, custom_text, None)
 
     d1, d2, d3 = st.columns(3)
-    max_names = d1.number_input("Max tickers", 1, 200, min(10, len(tickers)), key="lab_max")
+    # Keyed by universe: a Streamlit widget keeps its value once created, so a
+    # single key meant switching from a 3-name custom list to Nifty 500 left the
+    # cap stuck at 3. A per-universe key gives each list its own default of "all
+    # of them", which the operator can then lower.
+    max_names = d1.number_input(f"Max tickers (of {len(tickers)} in {universe})",
+                                1, max(1, len(tickers)), max(1, len(tickers)),
+                                key=f"lab_max_{universe}")
     iterations = d2.number_input("Combinations per ticker", 10, 500, 60, 10, key="lab_iters")
     min_trades = d3.number_input("Minimum trades to qualify", 1, 200, 10, key="lab_min")
     e1, e2 = st.columns(2)
@@ -9316,7 +9324,7 @@ def tab_signal_lab(cfg: dict) -> None:
     results = results.copy()
     results["Quality"] = results.apply(_quality_score, axis=1)
     signalling = results[results["Signal"] != "-"]
-    a, b, c = st.columns(3)
+    a, b, c, d = st.columns(4)
     a.metric("Ticker/timeframe pairs", len(results))
     st.caption("**Quality** blends profit factor, Sharpe, win rate and positive expectancy, "
                "scaled by sample size and cut by 25% for optimistic backtests. It is a sorting "
@@ -9324,8 +9332,30 @@ def tab_signal_lab(cfg: dict) -> None:
                "that kept its own best result.")
     b.metric("Signalling now", len(signalling))
     c.metric("Backtest-safe configs", int((results["Reliability"] == "Backtest-safe").sum()))
+    hit_target = int((pd.to_numeric(results.get(lab_target_column, pd.Series(dtype=float)),
+                                    errors="coerce") >= lab_target).sum()) \
+        if lab_target_column in results.columns else 0
+    d.metric(f"Reach {fmt(lab_target)} on {objective.split(' (')[0].lower()}", hit_target,
+             help="Counted against the objective's own column, whether or not you made it a "
+                  "hard requirement.")
 
+    # "Kept so far: 14 qualified" followed by a two-row table reads like a fault.
+    # It is the signalling filter hiding the rest, so say so with the numbers.
     show_only = st.checkbox("Show only tickers that are signalling", value=True, key="lab_filter")
+    hidden = len(results) - len(signalling)
+    if show_only and hidden:
+        st.info(f"**{len(results)} tickers qualified, {len(signalling)} are signalling right "
+                f"now.** The other {hidden} passed the search but have no live signal on the "
+                f"newest closed candle, so they are hidden. Untick the box above to see them.")
+
+    # Qualifying is not the same as clearing the target: unless the requirement
+    # box is ticked, the search simply keeps each ticker's best combination.
+    gate_note = ("the target you set" if st.session_state.get("lab_use_target")
+                 else "no target — each ticker's BEST combination was kept, whatever it scored")
+    st.caption(f"'Qualified' here means: the ticker produced at least "
+               f"{int(min_trades)} trades and met {gate_note}. Check the Win % column before "
+               f"reading any row as a high-accuracy setup.")
+
     table = signalling if show_only else results
     table = table.sort_values(["Quality", "Score"], ascending=[False, False]).reset_index(drop=True)
     front = [c for c in ["Ticker", "Timeframe", "Quality", "Signal", "When", "Bars Ago",
@@ -9539,7 +9569,10 @@ def tab_auto_screener(cfg: dict) -> None:
     if universe.startswith("Custom"):
         custom_text = st.text_area("Tickers", "BTC-USD\nRELIANCE", key="auto_custom")
     all_tickers, note = _universe_tickers(universe, custom_text, None)
-    chosen = st.multiselect("Tickers", all_tickers, default=all_tickers[:5], key="auto_tickers")
+    chosen = st.multiselect(f"Tickers ({len(all_tickers)} in {universe})", all_tickers,
+                            default=all_tickers, key=f"auto_tickers_{universe}",
+                            help="Defaults to the whole universe. Remove names to cut the "
+                                 "runtime; the estimate below updates as you do.")
     if note:
         st.caption(note)
 
@@ -11058,6 +11091,42 @@ def _test_chunked_sweep_state():
     print("   chunked sweep survives interruption and resumes without duplicating  OK")
 
 
+def _test_qualified_versus_signalling():
+    """
+    "14 qualified" beside a two-row table is not a fault, but it reads like one.
+
+    Qualifying means the search found a usable combination for that ticker;
+    signalling means it is triggering right now. The two are different questions
+    and the gap between them must be stated, not left to be inferred from a
+    short table.
+    """
+    results = pd.DataFrame({
+        "Ticker": [f"T{i}.NS" for i in range(14)],
+        "Signal": ["LONG", "SHORT"] + ["-"] * 12,
+        "Win %": [95.0, 91.0] + [55.0] * 12,
+        "Trades": [40] * 14, "Sharpe": [1.2] * 14, "Expectancy": [2.0] * 14,
+        "Profit Factor": [1.8] * 14, "Reliability": ["Backtest-safe"] * 14,
+    })
+    signalling = results[results["Signal"] != "-"]
+    assert len(results) == 14 and len(signalling) == 2
+    hidden = len(results) - len(signalling)
+    assert hidden == 12, "the filter hides the difference, it does not delete it"
+
+    # Qualifying does NOT imply the target was met unless a target was required.
+    target, column = 90.0, "Win %"
+    reach = int((pd.to_numeric(results[column]) >= target).sum())
+    assert reach == 2, "only two rows actually reach 90% on win rate"
+    assert reach < len(results), \
+        "qualified must not be read as 'cleared the target' when no target was required"
+
+    # Widget defaults must follow the universe, not stick at a previous list's size.
+    for universe_size in (3, 20, 40, 500):
+        default = max(1, universe_size)
+        assert default == universe_size, "the default cap is the whole universe"
+        assert min(default, universe_size) == universe_size
+    print("   qualified vs signalling counts, and universe-sized ticker caps  OK")
+
+
 def _test_signal_detail():
     """
     The enriched signal columns must reconcile with each other exactly.
@@ -11347,6 +11416,7 @@ def run_selftest() -> int:
         _test_objective_targets()
         _test_lab_budget_and_di_filter()
         _test_chunked_sweep_state()
+        _test_qualified_versus_signalling()
         print("-- filters --")
         _test_filters()
         _test_new_filters()
