@@ -886,6 +886,12 @@ FILTER_SPECS: list[dict] = [
      "help": "Wilder's directional movement pair, the two lines ADX is built from. +DI above "
              "-DI is buying pressure, the reverse is selling pressure. The value is the minimum "
              "spread between them; 0 accepts any cross."},
+    {"key": "orderblock", "label": "Order block zone", "kind": "toggle",
+     "help": "Price must be trading inside the order block that produced the last break of "
+             "structure — the candle institutions left behind before the move."},
+    {"key": "sweep", "label": "Liquidity sweep", "kind": "value", "value": 5.0, "step": 1.0,
+     "help": "A wick took out a confirmed swing and the body closed back inside within this "
+             "many candles. The value is that lookback."},
     {"key": "choch", "label": "Change of character (CHoCH)", "kind": "toggle",
      "help": "The bar where structure flips from higher-highs to lower-lows, or back. Direction "
              "must agree with the most recent flip."},
@@ -975,6 +981,19 @@ def attach_filter_columns(df: pd.DataFrame, params: dict, intraday: bool) -> pd.
     rng_hi = rolling_high(out["High"], int(p("structure_len")), exclude_current=False)
     rng_lo = rolling_low(out["Low"], int(p("structure_len")), exclude_current=False)
     out["f_range_mid"] = (rng_hi + rng_lo) / 2.0
+    # Order blocks: the last opposing candle before the break of structure.
+    down, up = out["Close"] < out["Open"], out["Close"] > out["Open"]
+    new_bull = (out["f_bos"] == 1) & (out["f_bos"].shift(1) != 1)
+    new_bear = (out["f_bos"] == -1) & (out["f_bos"].shift(1) != -1)
+    out["f_ob_bull_lo"] = out["Low"].where(down).ffill().shift(1).where(new_bull).ffill()
+    out["f_ob_bull_hi"] = out["High"].where(down).ffill().shift(1).where(new_bull).ffill()
+    out["f_ob_bear_lo"] = out["Low"].where(up).ffill().shift(1).where(new_bear).ffill()
+    out["f_ob_bear_hi"] = out["High"].where(up).ffill().shift(1).where(new_bear).ffill()
+
+    # Liquidity sweeps: a wick beyond a confirmed swing, body closing back inside.
+    out["f_sweep_up"] = (out["Low"] < out["f_swing_low"]) & (out["Close"] > out["f_swing_low"])
+    out["f_sweep_dn"] = (out["High"] > out["f_swing_high"]) & (out["Close"] < out["f_swing_high"])
+
     out["f_vol_ma"] = sma(out["Volume"], int(p("vol_len")))
     out["f_atr"] = atr(out["High"], out["Low"], out["Close"], int(p("atr_len")))
     out["f_atr_pct"] = out["f_atr"] / out["Close"] * 100.0
@@ -1135,6 +1154,31 @@ def evaluate_filters(df: pd.DataFrame, fcfg: dict, extras: dict | None = None):
                       f"(spread {fmt_signed(safe_last(spread))})",
               need_long=f"+DI above -DI by at least {fmt(min_spread)}",
               need_short=f"-DI above +DI by at least {fmt(min_spread)}")
+
+    if on("orderblock"):
+        in_bull = (c >= df["f_ob_bull_lo"]) & (c <= df["f_ob_bull_hi"])
+        in_bear = (c >= df["f_ob_bear_lo"]) & (c <= df["f_ob_bear_hi"])
+        apply("orderblock", in_bull, in_bear,
+              f"bull {fmt(safe_last(df['f_ob_bull_lo']))}-{fmt(safe_last(df['f_ob_bull_hi']))}",
+              current=f"price {fmt(safe_last(c))} · bullish OB "
+                      f"{fmt(safe_last(df['f_ob_bull_lo']))}-{fmt(safe_last(df['f_ob_bull_hi']))}"
+                      f" · bearish OB {fmt(safe_last(df['f_ob_bear_lo']))}-"
+                      f"{fmt(safe_last(df['f_ob_bear_hi']))}",
+              need_long="price inside the bullish order block",
+              need_short="price inside the bearish order block")
+
+    if on("sweep"):
+        window = max(1, int(float(fcfg["sweep"].get("value", 5.0))))
+        lm = df["f_sweep_up"].rolling(window, min_periods=1).max().astype(bool)
+        sm = df["f_sweep_dn"].rolling(window, min_periods=1).max().astype(bool)
+        apply("sweep", lm, sm,
+              f"up {int(df['f_sweep_up'].tail(window).sum())} · "
+              f"down {int(df['f_sweep_dn'].tail(window).sum())}",
+              current=f"sweeps in the last {window} candles: "
+                      f"{int(df['f_sweep_up'].tail(window).sum())} below the swing low, "
+                      f"{int(df['f_sweep_dn'].tail(window).sum())} above the swing high",
+              need_long=f"a sweep of the swing low within {window} candles",
+              need_short=f"a sweep of the swing high within {window} candles")
 
     if on("choch"):
         last_flip = safe_last(df["f_choch"])
@@ -3261,6 +3305,13 @@ class RiskConfig:
     step_trigger: float = 0.0        # `k` for the step trail
     min_stop_atr: float = 0.25       # fallback distance when a structural stop is invalid
     costs: CostModel = field(default_factory=CostModel)
+    # Session and time-in-trade limits. All optional; 0 or None means "no limit",
+    # so an unconfigured RiskConfig behaves exactly as before.
+    daily_profit_target: float | None = None
+    daily_loss_limit: float | None = None
+    min_hold_minutes: float = 0.0
+    max_minutes_in_profit: float | None = None
+    max_minutes_in_loss: float | None = None
 
     def distances(self, price: float) -> tuple[float, float]:
         """
@@ -3346,6 +3397,7 @@ class ExitManager:
         self.uses_signal_exit = (risk.sl_type in ("EMA Reverse Crossover", "Strategy Reverse Signal")
                                  or risk.tp_type in ("EMA Reverse Crossover", "Strategy Reverse Signal"))
         self._pending_current_candle_stop = risk.sl_type == "Current Candle Low/High"
+        self.opened_at = pd.Timestamp(ctx.time) if ctx.time is not None else None
         self.sl = self._initial_stop(ctx)
         self.initial_sl = self.sl
         self.risk_points = abs(self.entry - self.sl) if self.sl is not None else None
@@ -3567,6 +3619,33 @@ class ExitManager:
                 return p, "Target"
         return None
 
+    def time_exit_reason(self, now, price: float) -> str | None:
+        """
+        Exit because the trade has been open too long.
+
+        Winners and losers get separate clocks deliberately: a position that is
+        still losing after an hour is a different problem from one that has been
+        drifting in profit. `min_hold_minutes` protects both from being cut
+        before the idea has had any time at all.
+        """
+        risk = self.risk
+        if self.opened_at is None or now is None:
+            return None
+        if not (risk.max_minutes_in_profit or risk.max_minutes_in_loss):
+            return None
+        try:
+            held = (pd.Timestamp(now) - self.opened_at).total_seconds() / 60.0
+        except (TypeError, ValueError):
+            return None
+        if held < float(risk.min_hold_minutes or 0.0):
+            return None
+        winning = self.points(price) > 0
+        if winning and risk.max_minutes_in_profit and held >= float(risk.max_minutes_in_profit):
+            return f"Time limit in profit ({held:.0f}m)"
+        if (not winning) and risk.max_minutes_in_loss and held >= float(risk.max_minutes_in_loss):
+            return f"Time limit in loss ({held:.0f}m)"
+        return None
+
     def signal_exit_reason(self, ctx: BarCtx) -> str | None:
         """Bar-driven exits: EMA reverse crossover and strategy reverse signal."""
         d = self.d
@@ -3717,6 +3796,9 @@ def run_backtest(df: pd.DataFrame, strategy_name: str, params: dict, risk: RiskC
         last_of_session = np.zeros(n, dtype=bool)
     eod_exits = 0
 
+    daily_guard_on = bool(risk.daily_profit_target or risk.daily_loss_limit)
+    day_pnl: dict = {}
+
     trades: list[dict] = []
     pos: Position | None = None
     pending_signal_exit: str | None = None
@@ -3745,7 +3827,16 @@ def run_backtest(df: pd.DataFrame, strategy_name: str, params: dict, risk: RiskC
                     gap_exits += 1
                 trades.append(_close_trade(pos, float(exit_price), ctx.time, reason,
                                            _bar_dict(ctx)))
+                if daily_guard_on:
+                    day = pd.Timestamp(ctx.time).normalize()
+                    day_pnl[day] = day_pnl.get(day, 0.0) + float(trades[-1]["PnL"])
                 fallback_notes.update(mgr.notes)
+                pos, pending_signal_exit, just_exited = None, None, True
+            elif mgr.time_exit_reason(ctx.time, ctx.close):
+                reason = mgr.time_exit_reason(ctx.time, ctx.close)
+                trades.append(_close_trade(pos, float(ctx.close), ctx.time, reason,
+                                           _bar_dict(ctx)))
+                fallback_notes.update(pos.manager.notes)
                 pos, pending_signal_exit, just_exited = None, None, True
             elif square_off_eod and last_of_session[i]:
                 eod_exits += 1
@@ -3760,6 +3851,17 @@ def run_backtest(df: pd.DataFrame, strategy_name: str, params: dict, risk: RiskC
                 mgr.bars_held += 1
 
         # --------------------------------------------------------- entries ---
+        # Daily limits stop NEW entries once the day's realised result passes a
+        # threshold. They never force an open position shut: a target reached is
+        # a reason to stop trading, not a reason to abandon a live trade.
+        if daily_guard_on and pos is None:
+            day = pd.Timestamp(ctx.time).normalize()
+            booked = day_pnl.get(day, 0.0)
+            if risk.daily_profit_target and booked >= float(risk.daily_profit_target):
+                continue
+            if risk.daily_loss_limit and booked <= -abs(float(risk.daily_loss_limit)):
+                continue
+
         if pos is None and not just_exited and sig[i - 1] != 0:
             d = int(sig[i - 1])
             entry = ctx.open                          # signal on N -> fill at N+1 open
@@ -4161,6 +4263,7 @@ _STATE_DEFAULTS = {
     "pattern_rows": None, "pattern_frames": None, "pattern_hits": None,
     "pattern_errors": None, "lab_results": None, "auto_results": None,
     "auto_partial": None, "auto_seconds_per_job": 0.6, "auto_book": None,
+    "oi_snapshots": {},
     "lab_partial": None, "lab_queue": [], "lab_rows": [], "lab_errors": [],
     "lab_running": False, "lab_total": 0,
 }
@@ -4196,6 +4299,22 @@ def record_live_trade(trade: dict) -> None:
     trade = dict(trade)
     trade["Source"] = "LIVE"
     st.session_state.live_trades.append(trade)
+
+
+def live_pnl_today() -> float:
+    """Realised PnL from live trades closed today, for the daily guards."""
+    rows = st.session_state.get("live_trades", []) if st is not None else []
+    if not rows:
+        return 0.0
+    today = pd.Timestamp.now().normalize()
+    total = 0.0
+    for row in rows:
+        try:
+            if pd.Timestamp(row.get("Exit Time")).normalize() == today:
+                total += float(row.get("PnL", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+    return float(total)
 
 
 def live_ledger_frame() -> pd.DataFrame:
@@ -4663,6 +4782,11 @@ def run_cycle(cfg: dict) -> None:
             square_off(reason, price)
             st.session_state.live_last_bar = snapshot.last_closed_time
             return
+        timed = mgr.time_exit_reason(pd.Timestamp.now(), snapshot.ltp)
+        if timed:
+            square_off(timed, snapshot.ltp)
+            st.session_state.live_last_bar = snapshot.last_closed_time
+            return
         if new_bar:
             reason = mgr.signal_exit_reason(closed_ctx)
             if reason:
@@ -4686,6 +4810,15 @@ def run_cycle(cfg: dict) -> None:
     # hours, and blocking on that basis stops live trades for no reason.
     if snapshot.frozen and not cfg.get("allow_stale_entries"):
         return
+
+    # Daily limits gate NEW entries only.
+    risk = cfg["risk"]
+    if risk.daily_profit_target or risk.daily_loss_limit:
+        booked = live_pnl_today()
+        if risk.daily_profit_target and booked >= float(risk.daily_profit_target):
+            return
+        if risk.daily_loss_limit and booked <= -abs(float(risk.daily_loss_limit)):
+            return
 
     strat = get_strategy(cfg["strategy"])
     if strat.immediate:
@@ -5077,9 +5210,53 @@ def render_sidebar() -> dict:
                                                 0.1, key="cfg_slip")
         sb.caption("Enter what your own contract notes show. This is a simple model, not the "
                    "full Indian tax schedule.")
+    # ---- session and time-in-trade limits (all off by default) ----
+    sb.subheader("Session & Trade Limits")
+    daily_target = daily_loss = None
+    if sb.checkbox("Daily PnL limits", value=False, disabled=live, key="cfg_daily_on",
+                   help="Stops NEW entries once the day's realised result passes a threshold. "
+                        "It never forces an open position shut — a target reached is a reason "
+                        "to stop trading, not to abandon a live trade."):
+        dl1, dl2 = sb.columns(2)
+        daily_loss = dl1.number_input("Max daily loss", 0.0, 1_000_000.0, 0.0, 500.0,
+                                      disabled=live, key="cfg_daily_loss",
+                                      help="0 means no loss limit.")
+        daily_target = dl2.number_input("Daily profit target", 0.0, 1_000_000.0, 0.0, 500.0,
+                                        disabled=live, key="cfg_daily_target",
+                                        help="0 means no profit target.")
+        daily_loss = daily_loss or None
+        daily_target = daily_target or None
+
+    min_hold = 0.0
+    max_profit_minutes = max_loss_minutes = None
+    if sb.checkbox("Time limit on winning trades", value=False, disabled=live,
+                   key="cfg_tprofit_on",
+                   help="Closes a position that is IN PROFIT once it has been open this long."):
+        tp1, tp2 = sb.columns(2)
+        min_hold = tp1.number_input("Min hold (minutes)", 0.0, 1000.0, 60.0, 5.0,
+                                    disabled=live, key="cfg_min_hold",
+                                    help="No time-based exit fires before this.")
+        max_profit_minutes = tp2.number_input("Max minutes in profit", 1.0, 1000.0, 1000.0, 5.0,
+                                              disabled=live, key="cfg_max_profit")
+    if sb.checkbox("Time limit on losing trades", value=False, disabled=live,
+                   key="cfg_tloss_on",
+                   help="Closes a position that is IN LOSS once it has been open this long. A "
+                        "trade still losing after an hour is a different problem from one "
+                        "drifting in profit, which is why the two clocks are separate."):
+        tl1, tl2 = sb.columns(2)
+        min_hold = max(min_hold, tl1.number_input("Min hold before cutting (minutes)", 0.0,
+                                                  1000.0, 60.0, 5.0, disabled=live,
+                                                  key="cfg_min_hold_loss"))
+        max_loss_minutes = tl2.number_input("Max minutes in loss", 1.0, 1000.0, 1000.0, 5.0,
+                                            disabled=live, key="cfg_max_loss")
+
     risk = RiskConfig(sl_type=sl_type, sl_value=float(sl_value), tp_type=tp_type,
                       tp_value=float(tp_value), quantity=float(quantity),
-                      step_trigger=float(step_trigger), costs=costs)
+                      step_trigger=float(step_trigger), costs=costs,
+                      daily_profit_target=daily_target, daily_loss_limit=daily_loss,
+                      min_hold_minutes=float(min_hold),
+                      max_minutes_in_profit=max_profit_minutes,
+                      max_minutes_in_loss=max_loss_minutes)
 
     walk_fwd = sb.checkbox("Run segment stability (walk-forward) check", value=False,
                            key="cfg_wfo",
@@ -7308,6 +7485,102 @@ def screen_universe(tickers: list[str], cfg: dict, lookback_bars: int, progress=
     return pd.DataFrame(rows), pd.DataFrame(errors)
 
 
+# =============================================================================
+# SECTION 18b -- CHUNKED SWEEP DRIVER
+# =============================================================================
+# Every long scan in this app runs through here.
+#
+# The reason: a sweep of any size cannot live inside ONE Streamlit script run.
+# The hosted runtime recycles long-running scripts and a dropped websocket kills
+# whatever is in flight, so a single 5-minute pass is unsafe no matter what
+# internal time budget it carries. The work is therefore a QUEUE drained a few
+# seconds at a time. No individual run is long, state accumulates in
+# st.session_state between runs, and an interruption costs at most one slice.
+#
+# It also means partial results exist from the first slice onward, so they can
+# be read and downloaded while the scan is still going.
+
+
+def chunked_sweep(prefix: str, jobs: list, worker, slice_seconds: float = 12.0,
+                  label: str = "jobs"):
+    """
+    Drive a long scan as many short passes.
+
+    ``worker(job)`` returns ``(rows, errors)`` -- lists of dicts -- for ONE job
+    and must not raise; anything it does raise is caught and recorded so a single
+    bad ticker cannot end the sweep.
+
+    Returns ``(rows, errors, finished)`` accumulated so far.
+    """
+    q_key, r_key, e_key = f"{prefix}_queue", f"{prefix}_rows", f"{prefix}_errs"
+    run_key, tot_key = f"{prefix}_running", f"{prefix}_total"
+    for key, default in ((q_key, []), (r_key, []), (e_key, []),
+                         (run_key, False), (tot_key, 0)):
+        if key not in st.session_state:
+            st.session_state[key] = default
+
+    c_run, c_pause, c_clear = st.columns(3)
+    if c_run.button(f"Run ({len(jobs)} {label})", type="primary", width="stretch",
+                    key=f"{prefix}_start"):
+        st.session_state[q_key] = list(jobs)
+        st.session_state[r_key] = []
+        st.session_state[e_key] = []
+        st.session_state[tot_key] = len(jobs)
+        st.session_state[run_key] = True
+        st.rerun()
+
+    queue = list(st.session_state[q_key])
+    running = bool(st.session_state[run_key])
+    if c_pause.button("Pause" if running else "Resume", disabled=not queue,
+                      width="stretch", key=f"{prefix}_pause"):
+        st.session_state[run_key] = not running
+        st.rerun()
+    if c_clear.button("Clear", width="stretch", key=f"{prefix}_clear"):
+        st.session_state[q_key] = []
+        st.session_state[r_key] = []
+        st.session_state[e_key] = []
+        st.session_state[run_key] = False
+        st.session_state[tot_key] = 0
+        st.rerun()
+
+    total = int(st.session_state[tot_key] or 0)
+    done = total - len(queue)
+    if total:
+        st.progress(done / total if total else 0.0,
+                    text=f"{done} of {total} {label} scanned"
+                         + (" — working" if running else
+                            (" — paused" if queue else " — finished")))
+
+    if running and queue:
+        started = time.time()
+        rows = list(st.session_state[r_key])
+        errs = list(st.session_state[e_key])
+        while queue and (time.time() - started) < float(slice_seconds):
+            job = queue.pop(0)
+            try:
+                job_rows, job_errs = worker(job)
+                rows += list(job_rows or [])
+                errs += list(job_errs or [])
+            except Exception as exc:                                # noqa: BLE001
+                errs.append({"Job": str(job), "Problem": f"unhandled: {str(exc)[:140]}"})
+        st.session_state[q_key] = queue
+        st.session_state[r_key] = rows
+        st.session_state[e_key] = errs
+        if not queue:
+            st.session_state[run_key] = False
+            st.success(f"Finished all {total} {label}.")
+        else:
+            st.rerun()
+
+    rows = list(st.session_state[r_key])
+    errs = list(st.session_state[e_key])
+    finished = bool(total) and not queue
+    if queue and not running:
+        st.warning(f"Paused at {done} of {total}. Nothing is lost — press **Resume** to carry "
+                   f"on with the remaining {len(queue)}.")
+    return rows, errs, finished
+
+
 def render_scan_overrides(prefix: str, cfg: dict) -> dict:
     """
     Optional per-tab overrides. Every box is unticked, so leaving them alone
@@ -7431,31 +7704,27 @@ def tab_screener(cfg: dict) -> None:
                f"tab can enter a trade this list does not show — that is the setting to "
                f"reconcile, not a fault.")
 
-    if st.button("Run Screener", type="primary", width="stretch"):
-        st.session_state.screener_error = None
-        bar = st.progress(0.0, text="Starting ...")
-        try:
-            frames, errs = [], []
-            for tf in scan_timeframes:
-                for strat_name in scan_strategies:
-                    scoped = dict(cfg)
-                    scoped["interval"] = tf
-                    scoped["strategy"] = strat_name
-                    scoped["params"] = dict(cfg["params"])
-                    scoped["params"]["intraday"] = tf in INTRADAY_INTERVALS
-                    part, part_err = screen_universe(tickers, scoped, int(lookback), bar,
-                                                     include_older=include_older)
-                    if not part.empty:
-                        part.insert(1, "Timeframe", tf)
-                        frames.append(part)
-                    if not part_err.empty:
-                        errs.append(part_err)
-            results = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-            errors = pd.concat(errs, ignore_index=True) if errs else pd.DataFrame()
-            st.session_state.screener_results = (results, errors)
-        except Exception as exc:                                    # noqa: BLE001
-            st.session_state.screener_error = str(exc)
-        bar.empty()
+    slice_seconds = st.slider("Seconds of work per pass", 3, 45, 12, 1, key="scr_slice",
+                              help="The scan runs in short passes so a hosted runtime cannot "
+                                   "recycle it mid-way.")
+
+    def _scr_worker(job):
+        ticker, tf, strat_name = job
+        scoped = dict(cfg)
+        scoped["interval"] = tf
+        scoped["strategy"] = strat_name
+        scoped["params"] = dict(cfg["params"])
+        scoped["params"]["intraday"] = tf in INTRADAY_INTERVALS
+        part, part_err = screen_universe([ticker], scoped, int(lookback),
+                                         include_older=include_older)
+        if not part.empty:
+            part.insert(1, "Timeframe", tf)
+        return part.to_dict("records"), part_err.to_dict("records")
+
+    jobs = [(t, tf, sname) for t in tickers for tf in scan_timeframes
+            for sname in scan_strategies]
+    rows, errs, _done = chunked_sweep("scr", jobs, _scr_worker, slice_seconds, "scans")
+    st.session_state.screener_results = (pd.DataFrame(rows), pd.DataFrame(errs))
 
     if st.session_state.screener_error:
         st.error(st.session_state.screener_error)
@@ -8757,18 +9026,31 @@ def tab_patterns(cfg: dict) -> None:
                f"{len(tickers) * max(1, len(timeframes))} downloads, each carrying the "
                f"{API_GUARD_DELAY}s guard on both sides.")
 
-    if st.button("Scan for Patterns", type="primary", width="stretch"):
-        if not tickers or not timeframes or not patterns:
-            st.error("Pick at least one symbol, timeframe and pattern.")
-        else:
-            bar = st.progress(0.0, text="Starting ...")
-            rows, frames, hits, errors = scan_patterns(tickers, timeframes, patterns, direction,
-                                                       int(lookback), cfg["params"], bar)
-            bar.empty()
-            st.session_state.pattern_rows = rows
-            st.session_state.pattern_frames = frames
-            st.session_state.pattern_hits = hits
-            st.session_state.pattern_errors = errors
+    if not tickers or not timeframes or not patterns:
+        st.error("Pick at least one symbol, timeframe and pattern.")
+        return
+
+    slice_seconds = st.slider("Seconds of work per pass", 3, 45, 12, 1, key="pat_slice",
+                              help="Short passes keep a hosted runtime from recycling the scan.")
+
+    def _pat_worker(job):
+        ticker, tf = job
+        rows_p, frames_p, hits_p, errs_p = scan_patterns([ticker], [tf], patterns, direction,
+                                                         int(lookback), cfg["params"], None)
+        # Frames and hits back the Chart and Levels buttons, so they accumulate
+        # alongside the rows rather than being rebuilt at the end.
+        store_f = dict(st.session_state.get("pattern_frames") or {})
+        store_h = dict(st.session_state.get("pattern_hits") or {})
+        store_f.update(frames_p)
+        store_h.update(hits_p)
+        st.session_state.pattern_frames = store_f
+        st.session_state.pattern_hits = store_h
+        return rows_p.to_dict("records"), errs_p.to_dict("records")
+
+    jobs = [(t, tf) for t in tickers for tf in timeframes]
+    rows, errs, _done = chunked_sweep("pat", jobs, _pat_worker, slice_seconds, "symbol/timeframe")
+    st.session_state.pattern_rows = pd.DataFrame(rows)
+    st.session_state.pattern_errors = pd.DataFrame(errs)
 
     rows = st.session_state.get("pattern_rows")
     if rows is None:
@@ -9597,46 +9879,38 @@ def tab_auto_screener(cfg: dict) -> None:
                f"combinations = {jobs * int(iterations):,} backtests, roughly "
                f"{est / 60:.0f} minutes. Anything that cannot be tested is skipped and listed.")
 
-    budget_minutes = st.slider("Stop after (minutes)", 1, 60, 10, 1, key="auto_budget",
-                               help="A hard stop. Whatever has been scanned when the budget "
-                                    "runs out is kept and shown, rather than the run being "
-                                    "killed with nothing to show for it.")
-    if est > budget_minutes * 60:
-        st.warning(f"This sweep is estimated at about {est / 60:.0f} minutes but the budget is "
-                   f"{budget_minutes}. It will stop early and report partial results. To scan "
-                   f"the whole list, cut the ticker count or the combinations per ticker, or "
-                   f"raise the budget.")
+    if not chosen or not timeframes:
+        st.error("Pick at least one ticker and one timeframe.")
+        return
 
-    if st.button("Run Auto Screener", type="primary", width="stretch"):
-        if not chosen or not timeframes:
-            st.error("Pick at least one ticker and one timeframe.")
-        else:
-            bar = st.progress(0.0, text="Starting ...")
-            holder = st.empty()
-            started = time.time()
+    slice_seconds = st.slider("Seconds of work per pass", 3, 45, 12, 1, key="auto_slice",
+                              help="Each pass runs about this long, then hands control back. "
+                                   "Short passes are what stop a hosted runtime from recycling "
+                                   "the scan mid-way.")
 
-            def _partial(hot_p, quiet_p, near_p, skip_p, done, total):
-                # Keep the newest partial in session state, so a browser refresh
-                # or a dropped connection still has something to show.
-                st.session_state.auto_results = (hot_p, quiet_p, near_p, skip_p)
-                st.session_state.auto_partial = (done, total)
-                holder.caption(f"Kept so far: {len(hot_p)} signalling · {len(quiet_p)} quiet · "
-                               f"{len(near_p)} below the bar · {len(skip_p)} skipped")
+    def _auto_worker(job):
+        ticker, interval = job
+        hot_p, quiet_p, near_p, skip_p = run_auto_screen(
+            [ticker], cfg, float(min_value), int(min_trades), int(iterations),
+            [interval], int(signal_window), safe_only, None, metric=metric,
+            time_budget=float(slice_seconds) * 4)
+        rows = ([dict(r, Bucket="signalling") for r in hot_p.to_dict("records")]
+                + [dict(r, Bucket="quiet") for r in quiet_p.to_dict("records")]
+                + [dict(r, Bucket="below bar") for r in near_p.to_dict("records")])
+        return rows, skip_p.to_dict("records")
 
-            try:
-                st.session_state.auto_results = run_auto_screen(
-                    chosen, cfg, float(min_value), int(min_trades), int(iterations),
-                    timeframes, int(signal_window), safe_only, bar, metric=metric,
-                    time_budget=float(budget_minutes) * 60.0, on_partial=_partial)
-            except Exception as exc:                                # noqa: BLE001
-                st.error(f"The sweep stopped early: {exc}")
-                st.caption("Whatever had been scanned up to that point is shown below.")
-            finally:
-                spent = time.time() - started
-                if jobs:
-                    st.session_state.auto_seconds_per_job = max(0.05, spent / max(jobs, 1))
-                bar.empty()
-                holder.empty()
+    jobs = [(t, tf) for t in chosen for tf in timeframes]
+    rows, errs, _finished = chunked_sweep("auto", jobs, _auto_worker, slice_seconds,
+                                          "ticker/timeframe jobs")
+    frame = pd.DataFrame(rows)
+    hot = frame[frame["Bucket"] == "signalling"].drop(columns=["Bucket"]) \
+        if not frame.empty else pd.DataFrame()
+    quiet = frame[frame["Bucket"] == "quiet"].drop(columns=["Bucket"]) \
+        if not frame.empty else pd.DataFrame()
+    near = frame[frame["Bucket"] == "below bar"].drop(columns=["Bucket"]) \
+        if not frame.empty else pd.DataFrame()
+    skipped = pd.DataFrame(errs)
+    st.session_state.auto_results = (hot, quiet, near, skipped)
 
     payload = st.session_state.get("auto_results")
     if payload is None:
@@ -9644,11 +9918,7 @@ def tab_auto_screener(cfg: dict) -> None:
         return
     hot, quiet, near, skipped = payload
 
-    partial = st.session_state.get("auto_partial")
-    if partial and partial[0] < partial[1]:
-        st.warning(f"Partial results: {partial[0]} of {partial[1]} ticker/timeframe jobs were "
-                   f"scanned before the run stopped. Everything below is complete for what was "
-                   f"scanned; the rest was not reached.")
+
     if hot.empty and quiet.empty and near.empty:
         st.info("Nothing was returned. If the run stopped early, lower the ticker count or the "
                 "combinations per ticker and try again — the Skipped table below says what "
@@ -9789,6 +10059,398 @@ def tab_auto_screener(cfg: dict) -> None:
     render_analyst_panel("auto", "these Auto Screener results", _frame_context(context))
 
 
+# =============================================================================
+# SECTION 19e -- EXPIRY CALENDAR AND GAMMA BLAST SCREENER
+# =============================================================================
+# Indian expiry conventions differ by instrument, which is the whole point of
+# this screener:
+#   * INDICES expire WEEKLY, so the setup is judged on the expiry day itself.
+#   * STOCKS and FUTURES expire MONTHLY on the last <weekday> of the month, so
+#     "ten days after expiry" means roughly twenty days before the next one --
+#     the stretch where a fresh series has open interest but no expiry pressure.
+#
+# HOLIDAYS ARE NOT MODELLED. When an expiry falls on a trading holiday the
+# exchange moves it a day earlier, and there is no free holiday calendar wired
+# in here. Every date below can therefore be a day out around holidays, which is
+# why the windows are configurable rather than fixed.
+
+
+def monthly_expiry(year: int, month: int, weekday: int = 3) -> "datetime.date":
+    """Last `weekday` of the month (Monday=0 ... Sunday=6; Thursday=3)."""
+    import calendar as _calendar
+    last_day = _calendar.monthrange(year, month)[1]
+    day = last_day
+    while datetime(year, month, day).weekday() != weekday:
+        day -= 1
+    return datetime(year, month, day).date()
+
+
+def last_monthly_expiry(on_date, weekday: int = 3):
+    """The most recent monthly expiry on or before `on_date`."""
+    d = pd.Timestamp(on_date).date()
+    this_month = monthly_expiry(d.year, d.month, weekday)
+    if this_month <= d:
+        return this_month
+    year, month = (d.year - 1, 12) if d.month == 1 else (d.year, d.month - 1)
+    return monthly_expiry(year, month, weekday)
+
+
+def days_since_monthly_expiry(on_date, weekday: int = 3) -> int:
+    d = pd.Timestamp(on_date).date()
+    return (d - last_monthly_expiry(d, weekday)).days
+
+
+def days_to_weekly_expiry(on_date, weekday: int = 3) -> int:
+    """Days until the next weekly expiry; 0 means today IS expiry day."""
+    d = pd.Timestamp(on_date).date()
+    return (weekday - d.weekday()) % 7
+
+
+def looks_like_index(symbol: str) -> bool:
+    t = (symbol or "").upper()
+    return t.startswith("^") or t in {"NIFTY_FIN_SERVICE.NS"} or "NIFTY" in t or "SENSEX" in t
+
+
+def expiry_gate(symbol: str, on_date, cfg: dict) -> tuple[bool, str]:
+    """
+    Is this instrument inside its configured expiry window?
+
+    Returns ``(passes, description)`` so a row can explain itself even when it
+    fails.
+    """
+    kind = cfg.get("kind", "Auto")
+    is_index = looks_like_index(symbol) if kind == "Auto" else kind.startswith("Index")
+    if is_index:
+        to_expiry = days_to_weekly_expiry(on_date, int(cfg.get("weekly_weekday", 3)))
+        limit = int(cfg.get("index_days", 0))
+        return to_expiry <= limit, (f"index · {to_expiry}d to weekly expiry "
+                                    f"(window <= {limit})")
+    since = days_since_monthly_expiry(on_date, int(cfg.get("monthly_weekday", 3)))
+    lo, hi = int(cfg.get("stock_min_days", 8)), int(cfg.get("stock_max_days", 12))
+    return lo <= since <= hi, (f"stock · {since}d since monthly expiry "
+                               f"(window {lo}-{hi})")
+
+
+def nearest_strike(price: float, step: float) -> float:
+    if not step or step <= 0 or not np.isfinite(price):
+        return float("nan")
+    return round(float(price) / float(step)) * float(step)
+
+
+def auto_strike_step(price: float) -> float:
+    """A sane strike interval for a price, when the operator has not set one."""
+    for ceiling, step in ((200, 2.5), (500, 5), (1000, 10), (2500, 20), (5000, 50),
+                          (15000, 50), (30000, 100)):
+        if price <= ceiling:
+            return step
+    return 100.0
+
+
+def dhan_option_chain(broker: dict, underlying_scrip: int, underlying_seg: str,
+                      expiry: str) -> dict:
+    """
+    One option-chain snapshot from DhanHQ.
+
+    Returns ``{strike: {"ce_oi":..., "pe_oi":..., "ce_volume":..., "pe_volume":...}}``
+    or an empty dict. Never raises into a scan.
+    """
+    token = str(broker.get("access_token", "")).strip()
+    client = str(broker.get("client_id", "")).strip()
+    if not (token and client and expiry):
+        return {}
+    import requests
+    try:
+        resp = requests.post(f"{DHAN_BASE}/optionchain",
+                             headers={"Content-Type": "application/json",
+                                      "Accept": "application/json",
+                                      "access-token": token, "client-id": client},
+                             data=json.dumps({"UnderlyingScrip": int(underlying_scrip),
+                                              "UnderlyingSeg": underlying_seg,
+                                              "Expiry": str(expiry)}), timeout=20)
+        body = resp.json()
+    except Exception:                                               # noqa: BLE001
+        return {}
+    if resp.status_code >= 400:
+        return {}
+    chain = ((body.get("data") or {}).get("oc")) or {}
+    out: dict[float, dict] = {}
+    for strike, legs in chain.items():
+        try:
+            k = float(strike)
+        except (TypeError, ValueError):
+            continue
+        ce, pe = (legs or {}).get("ce") or {}, (legs or {}).get("pe") or {}
+        out[k] = {"ce_oi": float(ce.get("oi", 0) or 0), "pe_oi": float(pe.get("oi", 0) or 0),
+                  "ce_volume": float(ce.get("volume", 0) or 0),
+                  "pe_volume": float(pe.get("volume", 0) or 0),
+                  "ce_ltp": float(ce.get("last_price", 0) or 0),
+                  "pe_ltp": float(pe.get("last_price", 0) or 0)}
+    return out
+
+
+def record_oi_snapshot(ticker: str, chain: dict) -> None:
+    """
+    Keep a short history of chain snapshots so OI CHANGE can be measured.
+
+    No free source publishes historical open interest, so "OI is falling" can
+    only ever be observed from the moment this app starts watching. That is a
+    real limitation, not a temporary one: before the first two snapshots exist
+    the short-covering test simply cannot be answered.
+    """
+    if st is None or not chain:
+        return
+    store = st.session_state.setdefault("oi_snapshots", {})
+    series = store.setdefault(ticker, [])
+    series.append({"at": pd.Timestamp.now(), "chain": chain})
+    del series[:-40]                       # a rolling window, not a database
+
+
+def oi_change_at(ticker: str, strike: float) -> dict:
+    """CE/PE open-interest change at one strike, from the stored snapshots."""
+    store = (st.session_state.get("oi_snapshots") or {}) if st is not None else {}
+    series = store.get(ticker) or []
+    if len(series) < 2:
+        return {"samples": len(series)}
+    first, last = series[0]["chain"].get(strike), series[-1]["chain"].get(strike)
+    if not first or not last:
+        return {"samples": len(series)}
+    return {"samples": len(series),
+            "ce_oi": last["ce_oi"], "pe_oi": last["pe_oi"],
+            "ce_oi_change": last["ce_oi"] - first["ce_oi"],
+            "pe_oi_change": last["pe_oi"] - first["pe_oi"],
+            "ce_volume": last["ce_volume"], "pe_volume": last["pe_volume"],
+            "minutes": (series[-1]["at"] - series[0]["at"]).total_seconds() / 60.0}
+
+
+def gamma_blast_scan_one(ticker: str, interval: str, gcfg: dict, params: dict) -> dict | None:
+    """
+    Evaluate one ticker for the setup.
+
+    The PRICE half -- proximity to the level, volume surge, momentum, expiry
+    timing -- is computed from candles and always works. The OPEN INTEREST half
+    needs a broker chain and at least two snapshots; when it is missing the row
+    still comes back, marked so, rather than being silently dropped.
+    """
+    period, _ = lab_period_for(interval, WARMUP_BARS + 40)
+    bundle = load_market_data(ticker, period, interval, freshness_seconds=300, min_bars=60)
+    frame = bundle.frame
+    look = int(gcfg.get("level_lookback", 60))
+    if len(frame) <= look + 5:
+        return None
+
+    close = float(frame["Close"].iloc[-1])
+    resistance = float(frame["High"].iloc[-(look + 1):-1].max())
+    support = float(frame["Low"].iloc[-(look + 1):-1].min())
+    prox = float(gcfg.get("proximity_pct", 1.0)) / 100.0
+
+    near_res = abs(close - resistance) <= resistance * prox
+    near_sup = abs(close - support) <= support * prox
+    if not (near_res or near_sup):
+        return None
+
+    vol_ma = float(sma(frame["Volume"], int(gcfg.get("vol_len", 20))).iloc[-1] or 0)
+    vol_now = float(frame["Volume"].iloc[-1])
+    vol_ratio = (vol_now / vol_ma) if vol_ma else float("nan")
+    has_volume = float(frame["Volume"].tail(100).abs().sum()) > 0
+
+    mom_bars = int(gcfg.get("momentum_bars", 5))
+    past = float(frame["Close"].iloc[-(mom_bars + 1)])
+    momentum_pct = (close - past) / past * 100.0 if past else 0.0
+
+    side = "BULLISH (CE)" if near_res else "BEARISH (PE)"
+    level = resistance if near_res else support
+    direction_ok = (momentum_pct >= float(gcfg.get("momentum_pct", 0.2))) if near_res else \
+                   (momentum_pct <= -float(gcfg.get("momentum_pct", 0.2)))
+    vol_ok = (not has_volume) or (np.isfinite(vol_ratio)
+                                  and vol_ratio >= float(gcfg.get("vol_mult", 1.5)))
+
+    last_date = pd.Timestamp(frame.index[-1])
+    exp_ok, exp_note = expiry_gate(ticker, last_date, gcfg)
+
+    step = float(gcfg.get("strike_step", 0) or 0) or auto_strike_step(level)
+    strike = nearest_strike(level, step)
+    oi = oi_change_at(ticker, strike)
+    watched = int(oi.get("samples", 0))
+    if watched >= 2:
+        change = oi.get("ce_oi_change", 0.0) if near_res else oi.get("pe_oi_change", 0.0)
+        drop_needed = -abs(float(gcfg.get("oi_drop", 0.0)))
+        oi_ok = change <= drop_needed
+        oi_note = (f"{'CE' if near_res else 'PE'} OI change {fmt(change, 0)} over "
+                   f"{fmt(oi.get('minutes'), 0)}m")
+    else:
+        oi_ok = None                       # unknown, not false
+        oi_note = (f"no chain history ({watched} snapshot(s)) — connect Dhan and sample the "
+                   f"chain to test short covering")
+
+    conditions = {"Near level": bool(near_res or near_sup), "Volume surge": bool(vol_ok),
+                  "Momentum": bool(direction_ok), "Expiry window": bool(exp_ok)}
+    if oi_ok is not None:
+        conditions["OI falling (short covering)"] = bool(oi_ok)
+    met = sum(1 for v in conditions.values() if v)
+
+    return {
+        "Ticker": ticker, "Timeframe": interval, "Side": side,
+        "Spot": round(close, 2), "Level": round(level, 2),
+        "Distance %": round(abs(close - level) / level * 100.0, 3),
+        "Strike": strike, "Strike step": step,
+        "Volume x": None if not has_volume else round(float(vol_ratio), 2),
+        "Volume needed": float(gcfg.get("vol_mult", 1.5)),
+        "Momentum %": round(momentum_pct, 3),
+        "Momentum needed": float(gcfg.get("momentum_pct", 0.2)),
+        "Expiry": exp_note, "Expiry ok": "yes" if exp_ok else "no",
+        "CE OI": oi.get("ce_oi"), "CE OI change": oi.get("ce_oi_change"),
+        "PE OI": oi.get("pe_oi"), "PE OI change": oi.get("pe_oi_change"),
+        "OI state": oi_note,
+        "Conditions met": f"{met} of {len(conditions)}",
+        "All met": "yes" if met == len(conditions) else "no",
+        "Checked at": pd.Timestamp.now(),
+    }
+
+def tab_gamma_blast(cfg: dict) -> None:
+    st.subheader("Gamma Blast Screener")
+    st.caption("Spot pressing a level, participation rising, price leaning the right way, and "
+               "the expiry clock in the right place. Every threshold below is yours to set.")
+    st.warning("**What this can and cannot see.** Proximity, volume and momentum come from "
+               "candles and always work. Strike-level OPEN INTEREST needs a broker chain, and "
+               "short covering needs a HISTORY of it — no free source publishes one, so it can "
+               "only be measured from the moment this app starts sampling. Rows still appear "
+               "without it, marked as untested on that condition rather than quietly passed.")
+
+    c1, c2, c3 = st.columns(3)
+    universe = c1.selectbox("Universe", SCREENER_UNIVERSES, key="gb_universe")
+    interval = c2.selectbox("Timeframe", INTERVALS, index=INTERVALS.index("15m"), key="gb_tf")
+    kind = c3.selectbox("Expiry convention", ["Auto", "Index (weekly)",
+                                              "Stock / futures (monthly)"], key="gb_kind")
+
+    custom_text = ""
+    if universe.startswith("Custom"):
+        custom_text = st.text_area("Tickers", "RELIANCE\nTATAMOTORS\n^NSEI", key="gb_custom")
+    all_tickers, note = _universe_tickers(universe, custom_text, None)
+    chosen = st.multiselect(f"Tickers ({len(all_tickers)} in {universe})", all_tickers,
+                            default=all_tickers, key=f"gb_tickers_{universe}")
+    if note:
+        st.caption(note)
+
+    with st.expander("Expiry windows", expanded=True):
+        e1, e2, e3, e4 = st.columns(4)
+        weekly_weekday = e1.selectbox("Weekly expiry day", list(range(7)), index=3,
+                                      format_func=lambda i: ["Mon", "Tue", "Wed", "Thu", "Fri",
+                                                             "Sat", "Sun"][i], key="gb_wwd")
+        index_days = e2.number_input("Index: days to expiry at or below", 0, 7, 0, 1,
+                                     key="gb_idays",
+                                     help="0 means the expiry day itself.")
+        stock_min = e3.number_input("Stock: min days since monthly expiry", 0, 31, 8, 1,
+                                    key="gb_smin")
+        stock_max = e4.number_input("Stock: max days since monthly expiry", 0, 31, 12, 1,
+                                    key="gb_smax",
+                                    help="Ten days after expiry sits in the middle of this "
+                                         "window; widen it to catch holiday-shifted expiries.")
+        st.caption("Exchange holidays move an expiry a day earlier and are not modelled here, "
+                   "so keep a day or two of slack in these windows.")
+
+    with st.expander("Level, volume and momentum", expanded=True):
+        f1, f2, f3 = st.columns(3)
+        level_lookback = f1.number_input("Level lookback (candles)", 10, 500, 60, 5,
+                                         key="gb_look",
+                                         help="Resistance is the highest high over this many "
+                                              "candles; support the lowest low.")
+        proximity = f2.number_input("Proximity to the level (%)", 0.05, 10.0, 1.0, 0.05,
+                                    key="gb_prox")
+        vol_mult = f3.number_input("Volume multiple", 1.0, 10.0, 1.5, 0.1, key="gb_vol")
+        g1, g2, g3 = st.columns(3)
+        momentum_bars = g1.number_input("Momentum lookback (candles)", 1, 100, 5, 1,
+                                        key="gb_mombars")
+        momentum_pct = g2.number_input("Minimum move (%)", 0.0, 20.0, 0.2, 0.05, key="gb_mompct")
+        strike_step = g3.number_input("Strike step (0 = derive from price)", 0.0, 1000.0, 0.0,
+                                      0.5, key="gb_step")
+        oi_drop = st.number_input("Minimum OI fall at the strike (contracts)", 0.0, 1e9, 0.0,
+                                  1000.0, key="gb_oidrop",
+                                  help="Applied only once chain snapshots exist. 0 accepts any "
+                                       "fall.")
+
+    show_all = st.checkbox("Show near-misses too (rows that fail some conditions)", value=True,
+                           key="gb_showall",
+                           help="On by default: a row two conditions short is often worth "
+                                "seeing, and hiding it looks like the scan found nothing.")
+
+    gcfg = {"kind": kind, "weekly_weekday": weekly_weekday, "monthly_weekday": weekly_weekday,
+            "index_days": index_days, "stock_min_days": stock_min, "stock_max_days": stock_max,
+            "level_lookback": level_lookback, "proximity_pct": proximity, "vol_mult": vol_mult,
+            "vol_len": int(_p(cfg.get("params") or {}, "vol_len")),
+            "momentum_bars": momentum_bars, "momentum_pct": momentum_pct,
+            "strike_step": strike_step, "oi_drop": oi_drop}
+
+    slice_seconds = st.slider("Seconds of work per pass", 3, 45, 12, 1, key="gb_slice")
+
+    def _worker(ticker):
+        try:
+            row = gamma_blast_scan_one(ticker, interval, gcfg, cfg.get("params") or {})
+        except Exception as exc:                                    # noqa: BLE001
+            return [], [{"Ticker": ticker, "Problem": str(exc)[:140]}]
+        return ([row] if row else []), []
+
+    rows, errs, _done = chunked_sweep("gb", list(chosen), _worker, slice_seconds, "tickers")
+
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        st.info("No ticker is near its level yet. Widen the proximity, lengthen the level "
+                "lookback, or pick a faster timeframe.")
+    else:
+        full = frame[frame["All met"] == "yes"]
+        a, b, c = st.columns(3)
+        a.metric("Near a level", len(frame))
+        b.metric("Every condition met", len(full))
+        c.metric("Chain snapshots held",
+                 sum(len(v) for v in (st.session_state.get("oi_snapshots") or {}).values()))
+
+        table = frame if show_all else full
+        order = [c for c in ["Ticker", "Timeframe", "Side", "Conditions met", "All met", "Spot",
+                             "Level", "Distance %", "Strike", "Volume x", "Volume needed",
+                             "Momentum %", "Momentum needed", "Expiry", "Expiry ok",
+                             "CE OI", "CE OI change", "PE OI", "PE OI change", "OI state",
+                             "Strike step", "Checked at"] if c in table.columns]
+        st.dataframe(table.sort_values(["All met", "Conditions met"], ascending=[False, False])
+                     [order], width="stretch", hide_index=True)
+        st.download_button("Download candidates (CSV)", table[order].to_csv(index=False).encode(),
+                           f"gamma_blast_{pd.Timestamp.now():%Y%m%d_%H%M}.csv", "text/csv")
+
+        pick = st.selectbox("Apply which ticker to the sidebar?", table["Ticker"].tolist(),
+                            key="gb_pick")
+        if st.button("Apply to the sidebar", width="stretch", key="gb_apply"):
+            st.session_state.pending_ticker = pick
+            st.session_state.pending_combo = {
+                "strategy": "48 \u00b7 Options: Gamma Blast (late-session)",
+                "sl_type": "ATR Multiple", "sl_value": 1.5,
+                "tp_type": "Risk : Reward Multiple", "tp_value": 2.0,
+                "filter_key": "", "widgets": {"cfg_interval": interval}}
+            st.rerun()
+
+    with st.expander("Option chain sampling (Dhan)"):
+        st.caption("Each sample stores the chain so OI CHANGE can be measured. Two samples are "
+                   "the minimum; the gap between them is the window the change is measured over.")
+        broker = cfg.get("broker") or {}
+        if not (broker.get("use_live_ltp") or broker.get("enabled")):
+            st.info("Enable Dhan market data in the sidebar to sample option chains.")
+        else:
+            s1, s2 = st.columns(2)
+            scrip = s1.number_input("Underlying security id", 0, 10**9, 0, 1, key="gb_scrip",
+                                    help="Dhan's id for the underlying. Resolve it in the "
+                                         "sidebar's Dhan panel.")
+            seg = s2.selectbox("Underlying segment", DHAN_SEGMENTS, index=0, key="gb_seg")
+            expiry_str = st.text_input("Expiry (YYYY-MM-DD)", key="gb_expiry")
+            target = st.selectbox("Store against ticker", chosen or ["--"], key="gb_store")
+            if st.button("Sample the chain now", key="gb_sample"):
+                chain = dhan_option_chain(broker, int(scrip), seg, expiry_str)
+                if chain:
+                    record_oi_snapshot(target, chain)
+                    held = len((st.session_state.get("oi_snapshots") or {}).get(target, []))
+                    st.success(f"Stored a snapshot for {target}. {held} held; OI change becomes "
+                               f"measurable at two.")
+                else:
+                    st.error("No chain returned. Check the security id, segment and expiry.")
+    render_analyst_panel("gamma", "these gamma blast candidates", _frame_context(frame))
+
+
 def main() -> None:
     st.set_page_config(page_title="Algo Trading Platform", layout="wide",
                        initial_sidebar_state="expanded")
@@ -9801,10 +10463,10 @@ def main() -> None:
     (status.success if st.session_state.live_running else status.info)(
         "LIVE CORE: RUNNING" if st.session_state.live_running else "LIVE CORE: IDLE")
 
-    t1, t2, t3, t4, t5, t6, t7, t8 = st.tabs(
+    t1, t2, t3, t4, t5, t6, t7, t8, t9 = st.tabs(
         ["Backtesting Engine Studio", "Live Sandbox Operations", "Live Trade Log Ledger",
          "Signal Screener", "Auto Screener", "Strategy Optimiser", "Signal Lab",
-         "Chart Patterns"])
+         "Chart Patterns", "Gamma Blast"])
     with t1:
         tab_backtest(cfg)
     with t2:
@@ -9821,6 +10483,8 @@ def main() -> None:
         tab_signal_lab(cfg)
     with t8:
         tab_patterns(cfg)
+    with t9:
+        tab_gamma_blast(cfg)
 
 
 
@@ -11127,6 +11791,160 @@ def _test_qualified_versus_signalling():
     print("   qualified vs signalling counts, and universe-sized ticker caps  OK")
 
 
+def _test_every_sweep_is_chunked():
+    """
+    No scan may run as one long pass.
+
+    A hosted Streamlit runtime recycles long-running scripts, so an internal time
+    budget cannot save a sweep that takes minutes inside a single run -- something
+    else ends it first. Every scan therefore drains a queue in short slices, and
+    an interruption costs at most one slice.
+    """
+    import os
+    here = globals().get("__file__")
+    source = ""
+    if here and os.path.exists(here):
+        with open(here, encoding="utf-8") as handle:
+            source = handle.read()
+    if source:
+        for tab in ("def tab_screener(", "def tab_auto_screener(", "def tab_patterns(",
+                    "def tab_signal_lab("):
+            start = source.index(tab)
+            nxt = source.index("\ndef ", start + 10)
+            body = source[start:nxt]
+            assert ("chunked_sweep(" in body or "_queue" in body), \
+                f"{tab.strip('def (')} still runs as a single pass"
+
+    # The driver's contract: one slice per pass, state carried between them.
+    queue = [f"job{i}" for i in range(9)]
+    rows: list = []
+
+    def slice_once(pending, collected, budget):
+        taken = 0
+        while pending and taken < budget:
+            collected.append(pending.pop(0))
+            taken += 1
+        return pending, collected
+
+    queue, rows = slice_once(queue, rows, 4)
+    assert len(queue) == 5 and len(rows) == 4
+    snapshot_q, snapshot_r = list(queue), list(rows)      # runtime dies here
+    queue, rows = snapshot_q, snapshot_r
+    assert len(rows) == 4, "an interruption must cost nothing already scanned"
+    queue, rows = slice_once(queue, rows, 9)
+    assert not queue and len(rows) == 9 and len(set(rows)) == 9, \
+        "resuming must finish the queue without repeating a job"
+    print("   every sweep is chunked; interruption costs at most one slice  OK")
+
+
+def _test_expiry_calendar_and_gamma_scan():
+    """
+    Indian expiry conventions differ by instrument, and the screener turns on it.
+
+    Indices expire WEEKLY, so the window is the expiry day itself. Stocks and
+    futures expire MONTHLY on the last Thursday, so "ten days after expiry" is
+    the middle of a configurable band. Getting these backwards would screen the
+    wrong half of the month.
+    """
+    # September 2026: the last Thursday is the 24th.
+    assert monthly_expiry(2026, 9, 3) == datetime(2026, 9, 24).date()
+    assert monthly_expiry(2026, 2, 3) == datetime(2026, 2, 26).date(), "short month"
+    assert monthly_expiry(2026, 12, 3) == datetime(2026, 12, 31).date(), "year end"
+    for month in range(1, 13):
+        expiry = monthly_expiry(2026, month, 3)
+        assert expiry.weekday() == 3, "a monthly expiry must land on the chosen weekday"
+
+    # Rolling into a new month must step back to the previous expiry, not forward.
+    assert last_monthly_expiry("2026-10-01", 3) == datetime(2026, 9, 24).date()
+    assert days_since_monthly_expiry("2026-10-04", 3) == 10, "ten days after expiry"
+    assert days_since_monthly_expiry("2026-09-24", 3) == 0, "expiry day itself"
+
+    stock_cfg = {"kind": "Auto", "monthly_weekday": 3, "stock_min_days": 8,
+                 "stock_max_days": 12}
+    assert expiry_gate("RELIANCE.NS", "2026-10-04", stock_cfg)[0], "day 10 must pass"
+    assert not expiry_gate("RELIANCE.NS", "2026-09-25", stock_cfg)[0], "day 1 must fail"
+    assert not expiry_gate("RELIANCE.NS", "2026-10-10", stock_cfg)[0], "day 16 must fail"
+
+    index_cfg = {"kind": "Auto", "weekly_weekday": 3, "index_days": 0}
+    assert days_to_weekly_expiry("2026-09-17", 3) == 0, "Thursday is expiry day"
+    assert expiry_gate("^NSEI", "2026-09-17", index_cfg)[0], "an index passes on expiry day"
+    assert not expiry_gate("^NSEI", "2026-09-15", index_cfg)[0], "two days early must fail"
+    assert looks_like_index("^NSEI") and not looks_like_index("RELIANCE.NS")
+    # The convention can be forced, overriding detection.
+    forced = dict(index_cfg, kind="Stock / futures (monthly)")
+    assert "since monthly expiry" in expiry_gate("^NSEI", "2026-10-04", forced)[1]
+
+    # Strikes round to the nearest step, and the step scales with price.
+    assert nearest_strike(23987, 50) == 24000.0
+    assert nearest_strike(1207, 20) == 1200.0
+    assert auto_strike_step(150) < auto_strike_step(1200) < auto_strike_step(24000)
+
+    # An untested OI condition is reported as unknown, never as passed.
+    assert oi_change_at("NOSUCH", 100.0).get("samples", 0) == 0
+    print("   expiry calendar (weekly index vs monthly stock) and strike rounding  OK")
+
+
+def _test_session_and_time_limits():
+    """
+    Daily PnL guards gate NEW entries; time limits close open ones.
+
+    The distinction matters: a daily target reached is a reason to stop trading,
+    not a reason to abandon a position that is still running. And winners and
+    losers get separate clocks, because a trade still losing after an hour is a
+    different problem from one drifting in profit.
+    """
+    idx = pd.date_range("2026-09-01 09:15", periods=2000, freq="1min", tz="Asia/Kolkata")
+    rng = np.random.default_rng(11)
+    close = 20000 + np.cumsum(rng.normal(0, 4, 2000))
+    open_ = np.r_[close[0], close[:-1]]
+    df = pd.DataFrame({"Open": open_, "High": np.maximum(open_, close) + 5,
+                       "Low": np.minimum(open_, close) - 5, "Close": close,
+                       "Volume": 1000.0}, index=idx)
+    params = dict(DEFAULT_PARAMS)
+    params["intraday"] = True
+    params["symbol"] = "^NSEI"
+
+    def run(**kw):
+        risk = RiskConfig("Fixed Points", 25.0, "Fixed Points", 25.0, 1.0, **kw)
+        return run_backtest(df, "01 \u00b7 Dual EMA Crossover", params, risk, warmup=60,
+                            square_off_eod=False)
+
+    base = run()
+    capped = run(daily_loss_limit=20.0)
+    targeted = run(daily_profit_target=20.0)
+    assert len(capped.trades) < len(base.trades), "a loss limit must stop further entries"
+    assert len(targeted.trades) < len(base.trades), "a profit target must stop further entries"
+
+    # Once a day is stopped out, that day takes no further trades.
+    for result, column, sign in ((capped, "daily_loss_limit", -1),
+                                 (targeted, "daily_profit_target", 1)):
+        by_day = result.trades.groupby(
+            pd.to_datetime(result.trades["Exit Time"]).dt.normalize())["PnL"]
+        for _, pnl in by_day:
+            breach = [i for i, v in enumerate(pnl.cumsum()) if v * sign >= 20.0]
+            if breach:
+                assert breach[0] >= len(pnl) - 1, "a trade was opened after the day was stopped"
+
+    # Time limits: separate clocks, and neither fires before the minimum hold.
+    timed = RiskConfig("Fixed Points", 300.0, "Fixed Points", 300.0, 1.0,
+                       min_hold_minutes=10.0, max_minutes_in_profit=30.0,
+                       max_minutes_in_loss=20.0)
+    res = run_backtest(df, "01 \u00b7 Dual EMA Crossover", params, timed, warmup=60,
+                       square_off_eod=False)
+    reasons = set(res.trades["Exit Reason"]) if len(res.trades) else set()
+    assert any("Time limit" in r for r in reasons), "no time-based exit fired"
+    timed_rows = res.trades[res.trades["Exit Reason"].str.contains("Time limit", na=False)]
+    assert (timed_rows["Bars Held"] >= 10).all(), "an exit fired inside the minimum hold"
+    profit_rows = timed_rows[timed_rows["Exit Reason"].str.contains("in profit")]
+    loss_rows = timed_rows[timed_rows["Exit Reason"].str.contains("in loss")]
+    assert (profit_rows["Points"] > 0).all(), "a 'profit' time exit closed a losing trade"
+    assert (loss_rows["Points"] <= 0).all(), "a 'loss' time exit closed a winning trade"
+
+    # Unset limits must change nothing at all.
+    assert len(run().trades) == len(base.trades)
+    print("   daily PnL guards gate entries; time limits use separate clocks  OK")
+
+
 def _test_signal_detail():
     """
     The enriched signal columns must reconcile with each other exactly.
@@ -11417,6 +12235,9 @@ def run_selftest() -> int:
         _test_lab_budget_and_di_filter()
         _test_chunked_sweep_state()
         _test_qualified_versus_signalling()
+        _test_every_sweep_is_chunked()
+        _test_expiry_calendar_and_gamma_scan()
+        _test_session_and_time_limits()
         print("-- filters --")
         _test_filters()
         _test_new_filters()
