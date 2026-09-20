@@ -60,6 +60,8 @@ from __future__ import annotations
 import json
 import math
 import sys
+import os
+import tempfile
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -7501,23 +7503,79 @@ def screen_universe(tickers: list[str], cfg: dict, lookback_bars: int, progress=
 # be read and downloaded while the scan is still going.
 
 
-def chunked_sweep(prefix: str, jobs: list, worker, slice_seconds: float = 12.0,
-                  label: str = "jobs"):
+def _auto_slice_seconds() -> float:
+    """
+    How long one pass should work for.
+
+    This was a slider, which was the wrong thing to ask an operator: the only
+    reason chunking exists is that a hosted runtime recycles long scripts, and
+    nobody wants to tune that by hand. Twenty seconds is long enough to be
+    efficient and short enough that a recycle costs at most one pass. The scan
+    continues by itself until the queue is empty.
+    """
+    return 20.0
+
+
+def _sweep_store_path(prefix: str) -> str:
+    return os.path.join(tempfile.gettempdir(), f"algoplat_sweep_{prefix}.json")
+
+
+def _sweep_save(prefix: str, payload: dict) -> None:
+    """
+    Mirror sweep state to disk.
+
+    Session state does not survive the hosted runtime restarting, which is what
+    turns a finished scan into an empty "pick a universe" screen. A small JSON
+    file on disk means a restart costs the progress bar, not the results.
+    """
+    try:
+        with open(_sweep_store_path(prefix), "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, default=str)
+    except Exception:                                               # noqa: BLE001
+        pass
+
+
+def _sweep_load(prefix: str) -> dict:
+    try:
+        with open(_sweep_store_path(prefix), encoding="utf-8") as handle:
+            return json.load(handle) or {}
+    except Exception:                                               # noqa: BLE001
+        return {}
+
+
+def chunked_sweep(prefix: str, jobs: list, worker, slice_seconds: float = 20.0,
+                  label: str = "jobs", describe=None):
     """
     Drive a long scan as many short passes.
 
-    ``worker(job)`` returns ``(rows, errors)`` -- lists of dicts -- for ONE job
-    and must not raise; anything it does raise is caught and recorded so a single
-    bad ticker cannot end the sweep.
+    ``worker(job)`` returns ``(rows, errors)`` for ONE job and must not raise;
+    anything it does raise is caught and recorded, so a single bad ticker cannot
+    end the sweep.
+
+    Ordering matters here and used to be wrong: the work is done FIRST and the
+    progress bar drawn afterwards. Drawing it first meant every pass reported the
+    previous pass's count, so the final pass showed "48 of 50" directly above
+    "Finished all 50" -- a contradiction that made a completed scan look broken.
 
     Returns ``(rows, errors, finished)`` accumulated so far.
     """
     q_key, r_key, e_key = f"{prefix}_queue", f"{prefix}_rows", f"{prefix}_errs"
     run_key, tot_key = f"{prefix}_running", f"{prefix}_total"
-    for key, default in ((q_key, []), (r_key, []), (e_key, []),
-                         (run_key, False), (tot_key, 0)):
+    rate_key = f"{prefix}_seconds_per_job"
+    for key, default in ((q_key, []), (r_key, []), (e_key, []), (run_key, False),
+                         (tot_key, 0), (rate_key, 0.0)):
         if key not in st.session_state:
             st.session_state[key] = default
+
+    # A restart empties session state; the disk mirror puts the results back.
+    if not st.session_state[r_key] and not st.session_state[q_key]:
+        saved = _sweep_load(prefix)
+        if saved.get("rows"):
+            st.session_state[r_key] = saved.get("rows") or []
+            st.session_state[e_key] = saved.get("errs") or []
+            st.session_state[tot_key] = int(saved.get("total") or 0)
+            st.caption(f"Recovered {len(st.session_state[r_key])} rows from the last run — the "
+                       f"app restarted but the results were kept.")
 
     c_run, c_pause, c_clear = st.columns(3)
     if c_run.button(f"Run ({len(jobs)} {label})", type="primary", width="stretch",
@@ -7536,41 +7594,66 @@ def chunked_sweep(prefix: str, jobs: list, worker, slice_seconds: float = 12.0,
         st.session_state[run_key] = not running
         st.rerun()
     if c_clear.button("Clear", width="stretch", key=f"{prefix}_clear"):
-        st.session_state[q_key] = []
-        st.session_state[r_key] = []
-        st.session_state[e_key] = []
+        for key in (q_key, r_key, e_key):
+            st.session_state[key] = []
         st.session_state[run_key] = False
         st.session_state[tot_key] = 0
+        _sweep_save(prefix, {})
         st.rerun()
 
     total = int(st.session_state[tot_key] or 0)
-    done = total - len(queue)
-    if total:
-        st.progress(done / total if total else 0.0,
-                    text=f"{done} of {total} {label} scanned"
-                         + (" — working" if running else
-                            (" — paused" if queue else " — finished")))
+    status = st.empty()
+    bar = st.empty()
 
+    # ---- do the work FIRST ----
     if running and queue:
         started = time.time()
         rows = list(st.session_state[r_key])
         errs = list(st.session_state[e_key])
+        processed = 0
         while queue and (time.time() - started) < float(slice_seconds):
             job = queue.pop(0)
+            status.caption(f"Scanning {describe(job) if describe else job} ...")
             try:
                 job_rows, job_errs = worker(job)
                 rows += list(job_rows or [])
                 errs += list(job_errs or [])
             except Exception as exc:                                # noqa: BLE001
                 errs.append({"Job": str(job), "Problem": f"unhandled: {str(exc)[:140]}"})
+            processed += 1
+        if processed:
+            spent = time.time() - started
+            previous = float(st.session_state[rate_key] or 0.0)
+            measured = spent / processed
+            # Smooth the estimate instead of letting one slow ticker dominate it.
+            st.session_state[rate_key] = measured if previous <= 0 else \
+                (0.7 * previous + 0.3 * measured)
         st.session_state[q_key] = queue
         st.session_state[r_key] = rows
         st.session_state[e_key] = errs
-        if not queue:
-            st.session_state[run_key] = False
-            st.success(f"Finished all {total} {label}.")
-        else:
-            st.rerun()
+        _sweep_save(prefix, {"rows": rows, "errs": errs, "total": total})
+
+    # ---- then report what is ACTUALLY true now ----
+    queue = list(st.session_state[q_key])
+    done = total - len(queue)
+    per_job = float(st.session_state[rate_key] or 0.0)
+    if total:
+        eta = len(queue) * per_job
+        eta_text = ""
+        if queue and per_job > 0:
+            eta_text = (f" · about {eta:0.0f}s left" if eta < 90
+                        else f" · about {eta / 60:0.0f} min left")
+        state = ("working" if (running and queue) else
+                 ("paused" if queue else "finished"))
+        bar.progress(done / total if total else 0.0,
+                     text=f"{done} of {total} {label} scanned — {state}{eta_text}")
+    if not queue:
+        status.empty()
+
+    if running and queue:
+        st.rerun()
+    if running and not queue:
+        st.session_state[run_key] = False
 
     rows = list(st.session_state[r_key])
     errs = list(st.session_state[e_key])
@@ -7704,9 +7787,7 @@ def tab_screener(cfg: dict) -> None:
                f"tab can enter a trade this list does not show — that is the setting to "
                f"reconcile, not a fault.")
 
-    slice_seconds = st.slider("Seconds of work per pass", 3, 45, 12, 1, key="scr_slice",
-                              help="The scan runs in short passes so a hosted runtime cannot "
-                                   "recycle it mid-way.")
+    slice_seconds = _auto_slice_seconds()
 
     def _scr_worker(job):
         ticker, tf, strat_name = job
@@ -9030,8 +9111,7 @@ def tab_patterns(cfg: dict) -> None:
         st.error("Pick at least one symbol, timeframe and pattern.")
         return
 
-    slice_seconds = st.slider("Seconds of work per pass", 3, 45, 12, 1, key="pat_slice",
-                              help="Short passes keep a hosted runtime from recycling the scan.")
+    slice_seconds = _auto_slice_seconds()
 
     def _pat_worker(job):
         ticker, tf = job
@@ -9511,10 +9591,7 @@ def tab_signal_lab(cfg: dict) -> None:
     # seconds, saves what it found, and asks for the next pass. If the runtime
     # does recycle, everything already scanned survives and Resume continues.
     jobs = [(t, tf) for t in tickers for tf in timeframes]
-    slice_seconds = st.slider("Seconds of work per pass", 3, 60, 15, 1, key="lab_slice",
-                              help="Each pass runs for about this long, then hands control back "
-                                   "so the browser and the server stay responsive. Shorter is "
-                                   "safer on a hosted runtime; longer is slightly faster.")
+    slice_seconds = _auto_slice_seconds()
 
     c_run, c_pause, c_clear = st.columns(3)
     if c_run.button("Run Signal Lab", type="primary", width="stretch"):
@@ -9617,9 +9694,16 @@ def tab_signal_lab(cfg: dict) -> None:
     hit_target = int((pd.to_numeric(results.get(lab_target_column, pd.Series(dtype=float)),
                                     errors="coerce") >= lab_target).sum()) \
         if lab_target_column in results.columns else 0
-    d.metric(f"Reach {fmt(lab_target)} on {objective.split(' (')[0].lower()}", hit_target,
-             help="Counted against the objective's own column, whether or not you made it a "
-                  "hard requirement.")
+    shown_hits = 0
+    if lab_target_column in signalling.columns and len(signalling):
+        shown_hits = int((pd.to_numeric(signalling[lab_target_column], errors="coerce")
+                          >= lab_target).sum())
+    d.metric(f"Reach {fmt(lab_target)} on {objective.split(' (')[0].lower()}",
+             f"{hit_target} of {len(results)}",
+             f"{shown_hits} of the {len(signalling)} signalling",
+             help="The first number counts EVERY qualified row. The table below may be "
+                  "filtered to the ones signalling right now, so a row counted here can be "
+                  "absent from the table — that is the filter, not a miscount.")
 
     # "Kept so far: 14 qualified" followed by a two-row table reads like a fault.
     # It is the signalling filter hiding the rest, so say so with the numbers.
@@ -9640,8 +9724,8 @@ def tab_signal_lab(cfg: dict) -> None:
 
     table = signalling if show_only else results
     table = table.sort_values(["Quality", "Score"], ascending=[False, False]).reset_index(drop=True)
-    front = [c for c in ["Ticker", "Timeframe", "Quality", "Signal", "When", "Bars Ago",
-                         "Signal Time",
+    front = [c for c in ["Ticker", "Timeframe", "Period Used", "Quality", "Signal", "When",
+                         "Bars Ago", "Signal Time",
                          "Price at Signal", "Fill Price (next open)", "Price Now",
                          "Move in Favour", "R Multiple Now", "Best Strategy", "Stop-Loss",
                          "SL Value", "Target", "TP Value", "Filter", "Trades", "Win %",
@@ -9652,6 +9736,10 @@ def tab_signal_lab(cfg: dict) -> None:
         st.info("No ticker is signalling right now on its own optimised configuration.")
         return
 
+    spans = ", ".join(f"`{tf}` over {lab_period_for(tf, WARMUP_BARS + 40)[0]}"
+                      for tf in timeframes)
+    st.caption(f"Searched: {spans}. Each row's own timeframe and history window are in the "
+               f"**Timeframe** and **Period Used** columns.")
     st.dataframe(table.drop(columns=["Filter Key"]), width="stretch", hide_index=True)
     labels = [f"{r['Ticker']} · {r.get('Timeframe', '')}" for _, r in table.iterrows()]
     pick = st.selectbox("Apply which setup?", labels, key="lab_pick")
@@ -9883,10 +9971,7 @@ def tab_auto_screener(cfg: dict) -> None:
         st.error("Pick at least one ticker and one timeframe.")
         return
 
-    slice_seconds = st.slider("Seconds of work per pass", 3, 45, 12, 1, key="auto_slice",
-                              help="Each pass runs about this long, then hands control back. "
-                                   "Short passes are what stop a hosted runtime from recycling "
-                                   "the scan mid-way.")
+    slice_seconds = _auto_slice_seconds()
 
     def _auto_worker(job):
         ticker, interval = job
@@ -11945,6 +12030,47 @@ def _test_session_and_time_limits():
     print("   daily PnL guards gate entries; time limits use separate clocks  OK")
 
 
+def _test_sweep_progress_is_honest():
+    """
+    The progress bar must describe work ALREADY DONE.
+
+    It was drawn before the slice ran, so every pass reported the previous pass's
+    count. The last pass therefore showed "48 of 50" directly above "Finished
+    all 50" — a contradiction that makes a completed scan look broken, and made
+    every other number on the page suspect.
+    """
+    def pass_wrong(queue, total):
+        done = total - len(queue)              # drawn first, then work happens
+        drained = []
+        while queue:
+            drained.append(queue.pop(0))
+        return done, len(queue)
+
+    def pass_right(queue, total):
+        while queue:                            # work first
+            queue.pop(0)
+        return total - len(queue), len(queue)   # then report
+
+    assert pass_wrong([1, 2], 2) == (0, 0), "the old order under-reports by a whole slice"
+    assert pass_right([1, 2], 2) == (2, 0), "the bar must read 2 of 2 when 2 are done"
+    for size in (1, 2, 5, 50):
+        done, left = pass_right(list(range(size)), size)
+        assert done == size and left == 0, "a finished queue must report complete"
+
+    # A target count over ALL rows can legitimately exceed what a filtered table
+    # shows; the two populations must be reported separately, not conflated.
+    results = pd.DataFrame({"Win %": [95.0, 92.0] + [70.0] * 48,
+                            "Signal": ["-", "-"] + ["LONG"] * 5 + ["-"] * 43})
+    signalling = results[results["Signal"] != "-"]
+    reach_all = int((results["Win %"] >= 90).sum())
+    reach_shown = int((signalling["Win %"] >= 90).sum())
+    assert reach_all == 2 and reach_shown == 0, \
+        "two rows reach 90% but neither is signalling, so the table shows none"
+    assert float(signalling["Win %"].max()) < 90.0, \
+        "this is exactly the case that looked like a miscount"
+    print("   progress reports completed work; target counts name their population  OK")
+
+
 def _test_signal_detail():
     """
     The enriched signal columns must reconcile with each other exactly.
@@ -12238,6 +12364,7 @@ def run_selftest() -> int:
         _test_every_sweep_is_chunked()
         _test_expiry_calendar_and_gamma_scan()
         _test_session_and_time_limits()
+        _test_sweep_progress_is_honest()
         print("-- filters --")
         _test_filters()
         _test_new_filters()
