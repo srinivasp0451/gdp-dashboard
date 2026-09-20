@@ -5899,6 +5899,14 @@ def _render_backtest(result: BacktestResult, meta: dict) -> None:
                    "Use the Strategy Optimiser for the fit-then-test version.")
         st.dataframe(result.walk_forward, width="stretch", hide_index=True)
 
+    st.warning(
+        "**Treat this result with caution.** These numbers describe what this exact "
+        "configuration would have done on this exact sample. They are not a forecast. Before "
+        "risking money: check the trade count (under about 30 proves little), check expectancy "
+        "and profit factor rather than the win rate, confirm the reliability verdict is "
+        "backtest-safe, and re-run the same configuration on a different period to see whether "
+        "it survives.")
+
     if result.warnings:
         with st.expander(f"Run notes and caveats ({len(result.warnings)})", expanded=False):
             for w in result.warnings:
@@ -8838,21 +8846,44 @@ def tab_optimiser(cfg: dict) -> None:
                    f"`{cfg['interval']}` can supply the 200-candle warm-up plus enough bars to "
                    f"produce trades.")
 
-    if st.button("Run Optimiser", type="primary", width="stretch"):
-        st.session_state.optimizer_results = None
-        bar = st.progress(0.0, text="Loading data ...")
-        try:
-            bundle = load_market_data(cfg["symbol"], period, cfg["interval"], 300.0,
-                                      min_bars=WARMUP_BARS + 60)
-            results = optimise(bundle.frame, cfg["params"], cfg["quantity"], cfg["costs"],
-                               objective, int(min_trades), int(iterations),
-                               safe_exits_only=safe_only, progress=bar,
-                               grid=grid, exhaustive=exhaustive, scale_points=scale_points)
-            st.session_state.optimizer_results = (results, objective, float(target),
-                                                  target_column)
-        except Exception as exc:                                    # noqa: BLE001
-            st.error(f"Optimiser failed: {exc}")
-        bar.empty()
+    # Chunked like every other sweep. Running hundreds of combinations inside a
+    # single script run is what let this tab die silently: the runtime recycled
+    # it and nothing was ever written to session state, so the tab fell back to
+    # its "set an objective" placeholder as though nothing had been pressed.
+    batch = 25
+    batches = [(start, min(batch, int(iterations) - start))
+               for start in range(0, int(iterations), batch)]
+
+    def _opt_worker(job):
+        offset, size = job
+        bundle = load_market_data(cfg["symbol"], period, cfg["interval"], 300.0,
+                                  min_bars=WARMUP_BARS + 60)
+        part = optimise(bundle.frame, cfg["params"], cfg["quantity"], cfg["costs"],
+                        objective, int(min_trades), int(size), seed=11 + offset,
+                        safe_exits_only=safe_only, grid=grid, exhaustive=exhaustive,
+                        scale_points=scale_points)
+        return (part.drop(columns=["Rank"], errors="ignore").to_dict("records")
+                if not part.empty else []), []
+
+    rows, errs, _finished = chunked_sweep(
+        "opt", batches, _opt_worker, _auto_slice_seconds(), "combination batches",
+        describe=lambda job: f"combinations {job[0] + 1}-{job[0] + job[1]}")
+
+    results = pd.DataFrame(rows)
+    if not results.empty:
+        # Batches are independent random samples, so the same combination can
+        # appear twice; keep one of each and re-rank the merged set.
+        key_cols = [c for c in ("Strategy", "Stop-Loss", "SL Value", "Target", "TP Value",
+                                "Filter") if c in results.columns]
+        if key_cols:
+            results = results.drop_duplicates(subset=key_cols)
+        results = results.sort_values("Score", ascending=False).reset_index(drop=True)
+        results.insert(0, "Rank", range(1, len(results) + 1))
+    st.session_state.optimizer_results = (results, objective, float(target), target_column)
+
+    if errs:
+        with st.expander(f"Batches that failed ({len(errs)})"):
+            st.dataframe(pd.DataFrame(errs), width="stretch", hide_index=True)
 
     payload = st.session_state.optimizer_results
     if payload is None:
@@ -9651,6 +9682,14 @@ def tab_signal_lab(cfg: dict) -> None:
             time.sleep(0.05)
             st.rerun()
 
+    # Rendered before the results so it exists from the first page load. Putting
+    # it inside the results block meant the control only appeared after a run,
+    # which looks like it is missing.
+    show_only = st.checkbox("Show only tickers that are signalling", value=True,
+                            key="lab_filter",
+                            help="Untick to see every ticker that qualified, including those "
+                                 "with no live signal right now.")
+
     payload = st.session_state.get("lab_results")
     if payload is None:
         st.info("Pick a universe and run the lab.")
@@ -9707,7 +9746,28 @@ def tab_signal_lab(cfg: dict) -> None:
 
     # "Kept so far: 14 qualified" followed by a two-row table reads like a fault.
     # It is the signalling filter hiding the rest, so say so with the numbers.
-    show_only = st.checkbox("Show only tickers that are signalling", value=True, key="lab_filter")
+    # The target count is over ALL qualified rows while the table may be filtered
+    # to the signalling ones, so a counted row can be invisible. Rather than just
+    # explaining that, show them.
+    if lab_target_column in results.columns:
+        measured = pd.to_numeric(results[lab_target_column], errors="coerce")
+        reaching = results[measured >= lab_target]
+        if len(reaching):
+            with st.expander(f"The {len(reaching)} row(s) reaching {fmt(lab_target)} on "
+                             f"{objective.lower()}", expanded=not len(
+                                 reaching[reaching["Signal"] != "-"])):
+                cols = [c for c in ["Ticker", "Timeframe", "Signal", "When", lab_target_column,
+                                    "Trades", "Expectancy", "Profit Factor", "Sharpe",
+                                    "Best Strategy", "Stop-Loss", "Target", "Reliability"]
+                        if c in reaching.columns]
+                st.dataframe(reaching[cols], width="stretch", hide_index=True)
+                quiet_hits = int((reaching["Signal"] == "-").sum())
+                if quiet_hits:
+                    st.caption(f"{quiet_hits} of these are NOT signalling right now, which is "
+                               f"why they do not appear in the main table below. The count "
+                               f"above and the table are two different populations, not a "
+                               f"disagreement.")
+
     hidden = len(results) - len(signalling)
     if show_only and hidden:
         st.info(f"**{len(results)} tickers qualified, {len(signalling)} are signalling right "
@@ -12071,6 +12131,48 @@ def _test_sweep_progress_is_honest():
     print("   progress reports completed work; target counts name their population  OK")
 
 
+def _test_target_rows_are_reachable():
+    """
+    A counted row must be findable.
+
+    "2 of 50 reach 90%" above a table whose best is 78.57 is arithmetically
+    right -- the table is filtered to the rows signalling now -- but a number
+    you cannot trace to a row is indistinguishable from a bug. The rows behind
+    the count are now listed explicitly.
+    """
+    results = pd.DataFrame({
+        "Ticker": [f"T{i}" for i in range(10)],
+        "Win %": [95.0, 92.0, 78.57, 76.9, 76.7, 76.5, 70.0, 68.0, 60.0, 55.0],
+        "Signal": ["-", "-"] + ["LONG"] * 5 + ["-"] * 3,
+    })
+    target, column = 90.0, "Win %"
+    measured = pd.to_numeric(results[column], errors="coerce")
+    reaching = results[measured >= target]
+    signalling = results[results["Signal"] != "-"]
+
+    assert len(reaching) == 2, "two rows clear the bar"
+    assert float(signalling[column].max()) == 78.57, "the visible table tops out below it"
+    assert int((reaching["Signal"] == "-").sum()) == 2, \
+        "both are hidden by the signalling filter -- which is exactly why they must be listed"
+    # Every counted row is retrievable by ticker, so the count can be audited.
+    assert set(reaching["Ticker"]) == {"T0", "T1"}
+    assert len(reaching) + len(results[measured < target]) == len(results)
+
+    # Merging independent optimiser batches must not double-count a combination.
+    batch_a = pd.DataFrame({"Strategy": ["A", "B"], "Stop-Loss": ["Fixed Points"] * 2,
+                            "SL Value": [1.0, 2.0], "Target": ["Fixed Points"] * 2,
+                            "TP Value": [2.0, 4.0], "Filter": ["none"] * 2,
+                            "Score": [10.0, 20.0]})
+    batch_b = batch_a.copy()
+    batch_b.loc[1, "Score"] = 20.0
+    merged = pd.concat([batch_a, batch_b], ignore_index=True).drop_duplicates(
+        subset=["Strategy", "Stop-Loss", "SL Value", "Target", "TP Value", "Filter"])
+    assert len(merged) == 2, "the same combination from two batches must collapse to one"
+    ranked = merged.sort_values("Score", ascending=False).reset_index(drop=True)
+    assert list(ranked["Strategy"]) == ["B", "A"], "the merged set must be re-ranked"
+    print("   target counts are traceable to rows; merged batches do not duplicate  OK")
+
+
 def _test_signal_detail():
     """
     The enriched signal columns must reconcile with each other exactly.
@@ -12365,6 +12467,7 @@ def run_selftest() -> int:
         _test_expiry_calendar_and_gamma_scan()
         _test_session_and_time_limits()
         _test_sweep_progress_is_honest()
+        _test_target_rows_are_reachable()
         print("-- filters --")
         _test_filters()
         _test_new_filters()
