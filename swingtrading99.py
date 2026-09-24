@@ -3021,6 +3021,41 @@ NIFTY_MIDCAP_EXTRA = [
 ]
 NIFTY200_SYMBOLS = list(dict.fromkeys(NIFTY100_SYMBOLS + NIFTY_MIDCAP_EXTRA))
 
+# A further tranche of liquid mid/small caps. Combined with the above this
+# approximates a Nifty 500-style universe. Same caveat as the 200 list: NSE
+# sets membership and revises it at each rebalance, so this is a curated
+# watchlist, not the official constituent list. For an exact universe use the
+# Custom option, or "F&O stocks" which IS derived live from the scrip master.
+NIFTY_SMALLCAP_EXTRA = [
+    "AARTIIND", "ABBOTINDIA", "ACC", "AEGISLOG", "AJANTPHARM", "ALKYLAMINE", "AMBER",
+    "ANGELONE", "APARINDS", "APOLLOTYRE", "ASAHIINDIA", "ASTERDM", "ATUL", "BALRAMCHIN",
+    "BANKINDIA", "BASF", "BDL", "BEML", "BIRLACORPN", "BLUEDART", "BLUESTARCO",
+    "BSE", "CAMS", "CAPLIPOINT", "CARBORUNIV", "CASTROLIND", "CCL", "CDSL",
+    "CENTRALBK", "CENTURYPLY", "CERA", "CHALET", "CHOLAHLDNG", "CIEINDIA", "CLEAN",
+    "COCHINSHIP", "COROMANDEL", "CRISIL", "CUB", "DATAPATTNS", "DCMSHRIRAM", "DEVYANI",
+    "DHANUKA", "EIDPARRY", "EIHOTEL", "ELGIEQUIP", "EMAMILTD", "ENDURANCE", "ENGINERSIN",
+    "EQUITASBNK", "FINCABLES", "FINEORG", "FIVESTAR", "FORTIS", "FSL", "GESHIP",
+    "GILLETTE", "GLAND", "GLAXO", "GODFRYPHLP", "GODREJIND", "GPPL", "GRAPHITE",
+    "GRINDWELL", "GSFC", "GUJGASLTD", "HAPPSTMNDS", "HATSUN", "HBLPOWER", "HEG",
+    "HINDCOPPER", "HOMEFIRST", "HUDCO", "IDBI", "IIFL", "INDIACEM", "INDIGOPNTS",
+    "INOXWIND", "INTELLECT", "IOB", "IRCON", "ITI", "JBCHEPHARM", "JKCEMENT",
+    "JKLAKSHMI", "JMFINANCIL", "JSL", "JUBLINGREA", "JUSTDIAL", "JYOTHYLAB",
+    "KAJARIACER", "KALYANKJIL", "KANSAINER", "KARURVYSYA", "KAYNES", "KEC",
+    "KIRLOSENG", "KNRCON", "KPIL", "KPRMILL", "LATENTVIEW", "LEMONTREE", "LINDEINDIA",
+    "MAHABANK", "MAHSEAMLES", "MANKIND", "MAPMYINDIA", "MASTEK", "MAZDOCK", "MEDANTA",
+    "MINDACORP", "MOTILALOFS", "MRPL", "NATCOPHARM", "NBCC", "NCC", "NEWGEN",
+    "NH", "NIACL", "NLCINDIA", "NUVAMA", "OLECTRA", "PCBL", "PFIZER", "PNBHOUSING",
+    "POLYMED", "PPLPHARMA", "PRAJIND", "RADICO", "RAILTEL", "RAINBOW", "RAJESHEXPO",
+    "RATNAMANI", "RAYMOND", "RCF", "REDINGTON", "RENUKA", "RHIM", "ROUTE",
+    "RVNL", "SANOFI", "SAPPHIRE", "SCHAEFFLER", "SCHNEIDER", "SHYAMMETL", "SIGNATURE",
+    "SKFINDIA", "SOBHA", "SONATSOFTW", "SPARC", "SUMICHEM", "SUNDRMFAST", "SUPRAJIT",
+    "SUVENPHAR", "SWANENERGY", "SYRMA", "TANLA", "TATAINVEST", "TEJASNET", "THERMAX",
+    "TIMKEN", "TITAGARH", "TRIVENI", "TTKPRESTIG", "UJJIVANSFB", "USHAMART", "UTIAMC",
+    "VGUARD", "VIJAYA", "VINATIORGA", "VTL", "WELCORP", "WELSPUNLIV", "WESTLIFE",
+    "WHIRLPOOL", "ZENSARTECH", "ZFCVINDIA",
+]
+NIFTY500_SYMBOLS = list(dict.fromkeys(NIFTY200_SYMBOLS + NIFTY_SMALLCAP_EXTRA))
+
 # Non-equity instruments the screener can also scan. These are yfinance
 # symbols, so they work without a Dhan token.
 SCREENER_INDEX_SYMBOLS = [
@@ -6368,8 +6403,22 @@ def run_backtest(raw_df, strategy, sl_type, target_type, params, filters, qty, r
             if i < open_trade["entry_idx"]:
                 continue
             candle = df.iloc[i]
-            open_trade = update_trade_levels(open_trade, i, df, params, atr_series)
-
+            # NOTE ON ORDERING — this is deliberate and load-bearing.
+            #
+            # Trailing levels are NOT updated before this bar is tested. The
+            # stop that protects the position during bar i must be derived
+            # only from information available BEFORE bar i, which is what a
+            # live trader actually has. Updating first meant bar i's own High
+            # was used to raise the stop and then bar i's own Low was tested
+            # against it — look-ahead in both directions at once.
+            #
+            # It also made "Trail Candle Low/High (Current)" self-triggering:
+            # the stop was set to the bar's Low, and the immediate test
+            # "Low <= stop" was then trivially true, closing every trade on
+            # its first bar at that bar's low.
+            #
+            # Levels are now advanced at the END of the bar (see below), so
+            # bar i+1 is protected by the level implied by bar i's close.
             exited, exit_price, reason = False, None, None
 
             # 1) A signal/EMA-reverse exit detected on the PREVIOUS candle's
@@ -6441,6 +6490,13 @@ def run_backtest(raw_df, strategy, sl_type, target_type, params, filters, qty, r
                 sig_exit, sig_reason = detect_signal_exit_condition(open_trade, i, df, params)
                 if sig_exit:
                     open_trade["pending_exit_reason"] = sig_reason
+
+                # 5) ONLY NOW advance the trailing levels, using this bar's
+                #    completed High/Low. The new level governs bar i+1 onward,
+                #    which is the earliest a real trader could have acted on
+                #    it. This is what keeps the backtest free of intrabar
+                #    look-ahead.
+                open_trade = update_trade_levels(open_trade, i, df, params, atr_series)
 
     if open_trade is not None:
         last_i = len(df) - 1
@@ -7993,7 +8049,22 @@ def render_config_controls(ui, prefix="sb"):
             params["sl_points"] = cfg_number(ui, "Opening backstop (points)", "sl_points",
                                              10.0, 0.1, 100000.0, prefix=prefix)
             ui.caption("Applies only until the trailing level first ratchets tighter — usually within a bar or "
-                       "two. It protects against an immediate adverse gap; it does not shape the results.")
+                       "two. It protects against an immediate adverse gap.")
+            # A backstop tighter than normal bar noise stops being a backstop
+            # and becomes the actual stop, which quietly converts a trailing
+            # strategy into a fixed-points one.
+            try:
+                _ref_px = _current_underlying_ltp(ticker) or 0
+            except Exception:
+                _ref_px = 0
+            if _ref_px and float(params["sl_points"]) < _ref_px * 0.002:
+                ui.warning(f"⚠️ {float(params['sl_points']):.0f} points is about "
+                           f"{float(params['sl_points']) / _ref_px * 100:.3f}% of the current price — tighter "
+                           "than ordinary bar-to-bar noise. It will almost certainly fire before the trailing "
+                           "level ever ratchets, which means you are really testing a FIXED stop and the "
+                           "trailing rule you selected never engages. The backtest is then correct for what it "
+                           "simulated, but it is not telling you about the trailing strategy. Widen it, or "
+                           "untick the box.")
         else:
             # A wide, ATR-free default that cannot fire before trailing engages.
             params["sl_points"] = 100000.0
@@ -11730,7 +11801,7 @@ with tab_screen:
 
     sc1, sc2, sc3 = st.columns([1.2, 1, 1])
     scr_universe = cfg_selectbox(sc1, "Universe", "scr_universe",
-                                 ["Nifty 50", "Nifty 100", "Nifty 200 (approx.)",
+                                 ["Nifty 50", "Nifty 100", "Nifty 200 (approx.)", "Nifty 500 (approx.)",
                                   "F&O stocks (all, from Dhan)", "Indices",
                                   "Commodities", "Forex", "Crypto",
                                   "Indices + Commodities + Forex + Crypto", "Custom list"],
@@ -11753,6 +11824,12 @@ with tab_screen:
                    "source of truth for it here — so this is a curated large-cap/midcap watchlist that "
                    "approximates the Nifty 200, not the official constituent list. For an exact universe, paste "
                    "it into **Custom list**.")
+    elif scr_universe == "Nifty 500 (approx.)":
+        _symbols = list(NIFTY500_SYMBOLS)
+        st.caption("⚠️ Same caveat as the 200 list: NSE sets index membership and revises it at each rebalance, "
+                   "so this is a curated large/mid/small-cap watchlist approximating the Nifty 500 — not the "
+                   "official constituents. Use **Custom list** for an exact universe, or **F&O stocks** which is "
+                   "derived live from Dhan's scrip master and never goes stale.")
     elif scr_universe == "F&O stocks (all, from Dhan)":
         _symbols = fno_stock_universe()
         if _symbols:
@@ -11781,11 +11858,17 @@ with tab_screen:
                    "Crypto and forex trade nearly 24/7, so a session-based strategy will behave differently on "
                    "them than on Indian equities.")
 
-    scr_limit = cfg_number(st, "Maximum symbols to scan (protects against rate limits)", "scr_limit",
-                           100, 1, 500, is_int=True)
+    # The cap follows the universe: switching to a larger list should not
+    # silently keep scanning only the first 100 symbols.
+    _uni_size = max(1, len(_symbols))
+    if st.session_state.app_cfg.get("_scr_uni_sig") != (scr_universe, _uni_size):
+        cfg_force("scr_limit", int(_uni_size))
+        st.session_state.app_cfg["_scr_uni_sig"] = (scr_universe, _uni_size)
+    scr_limit = cfg_number(st, f"Maximum symbols to scan (universe has {_uni_size})", "scr_limit",
+                           int(_uni_size), 1, 5000, is_int=True)
     if len(_symbols) > int(scr_limit):
-        st.caption(f"⚠️ {len(_symbols)} symbols in the universe but the cap is {int(scr_limit)} — "
-                   "raise the cap to scan them all.")
+        st.caption(f"⚠️ Scanning the first {int(scr_limit)} of {len(_symbols)} symbols. Raise the cap to cover "
+                   "them all — the cap exists only to protect against yfinance rate limits on long scans.")
     _symbols = _symbols[:int(scr_limit)]
 
     _src_label = ("Dhan" if scr_source == "Dhan"
@@ -11865,6 +11948,64 @@ with tab_screen:
                                _res.to_csv(index=False).encode(),
                                file_name=f"screener_{strategy.replace(' ', '_')}_{interval}.csv",
                                mime="text/csv", key="scr_dl")
+
+            # ---------- apply a screened ticker to the sidebar ----------
+            st.markdown("#### 📥 Trade one of these")
+            st.caption("Pick a symbol from the results and push it, together with the timeframe, period, strategy "
+                       "and exit settings used for this scan, into the sidebar — so the configuration that found "
+                       "the signal is the one that trades it.")
+            _rank_basis = cfg_selectbox(st, "Order the list by", "scr_apply_rank",
+                                        ["Move since signal (%)", "Bucket freshness (Just Now first)",
+                                         "Symbol (A–Z)"],
+                                        default="Move since signal (%)")
+            _pick_df = _res.copy()
+            if _rank_basis.startswith("Move"):
+                _pick_df = _pick_df.sort_values("Move %", ascending=False, na_position="last")
+            elif _rank_basis.startswith("Bucket"):
+                _order = {"Just Now": 0, "Just After": 1, "Just Before": 2}
+                _pick_df["_o"] = _pick_df["Bucket"].map(_order).fillna(9)
+                _pick_df = _pick_df.sort_values(["_o", "Move %"], ascending=[True, False]).drop(columns=["_o"])
+            else:
+                _pick_df = _pick_df.sort_values("Symbol")
+            st.caption("⚠️ These are ranked by what the scan observed — recency and move since the signal. That is "
+                       "NOT accuracy: a screener evaluates one signal per symbol and cannot measure a win rate "
+                       "from it. For a genuine accuracy or expectancy ranking, run the symbol through the "
+                       "**🧭 Strategy Search** tab, which scores configurations on unseen data.")
+
+            _opts = [f"{r['Bucket']} · {r['Symbol']} · {r['Direction']} · move {r['Move %']:+.2f}%"
+                     if pd.notna(r["Move %"]) else f"{r['Bucket']} · {r['Symbol']} · {r['Direction']}"
+                     for _, r in _pick_df.iterrows()]
+            if _opts:
+                _sel = st.selectbox("Screened symbol", range(len(_opts)),
+                                    format_func=lambda i: _opts[i], key="scr_apply_pick")
+                _srow = _pick_df.iloc[_sel]
+                a1, a2 = st.columns([1, 2])
+                if a1.button("📥 Apply to sidebar", type="primary", use_container_width=True,
+                             key="scr_apply_btn"):
+                    _sym = str(_srow["Symbol"])
+                    if _sym.endswith((".NS", ".BO")) or _sym.startswith("^") or any(
+                            ch in _sym for ch in ("=", "-")):
+                        _tc, _custom = "Custom", _sym
+                    elif _sym in TICKER_MAP:
+                        _tc, _custom = _sym, None
+                    else:
+                        _tc, _custom = "Custom", f"{_sym}.NS"
+                    cfg_set("ticker_choice", _tc)
+                    if _custom:
+                        cfg_set("ticker_custom", _custom)
+                    # The scan's own configuration travels with the symbol.
+                    cfg_set("interval", interval)
+                    cfg_set("period", period)
+                    cfg_set("strategy", strategy)
+                    cfg_set("sl_type", sl_type)
+                    cfg_set("target_type", target_type)
+                    cfg_set("qty", int(qty))
+                    st.session_state["cfg_applied_msg"] = (
+                        f"Applied {_sym} · {strategy} · {interval}/{period} to the sidebar ✅")
+                    st.rerun()
+                a2.caption(f"Will set ticker **{_srow['Symbol']}** with timeframe **{interval}**, period "
+                           f"**{period}**, strategy **{strategy}**, SL **{sl_type}**, target **{target_type}** — "
+                           "the exact settings this scan used. Entry filters stay as they are in the sidebar.")
 
         if _errs is not None and not _errs.empty:
             with st.expander(f"⚠️ {len(_errs)} symbol(s) skipped", expanded=False):
