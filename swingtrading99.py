@@ -10736,7 +10736,9 @@ def evaluate_live_signal(ticker, interval, period, strategy, params, filters, sl
         if not exited and full_cfg:
             _zh_exit, _zh_px, _zh_reason = check_zero_hero_premium_exit(full_cfg, pos)
             if _zh_exit:
-                exited, exit_price, reason = True, ltp, _zh_reason
+                # _zh_px IS the premium the exit triggered on; `ltp` here is
+                # the index and would otherwise be recorded as the fill price.
+                exited, exit_price, reason = True, (_zh_px if _zh_px is not None else ltp), _zh_reason
                 pos["zh_exit_premium"] = _zh_px
         if not exited and full_cfg:
             _conv, _conv_msg = check_delivery_conversion(full_cfg, pos, ticker, strategy)
@@ -10769,6 +10771,22 @@ def evaluate_live_signal(ticker, interval, period, strategy, params, filters, sl
             # Keep the stored copy in step with trailed SL/target levels so a
             # restored position resumes with the correct risk, not stale levels.
             db_persist_position_state(ticker, strategy)
+        if exited and pos.get("trade_instrument") == "OPTION":
+            # Final safety net. Several exit paths (signal reversal, special
+            # exits, time-based, profitable-hold) legitimately take their
+            # TRIGGER from the underlying's candles, but the FILL must still be
+            # recorded in the instrument actually held. Without this, an option
+            # trade can be closed at an index price — producing rows like
+            # "entry ₹260.35 → exit 73,762.49 → +73,502 points".
+            _ep_ok = float(pos["entry_price"])
+            if exit_price is None or float(exit_price) > _ep_ok * 20 or float(exit_price) <= 0:
+                _fill = option_premium_now(full_cfg, pos.get("opt_security_id"),
+                                           pos.get("opt_leg"), pos.get("opt_strike"))
+                if _fill is None:
+                    _fill = pos.get("current_price") or _ep_ok
+                    reason = f"{reason} — premium unavailable, recorded at the last known ₹{float(_fill):.2f}"
+                exit_price = float(_fill)
+
         if exited:
             points = (exit_price - pos["entry_price"]) * position_pl_direction(pos)
             exit_candle = sig_df.iloc[-1]
@@ -11325,11 +11343,25 @@ with tab_live:
         else:
             st.button("▶ Running…", disabled=True, use_container_width=True)
     with ctrl3:
-        if st.button("⏹ Stop", use_container_width=True, disabled=not st.session_state.live_running):
-            st.session_state.live_running = False
-            st.rerun()
+        _stop_clicked = st.button("⏹ Stop", use_container_width=True,
+                                  disabled=not (st.session_state.live_running
+                                                or st.session_state.live_positions))
     with ctrl4:
-        squareoff_clicked = st.button("🟥 Square Off Now", use_container_width=True, disabled=not st.session_state.live_positions)
+        squareoff_clicked = st.button("🟥 Square Off Now", use_container_width=True,
+                                      disabled=not st.session_state.live_positions)
+
+    _stop_squares_off = cfg_checkbox(st, "Stop also squares off every open position",
+                                     "stop_squares_off", True, prefix="live")
+    st.caption("With this on, **Stop** closes any open position as well as halting monitoring — otherwise a "
+               "position would be left running with nothing watching its stoploss, which is the more dangerous "
+               "of the two states. Untick it only if you intend to manage an open position by hand.")
+    if _stop_clicked:
+        st.session_state.live_running = False
+        if _stop_squares_off and st.session_state.live_positions:
+            squareoff_clicked = True          # handled by the square-off block below
+            st.session_state["_stop_with_squareoff"] = True
+        else:
+            st.rerun()
 
     if st.session_state.live_running:
         st.success("🟢 Running continuously — polling the API and re-checking signals every few seconds. "
@@ -11349,31 +11381,56 @@ with tab_live:
     st.caption("Note: a full browser close / new session always resets this to OFF. A plain in-tab refresh (F5) may preserve the ON state since Streamlit keeps the same session — click Stop first if you want a hard reset before refreshing.")
 
     if squareoff_clicked and st.session_state.live_positions:
-        pos = st.session_state.live_positions[0]
+        # Square off EVERY open position, not just the first. Leaving any
+        # behind after an explicit "square off now" is the worst kind of
+        # surprise — the user believes they are flat when they are not.
         raw = fetch_data(ticker, interval, period)
         ltp_now = get_live_ltp(ticker)
-        exit_price = ltp_now if ltp_now is not None else (float(raw["Close"].iloc[-1]) if not raw.empty else pos["current_price"])
-        points = (exit_price - pos["entry_price"]) * position_pl_direction(pos)
-        _sq_row = {
-            "Entry Time": pos["entry_time"], "Entry Price": round(pos["entry_price"], 2),
-            "Direction": position_direction_label(pos),
-            "Exit Time": datetime.now(), "Exit Price": round(exit_price, 2),
-            "SL": round(pos["initial_sl"], 2), "Target": round(pos["initial_target"], 2),
-            "Highest": round(pos["highest"], 2), "Lowest": round(pos["lowest"], 2),
-            "Points": round(points, 2), "PnL": round(points * pos["remaining_qty"], 2),
-            "Exit Reason": "Manual Square Off", "Qty": pos["remaining_qty"],
-        }
-        if raw is not None and not raw.empty:
-            _c = raw.iloc[-1]
-            _sq_row.update({"Exit Open": round(float(_c["Open"]), 2), "Exit High": round(float(_c["High"]), 2),
-                            "Exit Low": round(float(_c["Low"]), 2), "Exit Close": round(float(_c["Close"]), 2)})
-        _live_attach_option_premiums(_sq_row, pos, config, pos["remaining_qty"], closing=True)
-        st.session_state.live_history.append(_sq_row)
+        _closed, _sq_rows = 0, []
+        for pos in list(st.session_state.live_positions):
+            # Price each position in ITS OWN instrument. An option position
+            # must be closed at its premium; using the index tick here
+            # produced exits like "entry ₹260 → exit 73,762".
+            if pos.get("trade_instrument") == "OPTION":
+                exit_price = option_premium_now(config, pos.get("opt_security_id"),
+                                                pos.get("opt_leg"), pos.get("opt_strike"))
+                if exit_price is None:
+                    exit_price = pos.get("current_price") or pos["entry_price"]
+                    st.warning(f"⚠️ Could not read the {pos.get('opt_leg', 'option')} premium to square off — "
+                               f"recorded at the last known ₹{float(exit_price):.2f}. Verify the actual fill "
+                               "with your broker.")
+                exit_price = float(exit_price)
+            else:
+                exit_price = (ltp_now if ltp_now is not None
+                              else (float(raw["Close"].iloc[-1]) if raw is not None and not raw.empty
+                                    else pos["current_price"]))
+            points = (exit_price - pos["entry_price"]) * position_pl_direction(pos)
+            _sq_row = {
+                "Entry Time": pos["entry_time"], "Entry Price": round(pos["entry_price"], 2),
+                "Direction": position_direction_label(pos),
+                "Exit Time": ist_now(), "Exit Price": round(exit_price, 2),
+                "SL": round(pos["initial_sl"], 2), "Target": round(pos["initial_target"], 2),
+                "Highest": round(pos["highest"], 2), "Lowest": round(pos["lowest"], 2),
+                "Points": round(points, 2), "PnL": round(points * pos["remaining_qty"], 2),
+                "Exit Reason": "Manual Square Off", "Qty": pos["remaining_qty"],
+            }
+            if raw is not None and not raw.empty and pos.get("trade_instrument") != "OPTION":
+                _c = raw.iloc[-1]
+                _sq_row.update({"Exit Open": round(float(_c["Open"]), 2), "Exit High": round(float(_c["High"]), 2),
+                                "Exit Low": round(float(_c["Low"]), 2), "Exit Close": round(float(_c["Close"]), 2)})
+            _live_attach_option_premiums(_sq_row, pos, config, pos["remaining_qty"], closing=True)
+            st.session_state.live_history.append(_sq_row)
+            db_save_trade(_sq_row, ticker, strategy)
+            _sq_rows.append((pos, _sq_row, exit_price))
+            _closed += 1
         st.session_state.live_positions = []
         note_trade_event()  # feeds the entry-cooldown gate
-        db_save_trade(_sq_row, ticker, strategy)
         db_clear_open_position()
-        st.warning(f"Manually squared off @ {exit_price:.2f}")
+        pos, _sq_row, exit_price = _sq_rows[-1]
+        _stopped_too = st.session_state.pop("_stop_with_squareoff", False)
+        st.warning(f"{'Stopped and squared' if _stopped_too else 'Squared'} off {_closed} position(s). "
+                   f"Last fill @ {exit_price:,.2f}"
+                   + (f" ({pos.get('opt_leg')} premium)" if pos.get("trade_instrument") == "OPTION" else ""))
         # Manual square-offs are ALWAYS sent, even with Bracket Orders on
         # (dispatch only skips broker-managed Stoploss/Target hits).
         _sq_res = dispatch_dhan_event(config, pos["direction"], False, "Manual Square Off",
