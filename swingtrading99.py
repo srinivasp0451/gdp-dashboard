@@ -54,15 +54,31 @@ TICKER_MAP = {
     "Options Trading": None,   # special mode: trade CE/PE option legs on an index/stock via Dhan
 }
 
+# Yahoo enforces a hard history limit per interval and SILENTLY TRUNCATES a
+# longer request rather than erroring, which looks like missing data. The
+# periods offered per timeframe are therefore capped at what can actually be
+# returned:
+#     1m                 ~7 days
+#     2m/5m/15m/30m/90m  ~60 days
+#     1h / 60m           ~730 days (2 years)
+#     1d and coarser     effectively unlimited
+YF_INTERVAL_MAX_DAYS = {
+    "1m": 7, "2m": 60, "3m": 7, "5m": 60, "10m": 60, "15m": 60, "25m": 60,
+    "30m": 60, "45m": 60, "60m": 730, "1h": 730, "2h": 730, "4h": 730,
+    "1d": 36500, "1wk": 36500, "1mo": 36500, "3mo": 36500,
+}
+
 TF_PERIOD_MAP = {
     "1m": ["1d", "5d", "7d"],
-    "3m": ["1d", "5d", "7d", "1mo"],
-    "5m": ["1d", "5d", "7d", "1mo"],
-    "15m": ["1d", "5d", "7d", "1mo"],
-    "1h": ["1d", "7d", "1mo", "3mo", "6mo", "1y"],
-    "1d": ["7d", "1mo", "6mo", "1y", "2y", "3y", "5y", "10y"],
-    "1wk": ["1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "20y", "30y"],
-    "1mo": ["1y", "2y", "3y", "5y", "10y", "20y", "30y"],
+    "3m": ["1d", "5d", "7d"],
+    "5m": ["1d", "5d", "7d", "1mo", "2mo"],
+    "15m": ["1d", "5d", "7d", "1mo", "2mo"],
+    "30m": ["1d", "5d", "7d", "1mo", "2mo"],
+    "1h": ["1d", "7d", "1mo", "3mo", "6mo", "1y", "2y"],
+    "1d": ["7d", "1mo", "6mo", "1y", "2y", "3y", "5y", "10y", "20y", "max"],
+    "1wk": ["1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "20y", "30y", "max"],
+    "1mo": ["1y", "2y", "3y", "5y", "10y", "20y", "30y", "max"],
+    "3mo": ["2y", "3y", "5y", "10y", "20y", "30y", "max"],
 }
 
 STRATEGIES = [
@@ -76,6 +92,8 @@ STRATEGIES = [
     "Bollinger Bands",
     "Volume Breakout",
     "Elliott Wave (Zigzag)",
+    "AMD (Accumulation–Manipulation–Distribution)",
+    "Volume Profile (Fixed Range)",
     "OI Based (CE/PE Open Interest)",
     "OI Change Based (ΔOI)",
     "OI Velocity (ΔOI per N seconds)",
@@ -132,6 +150,8 @@ STRATEGY_FAMILY = {
     "Bollinger Bands": "mean_reversion",
     "Volume Breakout": "trend",
     "Elliott Wave (Zigzag)": "trend",
+    "AMD (Accumulation–Manipulation–Distribution)": "trend",
+    "Volume Profile (Fixed Range)": "range",
     "OI Based (CE/PE Open Interest)": "neutral",
     "OI Change Based (ΔOI)": "neutral",
     "OI Velocity (ΔOI per N seconds)": "neutral",
@@ -268,7 +288,7 @@ DHAN_EXTRA_TF_PERIODS = {
 # Timeframes that Dhan serves by resampling a finer base interval, e.g. a 3m
 # candle is built from 1m data. Keyed by timeframe → (base code, pandas rule).
 DHAN_RESAMPLE_TF = {"2m": "2min", "3m": "3min", "10m": "10min", "30m": "30min",
-                    "45m": "45min", "2h": "2h", "4h": "4h", "1mo": "MS"}
+                    "45m": "45min", "2h": "2h", "4h": "4h", "1mo": "MS", "3mo": "QS"}
 
 
 def available_tf_period_map():
@@ -305,7 +325,8 @@ def available_tf_period_map():
 
 # Rough period-string → number of calendar days to request from Dhan
 PERIOD_TO_DAYS = {
-    "1d": 1, "5d": 5, "7d": 7, "1mo": 31, "3mo": 92, "6mo": 183, "4y": 1461,
+    "1d": 1, "5d": 5, "7d": 7, "1mo": 31, "2mo": 60, "3mo": 92, "6mo": 183, "4y": 1461,
+    "max": 36500,
     "1y": 366, "2y": 731, "3y": 1096, "5y": 1827, "10y": 3653,
     "20y": 7305, "30y": 10958,
 }
@@ -713,6 +734,151 @@ def swing_points(df, lookback=3):
     return swing_high, swing_low
 
 
+def market_structure(df, lookback=3):
+    """
+    Confirmed swing structure: the running last swing high and swing low, plus
+    the break-of-structure and change-of-character flags derived from them.
+
+    A pivot is only knowable `lookback` bars after it forms, so every series
+    returned here is shifted to the bar on which the information became
+    available. Nothing peeks at future bars.
+    """
+    sh, sl_ = swing_points(df, lookback)
+    # Values only at confirmed pivots; everything is shifted by `lookback`
+    # because a pivot is not knowable until that many bars have printed after
+    # it. Nothing here reads a future bar.
+    sh_vals = df["High"].where(sh)
+    sl_vals = df["Low"].where(sl_)
+    last_high = sh_vals.ffill().shift(lookback)
+    last_low = sl_vals.ffill().shift(lookback)
+    # The swing BEFORE the current one: step back one entry in the pivot-only
+    # series, then project it forward over the intervening bars.
+    prev_high = sh_vals.dropna().shift(1).reindex(df.index).ffill().shift(lookback)
+    prev_low = sl_vals.dropna().shift(1).reindex(df.index).ffill().shift(lookback)
+    close = df["Close"]
+    return {
+        "last_high": last_high, "last_low": last_low,
+        "prev_high": prev_high, "prev_low": prev_low,
+        "bos_up": (close > last_high).fillna(False),
+        "bos_dn": (close < last_low).fillna(False),
+        "swing_high": sh, "swing_low": sl_,
+    }
+
+
+def change_of_character(df, lookback=3):
+    """
+    CHoCH — the first break AGAINST the prevailing structure.
+
+    Distinct from a break of structure: a BOS continues the trend (a higher
+    high in an uptrend), whereas a CHoCH is the first failure of it — in an
+    uptrend, price closing below the most recent higher LOW. That is the
+    earliest structural evidence that control has changed hands, which is why
+    it is used as a reversal filter rather than a continuation one.
+    """
+    ms = market_structure(df, lookback)
+    close = df["Close"]
+
+    # Structure is a STATE that persists between pivots, not a condition that
+    # must hold on a single bar. Requiring a higher high and a higher low to
+    # coincide on one bar almost never happens once both series are shifted
+    # for pivot confirmation, so the state is set when a new pivot extends the
+    # structure and then carried forward until something changes it.
+    state = pd.Series(np.nan, index=df.index)
+    hh = (ms["last_high"] > ms["prev_high"]).fillna(False)
+    ll = (ms["last_low"] < ms["prev_low"]).fillna(False)
+    # ONLY a higher high or a lower low shifts structure — those are breaks of
+    # structure. A lower high on its own does not: including it flipped the
+    # state bearish BEFORE price broke the higher low, which is the very event
+    # a CHoCH is meant to mark, so the CHoCH could never fire.
+    state[hh] = 1.0
+    state[ll] = -1.0
+    state = state.ffill().fillna(0.0)
+
+    up_trend = state > 0
+    dn_trend = state < 0
+    broke_low = (close < ms["last_low"]).fillna(False)
+    broke_high = (close > ms["last_high"]).fillna(False)
+    # A CHoCH is the FIRST break against the prevailing structure, so the
+    # previous bar must not already have been broken.
+    choch_dn = up_trend & broke_low & ~broke_low.shift(1, fill_value=False)
+    choch_up = dn_trend & broke_high & ~broke_high.shift(1, fill_value=False)
+    return {"choch_up": choch_up, "choch_dn": choch_dn,
+            "up_trend": up_trend, "dn_trend": dn_trend, "state": state,
+            "last_high": ms["last_high"], "last_low": ms["last_low"]}
+
+
+def liquidity_sweep(df, lookback=20, min_wick_frac=0.4):
+    """
+    A liquidity sweep (stop hunt): price trades THROUGH a recent extreme and
+    then closes back inside it, leaving a long wick.
+
+    The logic is that resting stops sit just beyond obvious highs and lows;
+    a move that takes them out and immediately reverses suggests the extreme
+    was raided for liquidity rather than genuinely broken. Requiring the close
+    to return inside is what separates a sweep from a real breakout, and
+    requiring a minimum wick fraction keeps out bars that merely grazed it.
+    """
+    prior_high = df["High"].rolling(lookback).max().shift(1)
+    prior_low = df["Low"].rolling(lookback).min().shift(1)
+    rng = (df["High"] - df["Low"]).replace(0, np.nan)
+    upper_wick = (df["High"] - df[["Open", "Close"]].max(axis=1)) / rng
+    lower_wick = (df[["Open", "Close"]].min(axis=1) - df["Low"]) / rng
+    sweep_high = ((df["High"] > prior_high) & (df["Close"] < prior_high)
+                  & (upper_wick >= min_wick_frac)).fillna(False)
+    sweep_low = ((df["Low"] < prior_low) & (df["Close"] > prior_low)
+                 & (lower_wick >= min_wick_frac)).fillna(False)
+    # A high swept = sellers took the liquidity above → bearish; and vice versa.
+    return {"sweep_high": sweep_high, "sweep_low": sweep_low,
+            "prior_high": prior_high, "prior_low": prior_low,
+            "upper_wick": upper_wick, "lower_wick": lower_wick}
+
+
+def volume_profile(df, lookback=100, bins=24):
+    """
+    Fixed-range volume profile over the last `lookback` bars.
+
+    Volume is distributed across price bins to find:
+      • POC  — the price with the most traded volume (point of control)
+      • VAH/VAL — the bounds of the 70% value area around it
+    These mark where business was actually done, which is why value-area edges
+    act as reference points. Falls back to a bar-count profile when the feed
+    carries no volume (cash indices), and reports which it used.
+    """
+    win = df.iloc[-int(lookback):] if len(df) > lookback else df
+    if win.empty:
+        return None
+    lo, hi = float(win["Low"].min()), float(win["High"].max())
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        return None
+    edges = np.linspace(lo, hi, int(bins) + 1)
+    centers = (edges[:-1] + edges[1:]) / 2.0
+    vol = pd.to_numeric(win.get("Volume"), errors="coerce").fillna(0.0)
+    basis = "volume" if float(vol.sum()) > 0 else "bars"
+    weights = vol.values if basis == "volume" else np.ones(len(win))
+    tp = ((win["High"] + win["Low"] + win["Close"]) / 3.0).values
+    hist = np.zeros(int(bins))
+    idxs = np.clip(np.digitize(tp, edges) - 1, 0, int(bins) - 1)
+    for k, w in zip(idxs, weights):
+        hist[k] += w
+    if hist.sum() <= 0:
+        return None
+    poc_i = int(np.argmax(hist))
+    # Expand outward from the POC until 70% of the distribution is enclosed.
+    target = hist.sum() * 0.70
+    lo_i = hi_i = poc_i
+    acc = hist[poc_i]
+    while acc < target and (lo_i > 0 or hi_i < int(bins) - 1):
+        left = hist[lo_i - 1] if lo_i > 0 else -1
+        right = hist[hi_i + 1] if hi_i < int(bins) - 1 else -1
+        if right >= left:
+            hi_i += 1; acc += max(right, 0)
+        else:
+            lo_i -= 1; acc += max(left, 0)
+    return {"poc": float(centers[poc_i]), "val": float(edges[lo_i]), "vah": float(edges[hi_i + 1]),
+            "hist": hist, "centers": centers, "basis": basis,
+            "range_low": lo, "range_high": hi, "bars": len(win)}
+
+
 def elliott_wave_state(df, lookback=3):
     """
     Zigzag pivot detection with EXPLICIT confirmation timing plus Elliott
@@ -1044,6 +1210,19 @@ def fetch_data_yf(ticker, interval, period):
     resample_rule = None
     if interval in _YF_FALLBACK_TF:
         interval, resample_rule = _YF_FALLBACK_TF[interval]
+    # Yahoo truncates an over-long request instead of failing, so clamp the
+    # period to what this interval can actually serve and say so.
+    _lim = YF_INTERVAL_MAX_DAYS.get(interval)
+    if _lim:
+        _want = PERIOD_TO_DAYS.get(period)
+        if _want and _want > _lim:
+            _fit = next((p for p in ("2y", "1y", "6mo", "3mo", "2mo", "1mo", "7d", "5d", "1d")
+                         if PERIOD_TO_DAYS.get(p, 10 ** 9) <= _lim), "1mo")
+            st.session_state["yf_period_clamp_note"] = (
+                f"{interval} candles are only available for about {_lim} days on yfinance, so '{period}' was "
+                f"reduced to '{_fit}'. Yahoo silently truncates longer requests, which otherwise shows up as "
+                "missing data.")
+            period = _fit
     time.sleep(RATE_LIMIT_DELAY)
     df = yf.download(ticker, interval=interval, period=period, progress=False, auto_adjust=True)
     if df is None or df.empty:
@@ -1414,10 +1593,14 @@ def fetch_data(ticker, interval, period):
     return normalize_index_to_ist(fetch_data_yf(ticker, interval, period), ticker)
 
 
-@st.cache_data(ttl=3, show_spinner=False)
+@st.cache_data(ttl=1, show_spinner=False)
 def _dhan_ltp_cached(security_id, segment, _token_fp):
     """
     One LTP call, cached for 3 seconds.
+
+    A 1-second TTL: long enough to collapse the several calls one refresh
+    cycle makes for the same contract, short enough that the displayed price
+    is never more than a second stale.
 
     The cache exists because Dhan rate-limits this endpoint and the app can
     otherwise hit it many times per cycle: the entry blocker checks a premium,
@@ -2387,7 +2570,7 @@ TABLE_PERIODS = ["1d", "5d", "7d", "1mo", "3mo", "6mo", "1y", "2y", "3y", "4y", 
 _TF_RULE = {"1m": "1min", "2m": "2min", "3m": "3min", "5m": "5min", "10m": "10min",
             "15m": "15min", "25m": "25min", "30m": "30min", "45m": "45min",
             "60m": "60min", "1h": "1h", "2h": "2h", "4h": "4h",
-            "1d": "1D", "1wk": "1W", "1mo": "MS"}
+            "1d": "1D", "1wk": "1W", "1mo": "MS", "3mo": "QS"}
 _PERIOD_DAYS = {"1d": 1, "5d": 5, "7d": 7, "1mo": 31, "3mo": 92, "6mo": 183, "1y": 366,
                 "2y": 731, "3y": 1096, "4y": 1461, "5y": 1827, "6y": 2192, "7y": 2557,
                 "8y": 2922, "9y": 3287, "10y": 3653}
@@ -2422,7 +2605,7 @@ TABLE_DEFAULT_COLUMNS = ["Time", "PCR", "Δ PCR", "Spot", "Δ Spot", "Future", "
 _TF_BASE_INTERVAL = {"1m": "1m", "2m": "2m", "3m": "1m", "5m": "5m", "10m": "5m",
                      "15m": "15m", "25m": "5m", "30m": "30m", "45m": "15m",
                      "60m": "60m", "1h": "60m", "2h": "60m", "4h": "60m",
-                     "1d": "1d", "1wk": "1d", "1mo": "1d"}
+                     "1d": "1d", "1wk": "1d", "1mo": "1d", "3mo": "1d"}
 _BASE_LIMIT_DAYS = {"1m": 7, "2m": 60, "5m": 60, "15m": 60, "30m": 60, "60m": 60, "1d": 3650}
 _YF_PERIOD_LADDER = [(1, "1d"), (5, "5d"), (7, "7d"), (31, "1mo"), (92, "3mo"),
                      (183, "6mo"), (366, "1y"), (731, "2y"), (1827, "5y"), (3653, "10y")]
@@ -3639,6 +3822,128 @@ def aggregate_chain_history(df, mode, underlying_label=None, expiry=None):
 
 
 # ============================================================================
+# MULTI-STRATEGY SCREENER — best strategy per symbol, scored out-of-sample
+# ----------------------------------------------------------------------------
+# Runs every eligible strategy across a universe and reports which
+# symbol/strategy pairings actually performed, filtered by thresholds you set.
+#
+# Two exclusions are deliberate:
+#   • Option-chain strategies and Zero Hero depend on a LIVE chain snapshot
+#     that cannot be reconstructed historically, so backtesting them across a
+#     universe would produce numbers with nothing behind them.
+#   • Simple Buy/Sell Only and Threshold Cross are price-level triggers rather
+#     than edges — they fire on a condition you supply, so "optimising" them
+#     across symbols measures the level you picked, not a strategy.
+# ============================================================================
+
+def multi_screener_excluded():
+    """Strategies excluded from the universe screen, resolved at call time so
+    the set never depends on definition order."""
+    return ({"Simple Buy Only", "Simple Sell Only", "Threshold Cross",
+             "Hybrid (Combine Strategies)", "Zero Hero (Expiry Day OTM Momentum)"}
+            | set(OPTION_CHAIN_STRATEGIES))
+
+
+def multi_screener_strategies():
+    """Strategies that can be meaningfully backtested across a universe."""
+    excl = multi_screener_excluded()
+    return [s for s in STRATEGIES if s not in excl]
+
+
+MULTI_SCREEN_METRICS = {
+    "Accuracy %": ("accuracy", "win rate — see the warning about using it alone"),
+    "Expectancy": ("expectancy", "average points per trade after costs"),
+    "Sharpe": ("sharpe", "return relative to its own volatility (consistency)"),
+    "Net Points": ("total_points", "total points earned over the period"),
+    "Profit Factor": ("profit_factor", "gross profit ÷ gross loss"),
+    "Trades": ("trades", "sample size"),
+}
+
+
+def run_multi_strategy_screener(symbols, strategies, interval, period, sl_type, target_type,
+                                params, filters, qty, cost_cfg, thresholds, oos_fraction=0.3,
+                                min_trades=20, source="Auto", progress=None):
+    """
+    For each symbol × strategy: fit on the earlier data, score on the later
+    unseen slice, and keep the pairings that clear every threshold on the
+    UNSEEN portion.
+
+    Thresholds are applied to out-of-sample results deliberately. A filter like
+    "accuracy ≥ 90%" applied in-sample would select configurations that fitted
+    noise; applied to data the strategy never saw, it is at least a real claim.
+    """
+    rows, errors = [], []
+    total = max(len(symbols) * max(len(strategies), 1), 1)
+    done = 0
+    data_cache = {}
+
+    for sym in symbols:
+        if sym not in data_cache:
+            df, err = screener_fetch(sym, interval, period, source)
+            data_cache[sym] = (df, err)
+        raw, err = data_cache[sym]
+        if err or raw is None or raw.empty or len(raw) < 150:
+            errors.append({"Symbol": sym, "Reason": err or "not enough candles for an out-of-sample split"})
+            done += len(strategies)
+            continue
+
+        split = int(len(raw) * (1 - oos_fraction))
+        is_df, oos_df = raw.iloc[:split], raw.iloc[split:]
+        if len(is_df) < 100 or len(oos_df) < 40:
+            errors.append({"Symbol": sym, "Reason": "history too short to split in-sample / out-of-sample"})
+            done += len(strategies)
+            continue
+
+        for strat in strategies:
+            done += 1
+            if progress:
+                progress(done / total, f"{sym} · {strat[:26]}")
+            try:
+                is_tr, _ = run_backtest(is_df, strat, sl_type, target_type, params, filters, qty)
+                oos_tr, _ = run_backtest(oos_df, strat, sl_type, target_type, params, filters, qty)
+            except Exception as exc:
+                errors.append({"Symbol": sym, "Reason": f"{strat}: {type(exc).__name__}"})
+                continue
+
+            is_m = _search_metrics(is_tr, qty, cost_cfg)
+            oos_m = _search_metrics(oos_tr, qty, cost_cfg)
+            if not is_m or not oos_m or is_m["trades"] < min_trades:
+                continue
+
+            # thresholds are checked against the UNSEEN slice
+            passed = True
+            for label, (key, _desc) in MULTI_SCREEN_METRICS.items():
+                thr = thresholds.get(label)
+                if thr is None:
+                    continue
+                val = oos_m.get(key)
+                if val is None or (isinstance(val, float) and not np.isfinite(val)):
+                    passed = False
+                    break
+                if float(val) < float(thr):
+                    passed = False
+                    break
+            if not passed:
+                continue
+
+            rows.append({
+                "Symbol": sym, "Strategy": strat,
+                "OOS Accuracy %": oos_m["accuracy"], "OOS Expectancy": oos_m["expectancy"],
+                "OOS Sharpe": oos_m["sharpe"], "OOS Net Points": oos_m["total_points"],
+                "OOS Profit Factor": oos_m["profit_factor"], "OOS Trades": oos_m["trades"],
+                "OOS Max DD": oos_m["max_dd"],
+                "IS Accuracy %": is_m["accuracy"], "IS Expectancy": is_m["expectancy"],
+                "IS Trades": is_m["trades"],
+                "Breakeven Acc % Needed": is_m["breakeven_acc"],
+                "Avg Win": oos_m["avg_win"], "Avg Loss": oos_m["avg_loss"],
+            })
+
+    if progress:
+        progress(1.0, "done")
+    return (pd.DataFrame(rows), pd.DataFrame(errors))
+
+
+# ============================================================================
 # STRATEGY SEARCH — grid search with OUT-OF-SAMPLE validation
 # ----------------------------------------------------------------------------
 # This exists to answer "which configuration should I actually trade?", and it
@@ -4612,7 +4917,7 @@ def get_vix_aligned(target_index):
     return result
 
 
-@st.fragment(run_every=2)
+@st.fragment(run_every=1)
 def live_position_fragment(ticker, label="LTP"):
     """
     Refreshes every ~2s on its own: live price, and — if a paper position is
@@ -4674,6 +4979,16 @@ def live_position_fragment(ticker, label="LTP"):
                           if is_opt else ""))
         else:
             mark = float(mark)
+            if is_opt:
+                # Self-heal a position whose extremes were polluted with index
+                # ticks by an earlier build: anything wildly away from the
+                # premium scale cannot have come from this instrument.
+                _ep = float(pos.get("entry_price") or mark)
+                _hi, _lo = pos.get("highest"), pos.get("lowest")
+                if _hi is None or float(_hi) > _ep * 20:
+                    pos["highest"] = max(_ep, mark)
+                if _lo is None or float(_lo) > _ep * 20 or float(_lo) < 0:
+                    pos["lowest"] = min(_ep, mark)
             # Track extremes on the SAME series that prices the position.
             pos["highest"] = max(float(pos.get("highest", mark)), mark)
             pos["lowest"] = min(float(pos.get("lowest", mark)), mark)
@@ -4684,6 +4999,9 @@ def live_position_fragment(ticker, label="LTP"):
             pnl = points * pos["remaining_qty"]
 
             st.markdown("###### 💰 Live Position P&L")
+            if is_opt:
+                st.caption(f"🎟 Holding **{position_contract_label(pos)}**"
+                           + (f" · security {pos.get('opt_security_id')}" if pos.get("opt_security_id") else ""))
             c1, c2, c3 = st.columns(3)
             c1.metric("Entry Type", position_direction_label(pos))
             c2.metric("Entry Price", f"{unit}{pos['entry_price']:,.2f}")
@@ -5129,8 +5447,8 @@ def zero_hero_state(df, params):
     # previous bar (a genuine fresh cross), optionally followed by a cooldown
     # before the same side can trigger again.
     cooldown = int(params.get("zh_cooldown_bars", 0))
-    fresh_long = long_ok & (~long_ok.shift(1).fillna(False))
-    fresh_short = short_ok & (~short_ok.shift(1).fillna(False))
+    fresh_long = long_ok & (~long_ok.shift(1, fill_value=False))
+    fresh_short = short_ok & (~short_ok.shift(1, fill_value=False))
     if cooldown > 0:
         def _apply_cooldown(mask):
             kept = pd.Series(False, index=mask.index)
@@ -5417,6 +5735,57 @@ def generate_signals(df, strategy, params, _raw=False):
         if sig != 0 and len(df):
             df.iloc[-1, df.columns.get_loc("signal")] = sig
 
+    elif strategy == "AMD (Accumulation–Manipulation–Distribution)":
+        # AMD / "power of three": price builds a range (ACCUMULATION), sweeps
+        # one side of it to trigger resting stops (MANIPULATION), then moves
+        # the other way (DISTRIBUTION). The tradable event is the reversal
+        # AFTER the sweep — entering on the sweep itself takes the wrong side
+        # of the very move the pattern identifies as a trap.
+        lb = int(params.get("amd_range_bars", 20))
+        sw = liquidity_sweep(df, lb, float(params.get("amd_min_wick", 0.4)))
+        df["amd_prior_high"], df["amd_prior_low"] = sw["prior_high"], sw["prior_low"]
+        # The prior range must be reasonably tight — genuine accumulation
+        # rather than an ongoing trend making new extremes.
+        rng = df["High"].rolling(lb).max() - df["Low"].rolling(lb).min()
+        tight = (rng <= atr(df, 14) * float(params.get("amd_max_range_atr", 6.0))).fillna(False)
+        long_sig, short_sig = sw["sweep_low"] & tight, sw["sweep_high"] & tight
+        if bool(params.get("amd_require_close_back", True)):
+            # Require the NEXT bar to continue the reversal, filtering sweeps
+            # that simply keep going.
+            long_sig = long_sig.shift(1, fill_value=False) & (df["Close"] > df["Close"].shift(1))
+            short_sig = short_sig.shift(1, fill_value=False) & (df["Close"] < df["Close"].shift(1))
+        df.loc[long_sig, "signal"] = 1
+        df.loc[short_sig, "signal"] = -1
+
+    elif strategy == "Volume Profile (Fixed Range)":
+        # Price inside the value area is in balance and offers no edge; the
+        # tradable events are at its EDGES. Both readings of an edge are
+        # legitimate and they are opposites, so the choice is explicit.
+        lb = int(params.get("vp_lookback", 100))
+        bins = int(params.get("vp_bins", 24))
+        step = max(1, int(params.get("vp_recalc_every", 5)))
+        poc_l, vah_l, val_l, cache = [], [], [], None
+        for i in range(len(df)):
+            if i < 20:
+                poc_l.append(np.nan); vah_l.append(np.nan); val_l.append(np.nan); continue
+            if cache is None or i % step == 0:
+                cache = volume_profile(df.iloc[max(0, i - lb):i + 1], lookback=lb, bins=bins)
+            if cache:
+                poc_l.append(cache["poc"]); vah_l.append(cache["vah"]); val_l.append(cache["val"])
+            else:
+                poc_l.append(np.nan); vah_l.append(np.nan); val_l.append(np.nan)
+        # Shifted so a bar is judged against the profile formed BEFORE it.
+        df["vp_poc"] = pd.Series(poc_l, index=df.index).shift(1)
+        df["vp_vah"] = pd.Series(vah_l, index=df.index).shift(1)
+        df["vp_val"] = pd.Series(val_l, index=df.index).shift(1)
+        c, pc_ = df["Close"], df["Close"].shift(1)
+        if str(params.get("vp_mode", "Breakout from value area")).startswith("Breakout"):
+            df.loc[(c > df["vp_vah"]) & (pc_ <= df["vp_vah"]), "signal"] = 1
+            df.loc[(c < df["vp_val"]) & (pc_ >= df["vp_val"]), "signal"] = -1
+        else:  # fade the edge, back toward the POC
+            df.loc[(c < df["vp_val"]) & (pc_ >= df["vp_val"]), "signal"] = 1
+            df.loc[(c > df["vp_vah"]) & (pc_ <= df["vp_vah"]), "signal"] = -1
+
     elif strategy == ZERO_HERO_STRATEGY:
         zh = zero_hero_state(df, params)
         df["zh_ref_high"], df["zh_ref_low"] = zh["ref_high"], zh["ref_low"]
@@ -5642,8 +6011,8 @@ def generate_signals(df, strategy, params, _raw=False):
         k_upper, k_mid, k_lower = keltner(df, params.get("keltner_period", 20), params.get("keltner_atr_mult", 1.5))
         bb_upper, bb_mid, bb_lower = bollinger(df["Close"], 20, 2)
         squeeze = (bb_upper < k_upper) & (bb_lower > k_lower)
-        buy = squeeze.shift(1).fillna(False) & (df["Close"] > k_upper)
-        sell = squeeze.shift(1).fillna(False) & (df["Close"] < k_lower)
+        buy = squeeze.shift(1, fill_value=False) & (df["Close"] > k_upper)
+        sell = squeeze.shift(1, fill_value=False) & (df["Close"] < k_lower)
         df.loc[buy, "signal"] = 1
         df.loc[sell, "signal"] = -1
 
@@ -5686,8 +6055,8 @@ def generate_signals(df, strategy, params, _raw=False):
     elif strategy == "Pro: Heikin-Ashi Trend Continuation":
         ha_open, ha_high, ha_low, ha_close = heikin_ashi(df)
         bullish, bearish = ha_close > ha_open, ha_close < ha_open
-        buy = bullish & bullish.shift(1).fillna(False) & ~bullish.shift(2).fillna(False)
-        sell = bearish & bearish.shift(1).fillna(False) & ~bearish.shift(2).fillna(False)
+        buy = bullish & bullish.shift(1, fill_value=False) & ~bullish.shift(2, fill_value=False)
+        sell = bearish & bearish.shift(1, fill_value=False) & ~bearish.shift(2, fill_value=False)
         df.loc[buy, "signal"] = 1
         df.loc[sell, "signal"] = -1
 
@@ -5870,6 +6239,33 @@ def apply_filters(df, filters, params=None):
                 mask_buy &= ok
                 mask_sell &= ok
 
+    if filters.get("choch_enabled"):
+        # Change of Character: only take trades in the direction of the most
+        # recent structural shift. A BOS continues a trend; a CHoCH is the
+        # first failure of one, so this is a reversal-alignment filter.
+        ch = change_of_character(df, int(filters.get("choch_lookback", 3)))
+        bars = int(filters.get("choch_valid_bars", 10))
+        # A CHoCH stays "in force" for a limited number of bars afterwards.
+        up_recent = ch["choch_up"].rolling(bars, min_periods=1).max().astype(bool)
+        dn_recent = ch["choch_dn"].rolling(bars, min_periods=1).max().astype(bool)
+        if filters.get("choch_mode", "Trade with the shift") == "Trade with the shift":
+            mask_buy &= up_recent
+            mask_sell &= dn_recent
+        else:                                   # continuation: avoid fresh shifts against you
+            mask_buy &= ~dn_recent
+            mask_sell &= ~up_recent
+
+    if filters.get("sweep_enabled"):
+        # Liquidity sweep: require a recent stop-hunt in the right direction.
+        sw = liquidity_sweep(df, int(filters.get("sweep_lookback", 20)),
+                             float(filters.get("sweep_min_wick", 0.4)))
+        bars = int(filters.get("sweep_valid_bars", 5))
+        low_swept = sw["sweep_low"].rolling(bars, min_periods=1).max().astype(bool)
+        high_swept = sw["sweep_high"].rolling(bars, min_periods=1).max().astype(bool)
+        # Lows swept = buy-side liquidity taken below, then rejected → bullish.
+        mask_buy &= low_swept
+        mask_sell &= high_swept
+
     # ---- Option-chain filters ------------------------------------------------
     # These read a LIVE chain snapshot, which is a single point in time rather
     # than a per-bar series. They therefore gate the LATEST bar only: in live
@@ -5999,7 +6395,12 @@ def calc_initial_sl_target(direction, entry_price, atr_val, params, sl_type, tar
     target_points = params.get("target_points", 20.0)
     rr_ratio = max(params.get("rr_ratio", 2.0), 2.0)
 
-    if sl_type == "ATR Based SL":
+    if sl_type == "Percent of Entry Price":
+        # Scales with the instrument, so one setting works on a ₹57 option and
+        # a 24,000 index alike — unlike a points value, which has to be
+        # retuned for every instrument and silently misbehaves when it isn't.
+        sl_dist = abs(float(entry_price)) * float(params.get("sl_pct", 1.0)) / 100.0
+    elif sl_type == "ATR Based SL":
         sl_dist = atr_val * params.get("atr_mult_sl", 1.5)
     elif sl_type == "Autopilot SL":
         sl_dist = max(atr_val * 1.2, sl_points)
@@ -6011,7 +6412,9 @@ def calc_initial_sl_target(direction, entry_price, atr_val, params, sl_type, tar
     else:
         sl_dist = sl_points
 
-    if target_type == "ATR Based Target":
+    if target_type == "Percent of Entry Price":
+        target_dist = abs(float(entry_price)) * float(params.get("target_pct", 2.0)) / 100.0
+    elif target_type == "ATR Based Target":
         target_dist = atr_val * params.get("atr_mult_target", 3.0)
     elif target_type == "Risk:Reward Based (min 1:2)":
         target_dist = sl_dist * rr_ratio
@@ -7421,6 +7824,12 @@ def render_config_controls(ui, prefix="sb"):
         ui.caption(f"⚡ {interval} is a Dhan-only granularity (yfinance does not offer it). It is served from Dhan "
                    "and will fall back to the nearest supported timeframe if the feed is turned off.")
     periods_available = _tf_map.get(interval, TF_PERIOD_MAP.get(interval, ["1d"]))
+    _yf_lim = YF_INTERVAL_MAX_DAYS.get(interval)
+    if _yf_lim and _yf_lim < 36500 and not dhan_feed_active():
+        ui.caption(f"ℹ️ yfinance serves about {_yf_lim} days of {interval} history; longer requests are silently "
+                   "truncated by Yahoo, so the list above is capped to what will actually arrive.")
+    if st.session_state.get("yf_period_clamp_note"):
+        ui.warning("⏳ " + st.session_state.pop("yf_period_clamp_note"))
     _default_period = "7d" if "7d" in periods_available else periods_available[0]
     period = cfg_selectbox(ui, "Period", "period", periods_available, default=_default_period, prefix=prefix)
 
@@ -7468,6 +7877,42 @@ def render_config_controls(ui, prefix="sb"):
                    f"and SELL when RSI falls DOWN THROUGH {params['rsi_sell_level']:.0f}. Switch either dropdown to "
                    "trade the opposite crossing direction (e.g. buy as RSI drops INTO oversold) — both levels and both "
                    "directions are fully configurable.")
+    if strategy == "AMD (Accumulation–Manipulation–Distribution)":
+        c1, c2 = ui.columns(2)
+        params["amd_range_bars"] = cfg_number(c1, "Accumulation range lookback (bars)", "amd_range_bars",
+                                              20, 5, 300, is_int=True, prefix=prefix)
+        params["amd_max_range_atr"] = cfg_number(c2, "Max range width (× ATR)", "amd_max_range_atr",
+                                                 6.0, 1.0, 50.0, step=0.5, prefix=prefix)
+        params["amd_min_wick"] = cfg_number(ui, "Minimum sweep wick (fraction of bar range)", "amd_min_wick",
+                                            0.4, 0.05, 0.95, step=0.05, prefix=prefix)
+        params["amd_require_close_back"] = cfg_checkbox(ui, "Require the next bar to confirm the reversal",
+                                                        "amd_require_close_back", True, prefix=prefix)
+        ui.caption("Accumulation → Manipulation → Distribution (the 'power of three'). Price builds a range, "
+                   "sweeps one side to trigger resting stops, then moves the OTHER way. The trade is the reversal "
+                   "AFTER the sweep — entering on the sweep itself takes the wrong side of the very move the "
+                   "pattern identifies as a trap. The ATR cap ensures the prior range was genuine accumulation "
+                   "rather than a trend still making new extremes. Confirmation costs one bar of entry price but "
+                   "filters sweeps that simply keep going.")
+
+    if strategy == "Volume Profile (Fixed Range)":
+        c1, c2 = ui.columns(2)
+        params["vp_lookback"] = cfg_number(c1, "Profile range (bars)", "vp_lookback",
+                                           100, 20, 2000, is_int=True, prefix=prefix)
+        params["vp_bins"] = cfg_number(c2, "Price bins", "vp_bins", 24, 6, 120, is_int=True, prefix=prefix)
+        params["vp_mode"] = cfg_selectbox(ui, "How to trade the value area", "vp_mode",
+                                          ["Breakout from value area", "Fade back toward the POC"],
+                                          default="Breakout from value area", prefix=prefix)
+        params["vp_recalc_every"] = cfg_number(ui, "Recompute the profile every N bars", "vp_recalc_every",
+                                               5, 1, 100, is_int=True, prefix=prefix)
+        ui.caption("Distributes volume across price to find the **POC** (most-traded price) and the **value "
+                   "area** holding 70% of activity. Price inside the value area is in balance and offers no edge; "
+                   "the events worth trading are at its edges. Breakout treats leaving value as acceptance of new "
+                   "prices; Fade treats the same edge as over-extension due to revert. Both readings are "
+                   "legitimate and they are opposites, so the choice is explicit rather than assumed.")
+        ui.caption("On a cash index with no volume the profile counts BARS per price level instead — still a "
+                   "valid map of where price spent time, but that is a TIME profile, not a volume profile. The "
+                   "status board states which was used.")
+
     if strategy == "Elliott Wave (Zigzag)":
         params["zigzag_lookback"] = cfg_number(ui, "Zigzag Lookback (bars each side of a pivot)",
                                                "zigzag_lookback", 3, 2, 20, is_int=True, prefix=prefix)
@@ -8015,7 +8460,8 @@ def render_config_controls(ui, prefix="sb"):
     ui.markdown("### 🛑 Stoploss")
     sl_type = cfg_selectbox(ui, "Stoploss Type", "sl_type", SL_TYPES, default=SL_TYPES[0], prefix=prefix)
     _sl_explain = {
-        "Custom Points": "Active SL = entry ∓ 'SL Points (base)'. Only that one fixed level exists and that's what hits.",
+        "Custom Points": "Active SL = entry ∓ 'SL Points'. Only that one fixed level exists and that's what hits.",
+        "Percent of Entry Price": "Active SL = entry ∓ a PERCENTAGE of the entry price, so it scales with the instrument instead of needing a different points value for each one.",
         "Trailing SL (Points)": "Initial SL = entry ∓ 'SL Points (base)'; it then trails, always staying that many points behind the best price reached. One level — the trailed one — is what hits.",
         "Trail Candle Low/High (Current)": "Initial SL = entry ∓ 'SL Points (base)' (a starting backstop). Every candle it RATCHETS to the current candle's low (longs) / high (shorts) whenever that is TIGHTER. There is only ONE active SL at any moment — the tighter of the two — and that single level is what hits.",
         "Trail Candle Low/High (Previous)": "Initial SL = entry ∓ 'SL Points (base)' (a starting backstop). Every candle it RATCHETS to the PREVIOUS candle's low/high whenever that is tighter. Only the single, current ratcheted level can hit.",
@@ -8040,7 +8486,13 @@ def render_config_controls(ui, prefix="sb"):
     _SL_BACKSTOP_ONLY = {"Trail Candle Low/High (Current)", "Trail Candle Low/High (Previous)",
                          "Trail Swing Low/High (Current)", "Trail Swing Low/High (Previous)",
                          "Strategy Signal Exit", "EMA Reverse Crossover Exit", "Autopilot SL"}
-    if sl_type in _SL_USES_POINTS:
+    if sl_type == "Percent of Entry Price":
+        params["sl_pct"] = cfg_number(ui, "Stoploss (% of entry price)", "sl_pct",
+                                      1.0, 0.01, 90.0, step=0.25, prefix=prefix)
+        ui.caption(f"Exits {params['sl_pct']:.2f}% away from entry — on a 24,000 index that is about "
+                   f"{24000 * params['sl_pct'] / 100:,.0f} points, on a ₹60 option about "
+                   f"₹{60 * params['sl_pct'] / 100:.2f}. The same setting stays sensible across instruments.")
+    elif sl_type in _SL_USES_POINTS:
         params["sl_points"] = cfg_number(ui, "SL Points", "sl_points", 10.0, 0.1, 100000.0, prefix=prefix)
     elif sl_type in _SL_BACKSTOP_ONLY:
         _use_backstop = cfg_checkbox(ui, "Set an opening backstop in points", "sl_backstop_on",
@@ -8087,7 +8539,8 @@ def render_config_controls(ui, prefix="sb"):
     ui.markdown("### 🎯 Target")
     target_type = cfg_selectbox(ui, "Target Type", "target_type", TARGET_TYPES, default=TARGET_TYPES[0], prefix=prefix)
     _tgt_explain = {
-        "Custom Points": "Active target = entry ± 'Target Points (base)'. Only that fixed level exists and that's what hits.",
+        "Custom Points": "Active target = entry ± 'Target Points'. Only that fixed level exists and that's what hits.",
+        "Percent of Entry Price": "Active target = entry ± a PERCENTAGE of the entry price — the natural unit when the same configuration is used across instruments of very different price.",
         "Trailing Target (Display Only)": "No fixed target hits — the position rides until the SL side (or a signal/risk exit) closes it. 'Target Points (base)' only sets the initial displayed level.",
         "Trail Candle Low/High (Current)": "Initial target = entry ± 'Target Points (base)'; it then EXTENDS with the current candle's high/low, so it keeps moving away — exits usually come from the SL side.",
         "Trail Candle Low/High (Previous)": "Initial target = entry ± 'Target Points (base)'; it then EXTENDS with the previous candle's high/low.",
@@ -8107,7 +8560,16 @@ def render_config_controls(ui, prefix="sb"):
     _TGT_BACKSTOP_ONLY = {"Trail Candle Low/High (Current)", "Trail Candle Low/High (Previous)",
                           "Trail Swing Low/High (Current)", "Trail Swing Low/High (Previous)",
                           "Strategy Signal Exit", "EMA Reverse Crossover Exit"}
-    if target_type in _TGT_USES_POINTS:
+    if target_type == "Percent of Entry Price":
+        params["target_pct"] = cfg_number(ui, "Target (% of entry price)", "target_pct",
+                                          2.0, 0.01, 500.0, step=0.25, prefix=prefix)
+        _rr_pct = (float(params["target_pct"]) / float(params.get("sl_pct", 1.0))
+                   if sl_type == "Percent of Entry Price" and float(params.get("sl_pct", 0)) > 0 else None)
+        ui.caption(f"Books {params['target_pct']:.2f}% from entry."
+                   + (f" With the {params.get('sl_pct', 1.0):.2f}% stop that is a {_rr_pct:.1f}:1 reward:risk, "
+                      f"needing a {100 / (1 + _rr_pct):.0f}% hit rate to break even."
+                      if _rr_pct else ""))
+    elif target_type in _TGT_USES_POINTS:
         params["target_points"] = cfg_number(ui, "Target Points", "target_points",
                                              20.0, 0.1, 200000.0, prefix=prefix)
     elif target_type in _TGT_BACKSTOP_ONLY:
@@ -8349,6 +8811,39 @@ def render_config_controls(ui, prefix="sb"):
                    "is directionless, so the optional second box also requires the surge bar to close up for buys "
                    "and down for sells.")
 
+    filters["choch_enabled"] = cfg_checkbox(ui, "Change of Character (CHoCH) Filter", "choch_enabled",
+                                            False, prefix=prefix)
+    if filters["choch_enabled"]:
+        c1, c2 = ui.columns(2)
+        filters["choch_lookback"] = cfg_number(c1, "Swing lookback (bars each side)", "choch_lookback",
+                                               3, 2, 20, is_int=True, prefix=prefix)
+        filters["choch_valid_bars"] = cfg_number(c2, "Shift stays valid for (bars)", "choch_valid_bars",
+                                                 10, 1, 200, is_int=True, prefix=prefix)
+        filters["choch_mode"] = cfg_selectbox(ui, "How to use it", "choch_mode",
+                                              ["Trade with the shift", "Avoid trading against a fresh shift"],
+                                              default="Trade with the shift", prefix=prefix)
+        ui.caption("A **break of structure** continues a trend (a higher high in an uptrend). A **change of "
+                   "character** is the first FAILURE of it — in an uptrend, a close below the most recent higher "
+                   "low. That is the earliest structural evidence control has changed hands. 'Trade with the "
+                   "shift' only takes trades in the new direction; the other mode simply blocks entries against a "
+                   "fresh shift. Pivots need the lookback to confirm, so signals appear that many bars late — by "
+                   "construction, not as a flaw.")
+
+    filters["sweep_enabled"] = cfg_checkbox(ui, "Liquidity Sweep Filter", "sweep_enabled", False, prefix=prefix)
+    if filters["sweep_enabled"]:
+        c1, c2, c3 = ui.columns(3)
+        filters["sweep_lookback"] = cfg_number(c1, "Extreme lookback (bars)", "sweep_lookback",
+                                               20, 3, 300, is_int=True, prefix=prefix)
+        filters["sweep_min_wick"] = cfg_number(c2, "Min wick (fraction of bar range)", "sweep_min_wick",
+                                               0.4, 0.05, 0.95, step=0.05, prefix=prefix)
+        filters["sweep_valid_bars"] = cfg_number(c3, "Sweep stays valid for (bars)", "sweep_valid_bars",
+                                                 5, 1, 100, is_int=True, prefix=prefix)
+        ui.caption("Resting stops sit just beyond obvious highs and lows. A bar that trades THROUGH a recent "
+                   "extreme and then closes back inside it — leaving a long wick — suggests the level was raided "
+                   "for liquidity rather than genuinely broken. Requiring the close back inside is what separates "
+                   "a sweep from a real breakout; the wick fraction keeps out bars that merely grazed the level. "
+                   "Lows swept ⇒ buys only; highs swept ⇒ sells only.")
+
     ui.markdown("**📊 Option-Chain Filters** — live chain reads (need a Dhan token)")
     filters["oi_change_filter_enabled"] = cfg_checkbox(ui, "Change in OI (ΔOI) Filter",
                                                        "oi_change_filter_enabled", False, prefix=prefix)
@@ -8568,6 +9063,10 @@ def render_config_controls(ui, prefix="sb"):
             "zero_hero_mode": True,
             "ce_security_id": _zh_ce_id,
             "pe_security_id": _zh_pe_id,
+            # Needed so the position can name its contract and so the
+            # chain-snapshot price fallback can locate it.
+            "ce_strike": (_zh_ce or {}).get("strike"),
+            "pe_strike": (_zh_pe or {}).get("strike"),
             "expiry": _zh_exp2,
             "underlying": _zh_meta2["underlying"],
             "lot_size": store.get("_zh_lot"),
@@ -8665,6 +9164,8 @@ def render_config_controls(ui, prefix="sb"):
                 "chain_strategy_mode": True,
                 "ce_security_id": _ce_id,
                 "pe_security_id": _pe_id,
+                "ce_strike": _ce_strike,
+                "pe_strike": _pe_strike,
                 "expiry": _cs_exp,
                 "underlying": _cs_meta["underlying"],
                 "lot_size": store.get("_opt_lot_size"),
@@ -9808,8 +10309,27 @@ def position_direction_label(pos):
     sig_dir = int(pos.get("direction", 1))
     if pos.get("trade_instrument") == "OPTION":
         leg = pos.get("opt_leg") or ("CE" if sig_dir == 1 else "PE")
-        return f"BUY {leg} ({'long' if sig_dir == 1 else 'short'} view)"
+        strike = pos.get("opt_strike")
+        # Kept short so the metric does not truncate in a narrow column; the
+        # strike is what actually identifies the contract.
+        return f"BUY {int(strike)} {leg}" if strike else f"BUY {leg}"
     return "LONG" if sig_dir == 1 else "SHORT"
+
+
+def position_contract_label(pos):
+    """Full contract description for captions, where width is not a problem."""
+    pos = pos or {}
+    if pos.get("trade_instrument") != "OPTION":
+        return ""
+    leg = pos.get("opt_leg") or "option"
+    strike = pos.get("opt_strike")
+    bits = [f"{int(strike)} {leg}" if strike else leg]
+    if pos.get("opt_expiry"):
+        bits.append(f"expiry {pos['opt_expiry']}")
+    if pos.get("opt_underlying"):
+        bits.insert(0, str(pos["opt_underlying"]))
+    view = "long view" if int(pos.get("direction", 1)) == 1 else "short view"
+    return " · ".join(bits) + f" ({view})"
 
 
 def position_pl_direction(pos):
@@ -10107,8 +10627,21 @@ def evaluate_live_signal(ticker, interval, period, strategy, params, filters, sl
             # premium position's stop is a fixed % of what was paid, so leaving
             # it alone is correct rather than an omission.
             pos = update_trade_levels(pos, i, sig_df, params, a_series)
-        pos["highest"] = max(pos["highest"], ltp)
-        pos["lowest"] = min(pos["lowest"], ltp)
+        # Track extremes on the series that actually prices the position. For
+        # an option trade `ltp` here is the INDEX tick, which would push
+        # "Highest since entry" to ~73,900 on a position entered at a ₹260
+        # premium — mixing two instruments in the same field.
+        if pos.get("trade_instrument") == "OPTION":
+            _mark_now = option_premium_now(full_cfg, pos.get("opt_security_id"),
+                                           pos.get("opt_leg"), pos.get("opt_strike"))
+            if _mark_now:
+                _mark_now = float(_mark_now)
+                pos["highest"] = max(float(pos.get("highest", _mark_now)), _mark_now)
+                pos["lowest"] = min(float(pos.get("lowest", _mark_now)), _mark_now)
+                pos["current_price"] = _mark_now
+        else:
+            pos["highest"] = max(pos["highest"], ltp)
+            pos["lowest"] = min(pos["lowest"], ltp)
 
         exited, exit_price, reason = False, None, None
         if pos.get("pending_exit_reason"):
@@ -10364,9 +10897,12 @@ def evaluate_live_signal(ticker, interval, period, strategy, params, filters, sl
                     new_pos.update({
                         "trade_instrument": "OPTION", "opt_leg": _leg, "opt_security_id": _sec,
                         # Kept so the chain-snapshot fallback can locate this
-                        # contract if the live price endpoint is unavailable later.
+                        # contract if the live price endpoint is unavailable later,
+                        # and so the UI can name the contract being held.
                         "opt_strike": (_pc_now.get("ce_strike") if last_sig == 1
                                        else _pc_now.get("pe_strike")),
+                        "opt_expiry": _pc_now.get("expiry"),
+                        "opt_underlying": _pc_now.get("underlying"),
                         "opt_entry_premium": _prem, "underlying_entry": entry_price,
                         "entry_price": _prem, "sl": _osl, "target": _otgt,
                         "initial_sl": _osl, "initial_target": _otgt,
@@ -12018,6 +12554,154 @@ with tab_screen:
         st.warning("⚠️ The selected strategy reads a live option chain, which exists per-underlying rather than "
                    "per-candle. Screening many stocks with it is not meaningful — pick a price-based strategy for "
                    "the screener, or use the Option Chain Analysis tab for chain work.")
+
+    # ================= MULTI-STRATEGY UNIVERSE SCREEN =================
+    st.divider()
+    st.markdown("## 🧪 Best-Strategy Screen")
+    st.caption("Runs EVERY eligible strategy across the universe above and keeps only the symbol/strategy "
+               "pairings that clear your thresholds on data they were never fitted to.")
+
+    _ms_strats = multi_screener_strategies()
+    with st.expander("Which strategies are included, and why some are not", expanded=False):
+        st.markdown(f"**Included ({len(_ms_strats)}):** " + ", ".join(_ms_strats))
+        st.markdown("""
+**Excluded, deliberately:**
+- **Option-chain strategies and Zero Hero** depend on a LIVE chain snapshot. Dhan exposes no historical option
+  chain, so backtesting them across a universe would produce numbers with nothing behind them.
+- **Simple Buy/Sell Only and Threshold Cross** are price-level triggers rather than edges — they fire on a
+  condition you supply, so "optimising" them across symbols measures the level you chose, not a strategy.
+- **Hybrid** is a combination of the others; screening it would double-count whatever it contains.
+        """)
+
+    ms1, ms2, ms3 = st.columns(3)
+    ms_strats_sel = cfg_multiselect(st, "Strategies to test", "ms_strats", _ms_strats, default=_ms_strats)
+    ms_oos = ms1.number_input("Out-of-sample share (%)", 10, 50, 30, key="ms_oos")
+    ms_min_trades = ms2.number_input("Minimum in-sample trades", 5, 500, 20, key="ms_min_trades")
+    ms_max_syms = ms3.number_input("Max symbols to screen", 1, 500, min(25, len(_symbols)), key="ms_max_syms")
+
+    st.markdown("##### Thresholds — a pairing must clear ALL of these on the unseen data")
+    t1, t2, t3 = st.columns(3)
+    _ms_use_acc = t1.checkbox("Accuracy %", value=True, key="ms_use_acc")
+    _ms_acc = t1.number_input("min", 0.0, 100.0, 90.0, step=1.0, key="ms_acc",
+                              label_visibility="collapsed") if _ms_use_acc else None
+    _ms_use_exp = t2.checkbox("Expectancy", value=True, key="ms_use_exp")
+    _ms_exp = t2.number_input("min ", -1e6, 1e6, 0.0, step=0.5, key="ms_exp",
+                              label_visibility="collapsed") if _ms_use_exp else None
+    _ms_use_shp = t3.checkbox("Sharpe", value=False, key="ms_use_shp")
+    _ms_shp = t3.number_input("min  ", -100.0, 100.0, 1.0, step=0.25, key="ms_shp",
+                              label_visibility="collapsed") if _ms_use_shp else None
+    t4, t5, t6 = st.columns(3)
+    _ms_use_np = t4.checkbox("Net Points", value=False, key="ms_use_np")
+    _ms_np = t4.number_input("min   ", -1e9, 1e9, 0.0, step=10.0, key="ms_np",
+                             label_visibility="collapsed") if _ms_use_np else None
+    _ms_use_pf = t5.checkbox("Profit Factor", value=False, key="ms_use_pf")
+    _ms_pf = t5.number_input("min    ", 0.0, 100.0, 1.5, step=0.1, key="ms_pf",
+                             label_visibility="collapsed") if _ms_use_pf else None
+    _ms_use_tr = t6.checkbox("Trades (OOS)", value=False, key="ms_use_tr")
+    _ms_tr = t6.number_input("min     ", 1, 10000, 10, key="ms_tr",
+                             label_visibility="collapsed") if _ms_use_tr else None
+
+    if _ms_use_acc and _ms_acc is not None and float(_ms_acc) >= 85 and not _ms_use_exp:
+        st.warning(f"⚠️ A {float(_ms_acc):.0f}% accuracy filter with no expectancy requirement will surface the "
+                   "tiny-target/huge-stop configurations — they win almost every trade and still lose money. "
+                   "Keep the Expectancy threshold ticked (≥ 0) alongside it.")
+
+    _ms_thresholds = {}
+    if _ms_use_acc: _ms_thresholds["Accuracy %"] = _ms_acc
+    if _ms_use_exp: _ms_thresholds["Expectancy"] = _ms_exp
+    if _ms_use_shp: _ms_thresholds["Sharpe"] = _ms_shp
+    if _ms_use_np: _ms_thresholds["Net Points"] = _ms_np
+    if _ms_use_pf: _ms_thresholds["Profit Factor"] = _ms_pf
+    if _ms_use_tr: _ms_thresholds["Trades"] = _ms_tr
+
+    _ms_use_costs = st.checkbox("Apply realistic costs (slippage, spread, brokerage)", value=True,
+                                key="ms_use_costs")
+    _ms_costs = ({"slippage_points": 1.0, "spread_points": 0.5, "brokerage_flat": 20.0}
+                 if _ms_use_costs else None)
+    if _ms_use_costs:
+        st.caption("Costs are what separate a real edge from a spreadsheet one, and they hit small-target "
+                   "configurations hardest — which is where a high accuracy filter tends to land you.")
+
+    _ms_syms = _symbols[:int(ms_max_syms)]
+    st.info(f"Will test **{len(_ms_syms)}** symbols × **{len(ms_strats_sel)}** strategies = "
+            f"**{len(_ms_syms) * max(len(ms_strats_sel), 1):,}** backtests on {interval}/{period}, "
+            f"using the sidebar's SL ({sl_type}) and Target ({target_type}) settings."
+            + ("  Candles are fetched once per symbol and reused across strategies."
+               if len(ms_strats_sel) > 1 else ""))
+
+    if st.button("▶ Run Best-Strategy Screen", type="primary", key="ms_run",
+                 disabled=not (_ms_syms and ms_strats_sel)):
+        _mp = st.progress(0.0, text="Starting…")
+
+        def _mcb(f, label):
+            _mp.progress(min(max(f, 0.0), 1.0), text=f"{int(f * 100)}% · {label}")
+
+        with st.spinner("Screening the universe…"):
+            _mres, _merrs = run_multi_strategy_screener(
+                _ms_syms, ms_strats_sel, interval, period, sl_type, target_type,
+                params, filters, qty, _ms_costs,
+                _ms_thresholds, oos_fraction=float(ms_oos) / 100.0,
+                min_trades=int(ms_min_trades),
+                source=("Dhan" if scr_source == "Dhan" else
+                        ("yfinance" if scr_source == "yfinance" else "Auto")),
+                progress=_mcb)
+        _mp.empty()
+        st.session_state["ms_results"] = _mres
+        st.session_state["ms_errors"] = _merrs
+        st.session_state["ms_at"] = ist_now().strftime("%d-%b-%Y %H:%M:%S IST")
+
+    _mres = st.session_state.get("ms_results")
+    if _mres is None:
+        st.caption("Set your thresholds and press **▶ Run Best-Strategy Screen**.")
+    elif _mres.empty:
+        st.warning("**No symbol/strategy pairing cleared every threshold on unseen data.** That is a real and "
+                   "useful result rather than a failure — particularly with a 90% accuracy bar, which very few "
+                   "genuine edges reach once the reward:risk is meaningful. Try lowering the accuracy threshold "
+                   "and leaning on Expectancy and Sharpe instead, or widen the period so each symbol produces "
+                   "more trades.")
+        _merrs = st.session_state.get("ms_errors")
+        if _merrs is not None and not _merrs.empty:
+            with st.expander(f"{len(_merrs)} symbol(s) skipped"):
+                st.dataframe(_merrs, hide_index=True, use_container_width=True)
+    else:
+        st.success(f"{len(_mres)} pairing(s) cleared every threshold · run at {st.session_state.get('ms_at')}")
+        _ms_rank = cfg_selectbox(st, "Rank by", "ms_rank",
+                                 ["OOS Expectancy", "OOS Sharpe", "OOS Net Points",
+                                  "OOS Profit Factor", "OOS Accuracy %", "OOS Trades"],
+                                 default="OOS Expectancy")
+        _mv = _mres.sort_values(_ms_rank, ascending=False).reset_index(drop=True)
+        st.dataframe(_mv, hide_index=True, use_container_width=True, height=420)
+        st.caption("All figures are from the out-of-sample slice. **Breakeven Acc % Needed** is the hit rate the "
+                   "chosen risk:reward requires — compare it against the accuracy columns before trusting a high "
+                   "win rate.")
+        st.download_button("⬇ Download results (CSV)", _mv.to_csv(index=False).encode(),
+                           file_name=f"best_strategy_screen_{interval}_{period}.csv",
+                           mime="text/csv", key="ms_dl")
+
+        st.markdown("##### 📥 Apply a pairing to the sidebar")
+        _mopts = [f"{r['Symbol']} · {r['Strategy'][:34]} · exp {r['OOS Expectancy']:+.2f} · "
+                  f"acc {r['OOS Accuracy %']:.0f}% · {int(r['OOS Trades'])} trades"
+                  for _, r in _mv.head(60).iterrows()]
+        _mi = st.selectbox("Pairing", range(len(_mopts)), format_func=lambda i: _mopts[i], key="ms_pick")
+        _mrow = _mv.iloc[_mi]
+        if st.button("📥 Apply symbol + strategy to sidebar", type="primary", key="ms_apply"):
+            _s = str(_mrow["Symbol"])
+            if _s.endswith((".NS", ".BO")) or _s.startswith("^") or any(ch in _s for ch in ("=", "-")):
+                cfg_set("ticker_choice", "Custom"); cfg_set("ticker_custom", _s)
+            elif _s in TICKER_MAP:
+                cfg_set("ticker_choice", _s)
+            else:
+                cfg_set("ticker_choice", "Custom"); cfg_set("ticker_custom", f"{_s}.NS")
+            cfg_set("strategy", str(_mrow["Strategy"]))
+            cfg_set("interval", interval)
+            cfg_set("period", period)
+            cfg_set("sl_type", sl_type)
+            cfg_set("target_type", target_type)
+            st.session_state["cfg_applied_msg"] = (
+                f"Applied {_mrow['Symbol']} · {_mrow['Strategy']} · {interval}/{period} ✅")
+            st.rerun()
+        st.caption("Validate before trading it: confirm on the Backtest tab, then walk-forward it, then paper "
+                   "trade. A pairing that survived one out-of-sample slice is a candidate, not a conclusion.")
 
 
 # --------------------------------------------------------- PCR TIMELINE ----
