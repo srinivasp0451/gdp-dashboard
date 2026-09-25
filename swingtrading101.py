@@ -4602,6 +4602,11 @@ def _maybe_route_broker(cfg: dict, position: Position, closing: bool) -> None:
         log_event(f"Broker order FAILED: {exc}", "error")
 
 
+def closed_pos_of(snapshot: LiveSnapshot) -> int:
+    """Positional index of the last fully closed candle in the snapshot frame."""
+    return len(snapshot.frame) + int(snapshot.closed_index)
+
+
 def _live_fill_price(cfg: dict, snapshot: LiveSnapshot, ctx: BarCtx) -> float:
     """
     The price a live order can ACTUALLY get: the current LTP.
@@ -4832,10 +4837,34 @@ def run_cycle(cfg: dict) -> None:
         st.session_state.live_last_bar = snapshot.last_closed_time
         return
 
+    # Candles do not arrive one at a time on a delayed feed. A feed running 30
+    # minutes behind delivers half an hour of one-minute candles in a single
+    # refresh, and a crossover that happened inside that batch lands in the
+    # MIDDLE of it, not on the newest bar. Looking only at the newest closed
+    # candle therefore missed every signal that arrived in a catch-up burst --
+    # which on a lagging feed is most of them.
+    previous_bar = st.session_state.live_last_bar
     st.session_state.live_last_bar = snapshot.last_closed_time
     direction = int(snapshot.last_closed_signal)
     signal_time = snapshot.last_closed_time
     catch_up = False
+    arrived_late = False
+
+    if direction == 0 and previous_bar is not None:
+        closed = snapshot.frame["signal"].iloc[:closed_pos_of(snapshot) + 1]
+        try:
+            fresh = closed[closed.index > pd.Timestamp(previous_bar)]
+        except (TypeError, ValueError):
+            fresh = closed.iloc[0:0]
+        fired = fresh[fresh != 0]
+        if len(fired):
+            direction = int(fired.iloc[-1])
+            signal_time = fired.index[-1]
+            arrived_late = True
+            log_event(f"Signal found inside a batch of {len(fresh)} candle(s) that arrived "
+                      f"together: {'LONG' if direction > 0 else 'SHORT'} on "
+                      f"{fmt_time(signal_time)}. A delayed feed delivers candles in bursts, so "
+                      f"the trigger is rarely the newest bar.", "info")
 
     first_cycle = bool(st.session_state.get("live_first_cycle"))
     st.session_state.live_first_cycle = False
@@ -4891,6 +4920,8 @@ def run_cycle(cfg: dict) -> None:
 
     # Signal on candle N -> fill at the OPEN of candle N+1 (already printed).
     route = "newest closed candle"
+    if arrived_late:
+        route = "arrived in a batch of late candles"
     if catch_up:
         route = f"catch-up (lookback {int(cfg.get('entry_lookback', 0) or 0)})"
         fill = snapshot.ltp
@@ -7395,7 +7426,9 @@ def signal_detail(frame: pd.DataFrame, hit_time, direction: int, risk: "RiskConf
 
     return {
         "Signal Time": pd.Timestamp(hit_time),
-        "Bars Ago": int(last - 1 - pos),
+        # A forming candle has not closed, so "bars ago" is not a number yet.
+        # Reporting -1 made an unconfirmed row look like a data error.
+        "Bars Ago": int(last - 1 - pos) if pos <= last - 1 else None,
         "Price at Signal": round(price_signal, 2),
         "Fill Price (next open)": None if not np.isfinite(fill) else round(fill, 2),
         "Price Now": round(price_now, 2),
@@ -7653,12 +7686,17 @@ def chunked_sweep(prefix: str, jobs: list, worker, slice_seconds: float = 20.0,
                         else f" · about {eta / 60:0.0f} min left")
         state = ("working" if (running and queue) else
                  ("paused" if queue else "finished"))
+        pct = (done / total * 100.0) if total else 0.0
         bar.progress(done / total if total else 0.0,
-                     text=f"{done} of {total} {label} scanned — {state}{eta_text}")
+                     text=f"{done} of {total} {label} scanned ({pct:.0f}%) — "
+                          f"{state}{eta_text}")
     if not queue:
         status.empty()
 
     if running and queue:
+        # A breath between passes. Without it the reruns form a hot loop that
+        # starves the browser of the very updates this design exists to deliver.
+        time.sleep(0.15)
         st.rerun()
     if running and not queue:
         st.session_state[run_key] = False
@@ -9612,75 +9650,25 @@ def tab_signal_lab(cfg: dict) -> None:
                f"short passes rather than one long run, so you can leave it going, pause it, or "
                f"come back after a disconnection and resume where it stopped.")
 
-    # ---- chunked execution -------------------------------------------------
-    #
-    # A 7,500-backtest sweep cannot run inside ONE Streamlit script run. The
-    # hosted runtime recycles long-running scripts, and a dropped websocket kills
-    # whatever is in flight — which is why a 73-minute budget stopped at 31 of 50
-    # jobs. The budget was never the binding constraint; the length of a single
-    # run was. So no single run is long any more: each pass works for a few
-    # seconds, saves what it found, and asks for the next pass. If the runtime
-    # does recycle, everything already scanned survives and Resume continues.
+    # The Signal Lab now shares the same driver as every other sweep, so it gets
+    # the same guarantees: honest progress, a disk mirror that survives the
+    # runtime restarting, pause and resume, and per-job isolation.
     jobs = [(t, tf) for t in tickers for tf in timeframes]
-    slice_seconds = _auto_slice_seconds()
 
-    c_run, c_pause, c_clear = st.columns(3)
-    if c_run.button("Run Signal Lab", type="primary", width="stretch"):
-        st.session_state.lab_queue = list(jobs)
-        st.session_state.lab_rows = []
-        st.session_state.lab_errors = []
-        st.session_state.lab_total = len(jobs)
-        st.session_state.lab_running = True
-        st.session_state.lab_results = None
-        st.rerun()
+    def _lab_worker(job):
+        ticker, interval = job
+        part_rows, part_errs = run_signal_lab(
+            [ticker], cfg, objective, int(iterations), int(min_trades),
+            int(signal_window), safe_only, [interval], gates, None, grid,
+            exhaustive, scale_points, time_budget=_auto_slice_seconds() * 4)
+        return part_rows.to_dict("records"), part_errs.to_dict("records")
 
-    running = bool(st.session_state.get("lab_running"))
-    queue = list(st.session_state.get("lab_queue") or [])
-    if c_pause.button("Pause" if running else "Resume", disabled=not queue, width="stretch",
-                      key="lab_pause"):
-        st.session_state.lab_running = not running
-        st.rerun()
-    if c_clear.button("Clear results", width="stretch", key="lab_clear"):
-        for key in ("lab_queue", "lab_rows", "lab_errors", "lab_results", "lab_partial"):
-            st.session_state[key] = None if key in ("lab_results", "lab_partial") else []
-        st.session_state.lab_running = False
-        st.rerun()
-
-    total = int(st.session_state.get("lab_total") or 0)
-    if queue or running:
-        done = total - len(queue)
-        st.progress(done / total if total else 0.0,
-                    text=f"{done} of {total} ticker/timeframe jobs scanned"
-                         + (" — working" if running else " — paused"))
-
-    if running and queue:
-        slice_started = time.time()
-        rows = list(st.session_state.get("lab_rows") or [])
-        errs = list(st.session_state.get("lab_errors") or [])
-        while queue and (time.time() - slice_started) < float(slice_seconds):
-            ticker, interval = queue.pop(0)
-            try:
-                part_rows, part_errs = run_signal_lab(
-                    [ticker], cfg, objective, int(iterations), int(min_trades),
-                    int(signal_window), safe_only, [interval], gates, None, grid,
-                    exhaustive, scale_points, time_budget=float(slice_seconds) * 3)
-                rows += part_rows.to_dict("records")
-                errs += part_errs.to_dict("records")
-            except Exception as exc:                                # noqa: BLE001
-                # One bad ticker must never end the sweep.
-                errs.append({"Ticker": ticker, "Timeframe": interval,
-                             "Problem": f"unhandled: {str(exc)[:120]}"})
-        st.session_state.lab_queue = queue
-        st.session_state.lab_rows = rows
-        st.session_state.lab_errors = errs
-        st.session_state.lab_results = (pd.DataFrame(rows), pd.DataFrame(errs))
-        st.session_state.lab_partial = (total - len(queue), total)
-        if not queue:
-            st.session_state.lab_running = False
-            st.success(f"Finished all {total} ticker/timeframe jobs.")
-        else:
-            time.sleep(0.05)
-            st.rerun()
+    rows, errs, _finished = chunked_sweep(
+        "lab", jobs, _lab_worker, _auto_slice_seconds(), "ticker/timeframe jobs",
+        describe=lambda job: f"{job[0]} \u00b7 {job[1]}")
+    st.session_state.lab_results = (pd.DataFrame(rows), pd.DataFrame(errs))
+    st.session_state.lab_partial = (len(jobs) - len(st.session_state.get("lab_queue") or []),
+                                    len(jobs))
 
     # Rendered before the results so it exists from the first page load. Putting
     # it inside the results block meant the control only appeared after a run,
@@ -12173,6 +12161,49 @@ def _test_target_rows_are_reachable():
     print("   target counts are traceable to rows; merged batches do not duplicate  OK")
 
 
+def _test_batched_candle_arrival():
+    """
+    A delayed feed delivers candles in bursts, not one at a time.
+
+    A feed running half an hour behind hands over thirty one-minute candles in a
+    single refresh, and a crossover inside that burst lands in the MIDDLE of it.
+    Reading only the newest closed candle therefore missed most signals on a
+    lagging feed -- which is exactly the case where the operator is watching the
+    chart and wondering why nothing fired.
+    """
+    full = _synthetic(700, seed=11)
+    full.index = pd.date_range(end=pd.Timestamp("2026-09-25 12:00", tz="Asia/Kolkata"),
+                               periods=700, freq="1min", tz="Asia/Kolkata")
+    params = dict(DEFAULT_PARAMS)
+    params["intraday"] = True
+    frame, _ = prepare(full, "01 \u00b7 Dual EMA Crossover", params)
+    fired_all = [i for i, v in enumerate(frame["signal"].to_numpy()) if v != 0]
+    assert fired_all, "the sample needs at least one crossover"
+    cross = fired_all[-1]
+
+    before, _ = prepare(full.iloc[:cross - 5], "01 \u00b7 Dual EMA Crossover", params)
+    after, _ = prepare(full.iloc[:cross + 25], "01 \u00b7 Dual EMA Crossover", params)
+    last_seen = before.index[len(before) - 2]
+
+    closed = after["signal"].iloc[:len(after) - 1]
+    newest_only = int(closed.iloc[-1])
+    arrived = closed[closed.index > last_seen]
+    fired = arrived[arrived != 0]
+
+    assert len(arrived) > 1, "the burst must contain more than one candle"
+    assert len(fired) >= 1, "the crossover is inside the burst"
+    assert newest_only == 0, \
+        "the newest closed candle carries no signal — this is what the old code read"
+    # Scanning the burst finds it; scanning only the newest bar does not.
+    assert int(fired.iloc[-1]) != 0
+    assert fired.index[-1] > last_seen, "the signal is newer than anything already acted on"
+    # And nothing already seen is re-traded.
+    stale = closed[closed.index <= last_seen]
+    assert not len(stale[stale.index > last_seen])
+    print(f"   batched candle arrival: {len(arrived)} candles landed together, signal found "
+          f"mid-batch  OK")
+
+
 def _test_signal_detail():
     """
     The enriched signal columns must reconcile with each other exactly.
@@ -12468,6 +12499,7 @@ def run_selftest() -> int:
         _test_session_and_time_limits()
         _test_sweep_progress_is_honest()
         _test_target_rows_are_reachable()
+        _test_batched_candle_arrival()
         print("-- filters --")
         _test_filters()
         _test_new_filters()
