@@ -1210,19 +1210,31 @@ def fetch_data_yf(ticker, interval, period):
     resample_rule = None
     if interval in _YF_FALLBACK_TF:
         interval, resample_rule = _YF_FALLBACK_TF[interval]
-    # Yahoo truncates an over-long request instead of failing, so clamp the
-    # period to what this interval can actually serve and say so.
+    # Yahoo truncates an over-long request instead of failing. This clamp is a
+    # backstop for PROGRAMMATIC callers (screener, strategy search) that may
+    # pass an arbitrary period — the sidebar's own list is already built to
+    # these limits, so a normal selection must never be reduced.
+    #
+    # Two rules keep it from over-triggering, which it previously did: a
+    # tolerance, because "2y" is 731 days against a 730-day limit and that
+    # 1-day rounding difference is not a real overrun; and a step DOWN to the
+    # next period the interval actually offers, rather than an arbitrary jump
+    # (2y → 1y was the visible symptom of getting that wrong).
     _lim = YF_INTERVAL_MAX_DAYS.get(interval)
-    if _lim:
+    if _lim and _lim < 36500:
         _want = PERIOD_TO_DAYS.get(period)
-        if _want and _want > _lim:
-            _fit = next((p for p in ("2y", "1y", "6mo", "3mo", "2mo", "1mo", "7d", "5d", "1d")
-                         if PERIOD_TO_DAYS.get(p, 10 ** 9) <= _lim), "1mo")
-            st.session_state["yf_period_clamp_note"] = (
-                f"{interval} candles are only available for about {_lim} days on yfinance, so '{period}' was "
-                f"reduced to '{_fit}'. Yahoo silently truncates longer requests, which otherwise shows up as "
-                "missing data.")
-            period = _fit
+        _tolerance = max(7, _lim * 0.05)          # a week, or 5% — whichever is larger
+        if _want and _want > _lim + _tolerance:
+            _offered = TF_PERIOD_MAP.get(interval) or list(PERIOD_TO_DAYS.keys())
+            _fits = [p for p in _offered
+                     if PERIOD_TO_DAYS.get(p, 10 ** 9) <= _lim + _tolerance]
+            _fit = max(_fits, key=lambda p: PERIOD_TO_DAYS.get(p, 0)) if _fits else period
+            if _fit != period:
+                st.session_state["yf_period_clamp_note"] = (
+                    f"yfinance serves about {_lim} days of {interval} history, so '{period}' was reduced to "
+                    f"'{_fit}' — the longest span this interval actually returns. Yahoo truncates longer "
+                    "requests silently, which otherwise looks like missing data.")
+                period = _fit
     time.sleep(RATE_LIMIT_DELAY)
     df = yf.download(ticker, interval=interval, period=period, progress=False, auto_adjust=True)
     if df is None or df.empty:
