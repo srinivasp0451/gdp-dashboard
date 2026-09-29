@@ -270,6 +270,15 @@ def exit_reliability(sl_type: str, tp_type: str) -> tuple[str, list[str]]:
 QUOTE_LIVE_WINDOW = 300.0
 QUOTE_EVIDENCE_TICKS = 3
 
+# How many candles old a signal may be and still be acted on, outside the
+# first cycle. Zero was the old default and it is a trap: it means "only the
+# candle that is newest on THIS EXACT POLL", and on a feed that delivers
+# candles in bursts that poll frequently never happens, so real triggers were
+# skipped in silence. Two candles is small enough that the engine is still
+# trading the signal rather than chasing it, and large enough to survive a
+# batch arrival, a missed poll or a held liveness check.
+DEFAULT_ENTRY_LOOKBACK = 2
+
 INTERVAL_SECONDS = {"1m": 60, "2m": 120, "3m": 180, "5m": 300, "10m": 600, "15m": 900,
                     "30m": 1800, "60m": 3600, "4h": 14400, "1d": 86400,
                     "1wk": 604800, "1mo": 2592000}
@@ -4345,6 +4354,7 @@ def reset_live_runtime() -> None:
     st.session_state.last_ltp_change_ts = 0.0
     st.session_state.live_fail_streak = 0
     st.session_state.live_backoff_until = 0.0
+    st.session_state.held_signal_polls = 0
 
 
 # =============================================================================
@@ -4486,8 +4496,26 @@ def build_snapshot(cfg: dict, frame: pd.DataFrame, reports, warnings, vix,
 
     since_change = now_t - float(st.session_state.get("last_ltp_change_ts", 0.0))
     observed_ticks = int(st.session_state.get("live_poll_count", 0))
+
+    # A SECOND, independent proof that the venue is open: new candles keep
+    # arriving. Yahoo serves many index quotes from a cache that only refreshes
+    # on candle boundaries, so waiting for the quote to tick can wait forever on
+    # a market that is plainly trading -- and the whole engine was gated on that
+    # one signal. A newest-bar timestamp that keeps advancing cannot happen on a
+    # closed exchange, so it is treated as evidence in its own right.
+    seen_bar = st.session_state.get("newest_bar_seen")
+    if seen_bar is None or pd.Timestamp(seen_bar) != last_ts:
+        st.session_state.newest_bar_seen = last_ts
+        if seen_bar is not None:
+            st.session_state.newest_bar_advanced_ts = now_t
+    since_new_bar = now_t - float(st.session_state.get("newest_bar_advanced_ts", 0.0))
+    candles_advancing = (st.session_state.get("newest_bar_advanced_ts")
+                         and since_new_bar <= max(2.5 * bar_seconds, QUOTE_LIVE_WINDOW))
+
     if not stale:
         quote_live = True                       # candles are current: the venue is open
+    elif candles_advancing:
+        quote_live = True                       # bars are still printing: it is trading
     elif observed_ticks < QUOTE_EVIDENCE_TICKS:
         quote_live = False                      # not enough evidence yet -- hold entries
     else:
@@ -4711,7 +4739,21 @@ def run_cycle(cfg: dict) -> None:
                     or (now - st.session_state.live_frame_at) >= candle_gap)
     try:
         if need_candles:
+            previous_frame = st.session_state.live_frame
             frame, reports, warns, vix = refresh_candles(cfg)
+            # How many candles this single refresh delivered. A delayed feed
+            # hands over a burst, and every bar in that burst is being SEEN for
+            # the first time -- so a signal inside it is not a signal the engine
+            # was slow about, and judging its age by candle count alone would
+            # reject the only chance there ever was to act on it.
+            added = 0
+            if previous_frame is not None and len(previous_frame):
+                try:
+                    newer = frame.index > pd.Timestamp(previous_frame.index[-1])
+                    added = int(newer.sum())
+                except (TypeError, ValueError):
+                    added = 0
+            st.session_state.bars_added_last_refresh = added
             st.session_state.live_frame = frame
             st.session_state.live_reports = reports
             st.session_state.live_frame_warnings = warns
@@ -4812,11 +4854,7 @@ def run_cycle(cfg: dict) -> None:
         return
 
     # ----------------------------------------------------- 2. fresh entries ---
-    # Only a genuinely DEAD feed blocks entry: candles lagging AND the price not
-    # moving. Lagging candles alone are normal on a delayed feed during market
-    # hours, and blocking on that basis stops live trades for no reason.
-    if snapshot.frozen and not cfg.get("allow_stale_entries"):
-        return
+    strat = get_strategy(cfg["strategy"])
 
     # Daily limits gate NEW entries only.
     risk = cfg["risk"]
@@ -4827,113 +4865,150 @@ def run_cycle(cfg: dict) -> None:
         if risk.daily_loss_limit and booked <= -abs(float(risk.daily_loss_limit)):
             return
 
-    strat = get_strategy(cfg["strategy"])
+    # -- the one source of truth for "something fired that we have not acted on"
+    #
+    # Earlier versions asked "does the NEWEST CLOSED candle carry a signal?" and
+    # that question is unanswerable in practice. A signal is only visible on the
+    # single poll where its bar happens to be the newest closed one, and that
+    # poll is missed constantly: a delayed feed delivers ten candles in one
+    # burst so the trigger lands in the middle of the batch, the browser tab
+    # sleeps, a rerun lands mid-candle, the liveness gate holds the cycle for
+    # its first few ticks. Every one of those drops the trade silently, which is
+    # exactly the reported failure -- two clean 9/21 crossovers on Nifty, no
+    # entry, no explanation.
+    #
+    # So the engine now asks the durable question instead: what is the newest
+    # closed candle carrying a signal anywhere in the frame, and have we already
+    # made a decision about it? That is independent of which poll saw the bar
+    # close, which makes batch arrival, missed polls and held cycles harmless.
+    pending_dir = int(snapshot.recent_signal)
+    pending_time = snapshot.recent_signal_time
+    pending_ago = snapshot.recent_signal_bars_ago
+    decided = st.session_state.get("live_last_signal_time")
+    st.session_state.live_last_bar = snapshot.last_closed_time
+
     if strat.immediate:
-        direction = 1 if "Buy" in strat.name else -1
         cfg["_ltp_at_fill"] = snapshot.ltp
-        _open_live_position(cfg, direction, snapshot.ltp, closed_ctx,
+        _open_live_position(cfg, 1 if "Buy" in strat.name else -1, snapshot.ltp, closed_ctx,
                             snapshot.last_closed_time, bars_ago=0,
                             route="immediate profile, no candle wait")
-        st.session_state.live_last_bar = snapshot.last_closed_time
+        st.session_state.live_first_cycle = False
         return
-
-    # Candles do not arrive one at a time on a delayed feed. A feed running 30
-    # minutes behind delivers half an hour of one-minute candles in a single
-    # refresh, and a crossover that happened inside that batch lands in the
-    # MIDDLE of it, not on the newest bar. Looking only at the newest closed
-    # candle therefore missed every signal that arrived in a catch-up burst --
-    # which on a lagging feed is most of them.
-    previous_bar = st.session_state.live_last_bar
-    st.session_state.live_last_bar = snapshot.last_closed_time
-    direction = int(snapshot.last_closed_signal)
-    signal_time = snapshot.last_closed_time
-    catch_up = False
-    arrived_late = False
-
-    if direction == 0 and previous_bar is not None:
-        closed = snapshot.frame["signal"].iloc[:closed_pos_of(snapshot) + 1]
-        try:
-            fresh = closed[closed.index > pd.Timestamp(previous_bar)]
-        except (TypeError, ValueError):
-            fresh = closed.iloc[0:0]
-        fired = fresh[fresh != 0]
-        if len(fired):
-            direction = int(fired.iloc[-1])
-            signal_time = fired.index[-1]
-            arrived_late = True
-            log_event(f"Signal found inside a batch of {len(fresh)} candle(s) that arrived "
-                      f"together: {'LONG' if direction > 0 else 'SHORT'} on "
-                      f"{fmt_time(signal_time)}. A delayed feed delivers candles in bursts, so "
-                      f"the trigger is rarely the newest bar.", "info")
 
     first_cycle = bool(st.session_state.get("live_first_cycle"))
-    st.session_state.live_first_cycle = False
-    join_window = int(cfg.get("join_window", 3) or 3)
-
-    if direction == 0 and first_cycle and cfg.get("enter_on_start", True) \
-            and snapshot.recent_signal != 0 and snapshot.recent_signal_bars_ago is not None \
-            and 0 < snapshot.recent_signal_bars_ago <= join_window:
-        # You pressed Start because the screener showed a signal. Take it, but on
-        # the original signal's terms: the stop and target stay where they were,
-        # so you are joining with whatever reward is left rather than getting a
-        # fresh full-width target from a price that has already moved.
-        frame_idx = snapshot.frame.index
-        pos_i = int(frame_idx.get_loc(snapshot.recent_signal_time))
-        original_fill = (float(snapshot.frame["Open"].iloc[pos_i + 1])
-                         if pos_i + 1 < len(frame_idx) else snapshot.ltp)
-        d = int(snapshot.recent_signal)
-        probe = ExitManager(cfg["risk"], original_fill, d, closed_ctx)
-        already_done = probe.check_tick(snapshot.ltp)
-        if already_done:
-            log_event(f"A {'LONG' if d > 0 else 'SHORT'} signal fired "
-                      f"{snapshot.recent_signal_bars_ago} candle(s) ago, but price has already "
-                      f"reached its {already_done[1].lower()} at {fmt(snapshot.ltp)}. Not "
-                      f"entering — there is nothing left of that trade.", "warn")
-            st.session_state.live_last_signal_time = snapshot.recent_signal_time
-            return
-        st.session_state.live_last_signal_time = snapshot.recent_signal_time
-        cfg["_ltp_at_fill"] = snapshot.ltp
-        _open_live_position(cfg, d, snapshot.ltp, closed_ctx, snapshot.recent_signal_time,
-                            levels_from=original_fill,
-                            bars_ago=snapshot.recent_signal_bars_ago,
-                            route=f"joined on start (join window {join_window})")
+    if pending_dir == 0 or pending_time is None:
+        st.session_state.live_first_cycle = False
         return
+    if decided is not None and pd.Timestamp(pending_time) == pd.Timestamp(decided):
+        st.session_state.live_first_cycle = False
+        return                              # this exact signal was already decided
 
-    if direction == 0:
-        # Catch-up: the screener reports a signal from a window of candles, and
-        # the engine used to see only the newest one. With a lookback set we can
-        # still act on a slightly older signal -- but the N+1 open is long gone,
-        # so the fill is the CURRENT price and the row says so.
-        lookback = int(cfg.get("entry_lookback", 0) or 0)
-        if (lookback > 0 and snapshot.recent_signal != 0
-                and snapshot.recent_signal_bars_ago is not None
-                and 0 < snapshot.recent_signal_bars_ago <= lookback):
-            direction = int(snapshot.recent_signal)
-            signal_time = snapshot.recent_signal_time
-            catch_up = True
-
-    if direction == 0:
-        return
-    if st.session_state.get("live_last_signal_time") == signal_time:
-        return                                   # this exact signal was already traded
-    st.session_state.live_last_signal_time = signal_time
-
-    # Signal on candle N -> fill at the OPEN of candle N+1 (already printed).
-    route = "newest closed candle"
-    if arrived_late:
-        route = "arrived in a batch of late candles"
-    if catch_up:
-        route = f"catch-up (lookback {int(cfg.get('entry_lookback', 0) or 0)})"
-        fill = snapshot.ltp
-        log_event(f"Catch-up entry: the signal fired {snapshot.recent_signal_bars_ago} candle(s) "
-                  f"ago, so the N+1 open has passed. Filling at the current price "
-                  f"{fmt(fill)} instead.", "warn")
+    # -- how old a signal may be and still be worth taking
+    #
+    # On the first cycle the operator has just pressed Start, usually because a
+    # screener showed a signal, so a wider window is the intent. Afterwards the
+    # window only has to cover a burst of late candles. It is configurable, and
+    # zero is honoured: it then means "the newest closed candle only".
+    if first_cycle:
+        window = int(cfg.get("join_window", 3) or 3)
     else:
+        window = int(cfg.get("entry_lookback", DEFAULT_ENTRY_LOOKBACK))
+    ago = int(pending_ago or 0)
+
+    # A burst widens the window to cover itself, for one poll only. Ten candles
+    # arriving together means the tenth-oldest was invisible until this instant,
+    # and there is no sense in calling it "too old to act on" when this is the
+    # first moment it could be acted on at all. The real economic test -- has
+    # price already run to the stop or target the signal implied -- is applied
+    # below regardless, so this widening cannot wave through a dead trade.
+    burst = int(st.session_state.get("bars_added_last_refresh", 0) or 0)
+    if burst > window and ago <= burst:
+        window = min(burst, int(cfg.get("max_burst_entry", 12)))
+        log_event(f"The feed delivered {burst} candles in one refresh, so the entry window is "
+                  f"widened to {window} for this poll: the signal on {fmt_time(pending_time)} "
+                  f"became visible only now. Whether anything is left of the trade is still "
+                  f"checked against the price.", "info")
+
+    if ago > max(0, window):
+        # Mark it decided so this does not re-log on every poll, and say why.
+        st.session_state.live_last_signal_time = pending_time
+        st.session_state.live_first_cycle = False
+        log_event(f"A {'LONG' if pending_dir > 0 else 'SHORT'} signal is present on "
+                  f"{fmt_time(pending_time)}, {ago} candle(s) back. The entry window is "
+                  f"{max(0, window)} candle(s), so it is too old to take -- chasing it would "
+                  f"buy a move that has already happened. Raise 'Enter on signals up to N "
+                  f"candles old' in the sidebar if you want stale signals taken.", "warn")
+        return
+
+    # -- liveness: hold, never discard
+    #
+    # A dead tape must not produce fills, but the old code returned here BEFORE
+    # looking at the signal, so a trigger that fired while the engine was still
+    # gathering tick evidence was passed over and never revisited. Now the
+    # candidate is simply HELD: it stays undecided, and the next cycle that has
+    # its evidence takes it, as long as it is still inside the window above.
+    if snapshot.frozen and not cfg.get("allow_stale_entries"):
+        held = int(st.session_state.get("held_signal_polls", 0)) + 1
+        st.session_state.held_signal_polls = held
+        if held in (1, 5, 20) or held % 50 == 0:
+            ticks = int(st.session_state.get("live_poll_count", 0))
+            log_event(f"Holding a {'LONG' if pending_dir > 0 else 'SHORT'} signal from "
+                      f"{fmt_time(pending_time)}: candles are lagging and the quote has not "
+                      f"been seen to move yet ({ticks} of {QUOTE_EVIDENCE_TICKS} confirming "
+                      f"ticks). The signal is NOT discarded -- it will be taken as soon as the "
+                      f"tape proves it is live, or dropped once it ages past the entry window.",
+                      "warn")
+        return
+    st.session_state.held_signal_polls = 0
+
+    # -- is there anything left of the trade?
+    #
+    # A late entry is only worth taking if price has not already run to the stop
+    # or the target that the original signal implied. Checking this stops the
+    # engine opening a position that a faithful backtest would have closed
+    # already, which is the cheapest way to manufacture a fake losing streak.
+    frame_idx = snapshot.frame.index
+    sig_pos = int(frame_idx.get_loc(pending_time))
+    original_fill = (float(snapshot.frame["Open"].iloc[sig_pos + 1])
+                     if sig_pos + 1 < len(frame_idx) else snapshot.ltp)
+    if ago > 0:
+        probe = ExitManager(cfg["risk"], original_fill, pending_dir, closed_ctx)
+        done = probe.check_tick(snapshot.ltp)
+        if done:
+            st.session_state.live_last_signal_time = pending_time
+            st.session_state.live_first_cycle = False
+            log_event(f"A {'LONG' if pending_dir > 0 else 'SHORT'} signal fired {ago} candle(s) "
+                      f"ago at {fmt(original_fill)}, but price has already reached its "
+                      f"{done[1].lower()} at {fmt(snapshot.ltp)}. Not entering -- there is "
+                      f"nothing left of that trade.", "warn")
+            return
+
+    st.session_state.live_last_signal_time = pending_time
+    st.session_state.live_first_cycle = False
+
+    # Signal on candle N -> the backtest fills at the open of candle N+1. Live,
+    # that open has already passed, so the fill is the price actually available.
+    if ago == 0:
+        route = "newest closed candle"
         fill = _live_fill_price(cfg, snapshot, closed_ctx)
+        levels_from = None
+    else:
+        route = (f"joined on start ({ago} candle(s) after the signal)" if first_cycle
+                 else f"arrived late ({ago} candle(s) after the signal)")
+        fill = snapshot.ltp
+        # Keep the stop and target where the original signal put them, so a late
+        # entry takes whatever reward is LEFT instead of being handed a fresh
+        # full-width target measured from a price that has already moved.
+        levels_from = original_fill
+        log_event(f"Entering {ago} candle(s) after the signal on {fmt_time(pending_time)}. The "
+                  f"N+1 open of {fmt(original_fill)} is gone, so the fill is the live price "
+                  f"{fmt(fill)} while the stop and target stay anchored to the original "
+                  f"signal -- you are joining with what is left, not with a full target.",
+                  "info")
+
     cfg["_ltp_at_fill"] = snapshot.ltp
-    _open_live_position(cfg, direction, fill, closed_ctx, signal_time,
-                        bars_ago=(snapshot.recent_signal_bars_ago if catch_up else 0),
-                        route=route)
+    _open_live_position(cfg, pending_dir, fill, closed_ctx, pending_time,
+                        levels_from=levels_from, bars_ago=ago, route=route)
 
 
 def should_poll(cfg: dict) -> bool:
@@ -5191,12 +5266,15 @@ def render_sidebar() -> dict:
         help="Kept deliberately small and matched to the Screener's default window, so the two "
              "tabs agree about what counts as a live signal.") if enter_on_start else 3
     entry_lookback = sb.number_input(
-        "Live: act on a signal up to N candles old", min_value=0, max_value=20, value=0, step=1,
-        disabled=live, key="cfg_entry_look",
-        help="0 keeps the strict rule: only a signal on the newest CLOSED candle is taken, "
-             "filled at the next candle's open. Raise it to catch a signal the screener "
-             "reported a few candles ago — but the N+1 open has passed by then, so the fill is "
-             "the current price and the trade row says so.")
+        "Live: act on a signal up to N candles old", min_value=0, max_value=20,
+        value=DEFAULT_ENTRY_LOOKBACK, step=1, disabled=live, key="cfg_entry_look",
+        help="How stale a signal may be and still be taken. 0 is the strict rule — only the "
+             "candle that is newest on this exact poll — and it is why crossovers got missed: "
+             "a delayed feed delivers several candles at once, so the trigger is rarely the "
+             "newest bar on the poll that sees it. The default of 2 survives a burst without "
+             "chasing. Past the first candle the N+1 open has gone, so the fill is the live "
+             "price while the stop and target stay anchored to the original signal, and the "
+             "trade row says so.")
     square_off_on_stop = sb.checkbox(
         "Square off the open position when the engine stops", value=True, disabled=live,
         key="cfg_sq_stop",
@@ -5654,9 +5732,11 @@ def _render_broker(sb, live: bool, symbol: str) -> dict:
 
 
 def _default_underlying(symbol: str) -> str:
-    s = (symbol or "").upper()
+    """Yahoo ticker -> the name Dhan uses for the same underlying."""
+    s = (symbol or "").strip().upper()
     mapping = {"^NSEI": "NIFTY", "^NSEBANK": "BANKNIFTY", "^BSESN": "SENSEX",
-               "NIFTY_FIN_SERVICE.NS": "FINNIFTY"}
+               "NIFTY_FIN_SERVICE.NS": "FINNIFTY", "^NSMIDCP": "MIDCPNIFTY",
+               "^CNXMDCP50": "MIDCPNIFTY", "^NSEBANKEX": "BANKEX"}
     return mapping.get(s, s.replace(".NS", "").replace(".BO", ""))
 
 
@@ -7557,6 +7637,23 @@ def _auto_slice_seconds() -> float:
     return 20.0
 
 
+def _sweep_job_budget(minimum: float = 5.0) -> float:
+    """
+    How long ONE job inside the current pass may take.
+
+    A worker that outruns its pass is the mechanism behind "it scans for a
+    while and then freezes": the pass driver only checks the clock between
+    jobs, so a job allowed four times the pass length keeps the script alive
+    long past the point a hosted runtime is willing to wait, and the run is
+    recycled mid-calculation with nothing written back. Asking the driver for
+    the time actually left keeps every pass short, which is the entire reason
+    the chunked design exists.
+    """
+    deadline = float(st.session_state.get("_sweep_deadline", 0.0)) if st is not None else 0.0
+    left = deadline - time.time()
+    return max(float(minimum), left)
+
+
 def _sweep_store_path(prefix: str) -> str:
     return os.path.join(tempfile.gettempdir(), f"algoplat_sweep_{prefix}.json")
 
@@ -7643,16 +7740,62 @@ def chunked_sweep(prefix: str, jobs: list, worker, slice_seconds: float = 20.0,
         st.rerun()
 
     total = int(st.session_state[tot_key] or 0)
-    status = st.empty()
     bar = st.empty()
+    status = st.empty()
 
-    # ---- do the work FIRST ----
+    # ---- draw the bar BEFORE the work, from what is true right now ----
+    #
+    # This is the reason the progress bar "appeared and disappeared". Reporting
+    # was moved to after the work slice to stop a stale count contradicting the
+    # finish message -- and that fixed the contradiction by making the bar
+    # invisible for the entire pass, drawn microseconds before the rerun wiped
+    # the screen. Both halves are needed: draw it first so it is on screen for
+    # the whole 20-second pass, then draw it again afterwards so the final
+    # number is the true one. The pre-work draw is not a prediction; it is the
+    # count of jobs genuinely finished so far.
+    def _paint(queue_now: list, active: bool) -> None:
+        if not total:
+            return
+        done_now = total - len(queue_now)
+        rate = float(st.session_state[rate_key] or 0.0)
+        eta_text = ""
+        if queue_now and rate > 0:
+            eta = len(queue_now) * rate
+            eta_text = (f" · about {eta:0.0f}s left" if eta < 90
+                        else f" · about {eta / 60:0.0f} min left")
+        state = ("working" if (active and queue_now) else
+                 ("paused" if queue_now else "finished"))
+        pct = done_now / total * 100.0
+        bar.progress(done_now / total,
+                     text=f"{done_now} of {total} {label} scanned ({pct:.0f}%) — "
+                          f"{state}{eta_text}")
+
+    _paint(queue, running)
+
+    # ---- do the work ----
     if running and queue:
         started = time.time()
+        # Published so a worker can bound ITSELF to this pass. The loop below
+        # only checks the clock BEFORE starting a job, so a worker allowed to
+        # run several times the pass length overruns the whole slice -- and a
+        # script run that long is what a hosted runtime recycles, which the
+        # operator sees as the scan freezing halfway with no message.
         rows = list(st.session_state[r_key])
         errs = list(st.session_state[e_key])
         processed = 0
-        while queue and (time.time() - started) < float(slice_seconds):
+        rate = float(st.session_state[rate_key] or 0.0)
+        while queue:
+            elapsed = time.time() - started
+            # Always do at least one job -- a pass that does nothing is a hang --
+            # but do not START one the pass has no room for. Waiting until the
+            # clock is already spent and then launching a job that needs another
+            # twenty seconds is how a pass ends up running several times its
+            # budget, and an over-long script run is what gets recycled.
+            if processed and elapsed + max(rate, 1.0) > float(slice_seconds):
+                break
+            # Each job gets the rest of THIS pass, so a slow one is cut short at
+            # the slice boundary rather than dragging the whole run past it.
+            st.session_state["_sweep_deadline"] = started + float(slice_seconds)
             job = queue.pop(0)
             status.caption(f"Scanning {describe(job) if describe else job} ...")
             try:
@@ -7674,30 +7817,26 @@ def chunked_sweep(prefix: str, jobs: list, worker, slice_seconds: float = 20.0,
         st.session_state[e_key] = errs
         _sweep_save(prefix, {"rows": rows, "errs": errs, "total": total})
 
-    # ---- then report what is ACTUALLY true now ----
+    # ---- then repaint with what is ACTUALLY true now ----
     queue = list(st.session_state[q_key])
     done = total - len(queue)
-    per_job = float(st.session_state[rate_key] or 0.0)
-    if total:
-        eta = len(queue) * per_job
-        eta_text = ""
-        if queue and per_job > 0:
-            eta_text = (f" · about {eta:0.0f}s left" if eta < 90
-                        else f" · about {eta / 60:0.0f} min left")
-        state = ("working" if (running and queue) else
-                 ("paused" if queue else "finished"))
-        pct = (done / total * 100.0) if total else 0.0
-        bar.progress(done / total if total else 0.0,
-                     text=f"{done} of {total} {label} scanned ({pct:.0f}%) — "
-                          f"{state}{eta_text}")
+    _paint(queue, running)
     if not queue:
         status.empty()
 
     if running and queue:
-        # A breath between passes. Without it the reruns form a hot loop that
-        # starves the browser of the very updates this design exists to deliver.
-        time.sleep(0.15)
-        st.rerun()
+        # The next pass is requested, NOT taken here.
+        #
+        # This used to call st.rerun() on the spot, and that single line was why
+        # the Signal Lab showed "Pick a universe and run the lab" while it was
+        # visibly working: st.rerun() abandons the script immediately, so every
+        # line of the calling tab BELOW this driver -- the metrics, the tables,
+        # the partial results -- never executed. The tab therefore rendered its
+        # own empty state on every working pass and only filled in once the
+        # sweep happened to finish. Deferring the rerun to the end of the script
+        # lets the caller finish drawing first, so partial results are on screen
+        # throughout the scan.
+        st.session_state["_sweep_rerun_pending"] = True
     if running and not queue:
         st.session_state[run_key] = False
 
@@ -9660,29 +9799,31 @@ def tab_signal_lab(cfg: dict) -> None:
         part_rows, part_errs = run_signal_lab(
             [ticker], cfg, objective, int(iterations), int(min_trades),
             int(signal_window), safe_only, [interval], gates, None, grid,
-            exhaustive, scale_points, time_budget=_auto_slice_seconds() * 4)
+            exhaustive, scale_points, time_budget=_sweep_job_budget())
         return part_rows.to_dict("records"), part_errs.to_dict("records")
 
     rows, errs, _finished = chunked_sweep(
         "lab", jobs, _lab_worker, _auto_slice_seconds(), "ticker/timeframe jobs",
         describe=lambda job: f"{job[0]} \u00b7 {job[1]}")
     st.session_state.lab_results = (pd.DataFrame(rows), pd.DataFrame(errs))
-    st.session_state.lab_partial = (len(jobs) - len(st.session_state.get("lab_queue") or []),
-                                    len(jobs))
+    lab_total = int(st.session_state.get("lab_total") or 0)
+    st.session_state.lab_partial = (lab_total - len(st.session_state.get("lab_queue") or []),
+                                    lab_total)
 
     # Rendered before the results so it exists from the first page load. Putting
     # it inside the results block meant the control only appeared after a run,
     # which looks like it is missing.
-    show_only = st.checkbox("Show only tickers that are signalling", value=True,
+    show_only = st.checkbox("Show only tickers that are signalling", value=False,
                             key="lab_filter",
-                            help="Untick to see every ticker that qualified, including those "
-                                 "with no live signal right now.")
+                            help="Off by default, so a finished scan shows every ticker that "
+                                 "qualified. Tick it to narrow the table to the ones carrying a "
+                                 "signal right now.")
 
-    payload = st.session_state.get("lab_results")
-    if payload is None:
-        st.info("Pick a universe and run the lab.")
+    results, errors = st.session_state.lab_results
+    if not lab_total:
+        st.info("Pick a universe and press **Run** above. Results appear here as the scan works "
+                "\u2014 it does not wait for the whole universe to finish.")
         return
-    results, errors = payload
 
     partial = st.session_state.get("lab_partial")
     if partial and partial[0] < partial[1]:
@@ -9693,6 +9834,18 @@ def tab_signal_lab(cfg: dict) -> None:
         else:
             st.warning(f"Paused or interrupted at {partial[0]} of {partial[1]} jobs. Nothing is "
                        f"lost — press **Resume** to continue with the remaining {remaining}.")
+    scanning = bool(st.session_state.get("lab_running")) and \
+        bool(st.session_state.get("lab_queue"))
+    if results.empty and scanning:
+        # Mid-scan with nothing kept yet is not a verdict, and saying "nothing
+        # qualified" here reads as a failed run when the scan has barely begun.
+        st.info(f"Working. {partial[0] if partial else 0} of {lab_total} jobs done and nothing "
+                f"has qualified yet — the table appears as soon as the first ticker clears your "
+                f"settings.")
+        if not errors.empty:
+            with st.expander(f"Rejected so far ({len(errors)})"):
+                st.dataframe(errors, width="stretch", hide_index=True)
+        return
     if results.empty and not errors.empty:
         reasons = errors["Problem"].value_counts()
         st.info(f"**No ticker qualified.** {len(errors)} were examined and every one was "
@@ -10026,7 +10179,7 @@ def tab_auto_screener(cfg: dict) -> None:
         hot_p, quiet_p, near_p, skip_p = run_auto_screen(
             [ticker], cfg, float(min_value), int(min_trades), int(iterations),
             [interval], int(signal_window), safe_only, None, metric=metric,
-            time_budget=float(slice_seconds) * 4)
+            time_budget=_sweep_job_budget())
         rows = ([dict(r, Bucket="signalling") for r in hot_p.to_dict("records")]
                 + [dict(r, Bucket="quiet") for r in quiet_p.to_dict("records")]
                 + [dict(r, Bucket="below bar") for r in near_p.to_dict("records")])
@@ -10338,6 +10491,81 @@ def record_oi_snapshot(ticker: str, chain: dict) -> None:
     del series[:-40]                       # a rolling window, not a database
 
 
+def option_chain_underlying(ticker: str) -> tuple[int, str, str] | None:
+    """
+    Resolve a ticker to ``(underlying_security_id, underlying_segment, expiry)``
+    for Dhan's option-chain endpoint, using the instrument master.
+
+    This is the piece that was missing, and the reason a Dhan token changed
+    nothing for the Gamma Blast scan: the scan never asked for a chain. Open
+    interest was only reachable by typing a security id, a segment and an expiry
+    date into a panel, by hand, one ticker at a time -- so the OI half of the
+    setup was permanently untested no matter what credentials were supplied.
+
+    Returns ``None`` when the master has no option series for the name, which is
+    the truthful answer for a stock with no listed options.
+    """
+    name = _default_underlying(ticker)
+    if not name:
+        return None
+    try:
+        master = st.session_state.get("scrip_master") if st is not None else None
+        if master is None or getattr(master, "empty", True):
+            master = load_scrip_master()
+            if st is not None:
+                st.session_state.scrip_master = master
+    except Exception:                                               # noqa: BLE001
+        return None
+
+    hit = master[(master["name"].fillna("") == name) |
+                 (master["trading_symbol"].fillna("").str.startswith(name))]
+    if hit.empty:
+        return None
+    options = hit[hit["instrument"].fillna("").str.contains("OPT", na=False)]
+    if options.empty:
+        return None
+    expiry = _nearest_expiry(options)
+    if expiry is None:
+        return None
+
+    # The chain is keyed by the UNDERLYING, not by an option contract: an index
+    # on IDX_I, a stock on its cash segment.
+    if looks_like_index(ticker):
+        under = hit[hit["instrument"].fillna("").str.contains("INDEX", na=False)]
+        segment = "IDX_I"
+    else:
+        under = hit[hit["instrument"].fillna("").str.contains("EQUITY", na=False)]
+        segment = "NSE_EQ"
+    if under.empty:
+        return None
+    try:
+        scrip = int(str(under.iloc[0]["security_id"]).strip())
+    except (TypeError, ValueError):
+        return None
+    return scrip, segment, f"{pd.Timestamp(expiry):%Y-%m-%d}"
+
+
+def sample_chain_for(broker: dict, ticker: str) -> tuple[dict, str]:
+    """
+    Fetch and store one chain snapshot for a ticker, resolving everything itself.
+
+    Returns ``(chain, note)``. The note explains any failure in the row rather
+    than leaving a blank column the operator has to guess about.
+    """
+    if not (str(broker.get("access_token", "")).strip()
+            and str(broker.get("client_id", "")).strip()):
+        return {}, "no Dhan token"
+    resolved = option_chain_underlying(ticker)
+    if resolved is None:
+        return {}, "no option series in the Dhan master"
+    scrip, segment, expiry = resolved
+    chain = dhan_option_chain(broker, scrip, segment, expiry)
+    if not chain:
+        return {}, f"chain request returned nothing for {expiry} ({segment} {scrip})"
+    record_oi_snapshot(ticker, chain)
+    return chain, f"chain sampled for expiry {expiry}"
+
+
 def oi_change_at(ticker: str, strike: float) -> dict:
     """CE/PE open-interest change at one strike, from the stored snapshots."""
     store = (st.session_state.get("oi_snapshots") or {}) if st is not None else {}
@@ -10355,31 +10583,50 @@ def oi_change_at(ticker: str, strike: float) -> dict:
             "minutes": (series[-1]["at"] - series[0]["at"]).total_seconds() / 60.0}
 
 
-def gamma_blast_scan_one(ticker: str, interval: str, gcfg: dict, params: dict) -> dict | None:
+def gamma_blast_scan_one(ticker: str, interval: str, gcfg: dict, params: dict,
+                         broker: dict | None = None) -> dict:
     """
-    Evaluate one ticker for the setup.
+    Evaluate one ticker for the setup, and ALWAYS return a row.
 
-    The PRICE half -- proximity to the level, volume surge, momentum, expiry
-    timing -- is computed from candles and always works. The OPEN INTEREST half
-    needs a broker chain and at least two snapshots; when it is missing the row
-    still comes back, marked so, rather than being silently dropped.
+    Two changes from the version that reported zero signals forever.
+
+    First, open interest is now fetched. The scan resolves the underlying and
+    the nearest expiry from the Dhan instrument master and calls the chain
+    endpoint itself, so a supplied token actually does something. Before this,
+    OI could only arrive by typing a security id into a panel by hand, which
+    meant the OI conditions were untestable in a scan and the setup could never
+    complete.
+
+    Second, a ticker that is not near its level is no longer dropped. Dropping
+    it produced an empty table and a bare "0", which is indistinguishable from
+    the scan being broken -- and it hid the one number needed to fix it, the
+    distance to the level. Every ticker now comes back with its measurements and
+    a per-condition verdict, and the caller filters.
     """
     period, _ = lab_period_for(interval, WARMUP_BARS + 40)
     bundle = load_market_data(ticker, period, interval, freshness_seconds=300, min_bars=60)
     frame = bundle.frame
     look = int(gcfg.get("level_lookback", 60))
     if len(frame) <= look + 5:
-        return None
+        # Genuinely unmeasurable: say so as a row rather than vanishing.
+        return {"Ticker": ticker, "Timeframe": interval, "Side": "-",
+                "Conditions met": "0 of 4", "All met": "no",
+                "Why not": f"only {len(frame)} candles; the level lookback needs "
+                           f"{look + 6}", "Checked at": pd.Timestamp.now()}
 
     close = float(frame["Close"].iloc[-1])
     resistance = float(frame["High"].iloc[-(look + 1):-1].max())
     support = float(frame["Low"].iloc[-(look + 1):-1].min())
     prox = float(gcfg.get("proximity_pct", 1.0)) / 100.0
 
+    d_res = abs(close - resistance) / resistance * 100.0 if resistance else float("inf")
+    d_sup = abs(close - support) / support * 100.0 if support else float("inf")
     near_res = abs(close - resistance) <= resistance * prox
     near_sup = abs(close - support) <= support * prox
-    if not (near_res or near_sup):
-        return None
+    # When both are in range, the nearer one decides the side.
+    if near_res and near_sup:
+        near_res, near_sup = (d_res <= d_sup), (d_sup < d_res)
+    near_level = bool(near_res or near_sup)
 
     vol_ma = float(sma(frame["Volume"], int(gcfg.get("vol_len", 20))).iloc[-1] or 0)
     vol_now = float(frame["Volume"].iloc[-1])
@@ -10390,10 +10637,15 @@ def gamma_blast_scan_one(ticker: str, interval: str, gcfg: dict, params: dict) -
     past = float(frame["Close"].iloc[-(mom_bars + 1)])
     momentum_pct = (close - past) / past * 100.0 if past else 0.0
 
-    side = "BULLISH (CE)" if near_res else "BEARISH (PE)"
-    level = resistance if near_res else support
-    direction_ok = (momentum_pct >= float(gcfg.get("momentum_pct", 0.2))) if near_res else \
+    # Side: the level being pressed, or -- when neither is close -- whichever is
+    # nearer, so the row is still readable.
+    leaning_up = near_res or (not near_level and d_res <= d_sup)
+    side = "BULLISH (CE)" if leaning_up else "BEARISH (PE)"
+    level = resistance if leaning_up else support
+    direction_ok = (momentum_pct >= float(gcfg.get("momentum_pct", 0.2))) if leaning_up else \
                    (momentum_pct <= -float(gcfg.get("momentum_pct", 0.2)))
+    # Indices publish no volume on Yahoo, so a volume gate there would reject
+    # every index for a reason that has nothing to do with the market.
     vol_ok = (not has_volume) or (np.isfinite(vol_ratio)
                                   and vol_ratio >= float(gcfg.get("vol_mult", 1.5)))
 
@@ -10402,42 +10654,59 @@ def gamma_blast_scan_one(ticker: str, interval: str, gcfg: dict, params: dict) -
 
     step = float(gcfg.get("strike_step", 0) or 0) or auto_strike_step(level)
     strike = nearest_strike(level, step)
+
+    # ---- open interest, fetched rather than waited for ----
+    chain_note = "Dhan data not enabled"
+    if gcfg.get("use_chain") and broker:
+        _chain, chain_note = sample_chain_for(broker, ticker)
     oi = oi_change_at(ticker, strike)
     watched = int(oi.get("samples", 0))
-    if watched >= 2:
-        change = oi.get("ce_oi_change", 0.0) if near_res else oi.get("pe_oi_change", 0.0)
-        drop_needed = -abs(float(gcfg.get("oi_drop", 0.0)))
-        oi_ok = change <= drop_needed
-        oi_note = (f"{'CE' if near_res else 'PE'} OI change {fmt(change, 0)} over "
+    ce_oi = pe_oi = None
+    if watched >= 1:
+        snaps = ((st.session_state.get("oi_snapshots") or {}) if st is not None else {})
+        latest = (snaps.get(ticker) or [{}])[-1].get("chain") or {}
+        leg = latest.get(strike) or {}
+        ce_oi, pe_oi = leg.get("ce_oi"), leg.get("pe_oi")
+    if watched >= 2 and "ce_oi_change" in oi:
+        change = oi.get("ce_oi_change", 0.0) if leaning_up else oi.get("pe_oi_change", 0.0)
+        oi_ok = change <= -abs(float(gcfg.get("oi_drop", 0.0)))
+        oi_note = (f"{'CE' if leaning_up else 'PE'} OI change {fmt(change, 0)} over "
                    f"{fmt(oi.get('minutes'), 0)}m")
     else:
         oi_ok = None                       # unknown, not false
-        oi_note = (f"no chain history ({watched} snapshot(s)) — connect Dhan and sample the "
-                   f"chain to test short covering")
+        oi_note = (f"{watched} snapshot(s) held — OI CHANGE needs two, taken minutes apart. "
+                   f"{chain_note}.")
 
-    conditions = {"Near level": bool(near_res or near_sup), "Volume surge": bool(vol_ok),
+    conditions = {"Near level": near_level, "Volume surge": bool(vol_ok),
                   "Momentum": bool(direction_ok), "Expiry window": bool(exp_ok)}
     if oi_ok is not None:
         conditions["OI falling (short covering)"] = bool(oi_ok)
     met = sum(1 for v in conditions.values() if v)
+    failing = [name for name, passed in conditions.items() if not passed]
 
     return {
         "Ticker": ticker, "Timeframe": interval, "Side": side,
         "Spot": round(close, 2), "Level": round(level, 2),
-        "Distance %": round(abs(close - level) / level * 100.0, 3),
+        "Distance %": round(abs(close - level) / level * 100.0, 3) if level else None,
+        "Proximity needed %": float(gcfg.get("proximity_pct", 1.0)),
+        "Resistance": round(resistance, 2), "Support": round(support, 2),
         "Strike": strike, "Strike step": step,
         "Volume x": None if not has_volume else round(float(vol_ratio), 2),
         "Volume needed": float(gcfg.get("vol_mult", 1.5)),
         "Momentum %": round(momentum_pct, 3),
         "Momentum needed": float(gcfg.get("momentum_pct", 0.2)),
         "Expiry": exp_note, "Expiry ok": "yes" if exp_ok else "no",
-        "CE OI": oi.get("ce_oi"), "CE OI change": oi.get("ce_oi_change"),
-        "PE OI": oi.get("pe_oi"), "PE OI change": oi.get("pe_oi_change"),
+        "CE OI": ce_oi, "CE OI change": oi.get("ce_oi_change"),
+        "PE OI": pe_oi, "PE OI change": oi.get("pe_oi_change"),
         "OI state": oi_note,
+        "Near level": "yes" if near_level else "no",
         "Conditions met": f"{met} of {len(conditions)}",
+        "Met count": met, "Of count": len(conditions),
         "All met": "yes" if met == len(conditions) else "no",
+        "Why not": ", ".join(failing) if failing else "-",
         "Checked at": pd.Timestamp.now(),
     }
+
 
 def tab_gamma_blast(cfg: dict) -> None:
     st.subheader("Gamma Blast Screener")
@@ -10506,18 +10775,34 @@ def tab_gamma_blast(cfg: dict) -> None:
                            help="On by default: a row two conditions short is often worth "
                                 "seeing, and hiding it looks like the scan found nothing.")
 
+    broker = cfg.get("broker") or {}
+    has_token = bool(str(broker.get("access_token", "")).strip()
+                     and str(broker.get("client_id", "")).strip())
+    use_chain = st.checkbox(
+        "Fetch the option chain from Dhan while scanning", value=has_token, disabled=not has_token,
+        key="gb_use_chain",
+        help="On, the scan resolves each underlying and its nearest expiry from the Dhan "
+             "instrument master and pulls the chain itself, so CE/PE open interest at the strike "
+             "is real data. Open interest CHANGE still needs two scans a few minutes apart, "
+             "because no free or paid source publishes a history of it — it can only be measured "
+             "from when this app starts watching.")
+    if not has_token:
+        st.info("Enter a Dhan client id and access token in the sidebar to read open interest. "
+                "Everything else on this screen works without it.")
+
     gcfg = {"kind": kind, "weekly_weekday": weekly_weekday, "monthly_weekday": weekly_weekday,
             "index_days": index_days, "stock_min_days": stock_min, "stock_max_days": stock_max,
             "level_lookback": level_lookback, "proximity_pct": proximity, "vol_mult": vol_mult,
             "vol_len": int(_p(cfg.get("params") or {}, "vol_len")),
             "momentum_bars": momentum_bars, "momentum_pct": momentum_pct,
-            "strike_step": strike_step, "oi_drop": oi_drop}
+            "strike_step": strike_step, "oi_drop": oi_drop,
+            "use_chain": bool(use_chain and has_token)}
 
-    slice_seconds = st.slider("Seconds of work per pass", 3, 45, 12, 1, key="gb_slice")
+    slice_seconds = _auto_slice_seconds()
 
     def _worker(ticker):
         try:
-            row = gamma_blast_scan_one(ticker, interval, gcfg, cfg.get("params") or {})
+            row = gamma_blast_scan_one(ticker, interval, gcfg, cfg.get("params") or {}, broker)
         except Exception as exc:                                    # noqa: BLE001
             return [], [{"Ticker": ticker, "Problem": str(exc)[:140]}]
         return ([row] if row else []), []
@@ -10526,45 +10811,96 @@ def tab_gamma_blast(cfg: dict) -> None:
 
     frame = pd.DataFrame(rows)
     if frame.empty:
-        st.info("No ticker is near its level yet. Widen the proximity, lengthen the level "
-                "lookback, or pick a faster timeframe.")
+        st.info("Nothing scanned yet. Press **Run** above.")
     else:
         full = frame[frame["All met"] == "yes"]
-        a, b, c = st.columns(3)
-        a.metric("Near a level", len(frame))
-        b.metric("Every condition met", len(full))
-        c.metric("Chain snapshots held",
+        near = frame[frame.get("Near level", pd.Series("no", index=frame.index)) == "yes"]
+        a, b, c, d = st.columns(4)
+        a.metric("Scanned", len(frame))
+        b.metric("Near a level", len(near))
+        c.metric("Every condition met", len(full))
+        d.metric("Chain snapshots held",
                  sum(len(v) for v in (st.session_state.get("oi_snapshots") or {}).values()))
 
+        # WHY it is zero. A bare "0" is the complaint this answers: with the
+        # stock window set to 8-12 days after a monthly expiry, most days of the
+        # month reject every stock on the expiry condition alone, and there was
+        # nothing on screen to say so.
+        if full.empty and "Why not" in frame.columns:
+            tally: dict[str, int] = {}
+            for entry in frame["Why not"]:
+                for name in str(entry).split(", "):
+                    if name and name != "-":
+                        tally[name] = tally.get(name, 0) + 1
+            if tally:
+                ranked = sorted(tally.items(), key=lambda kv: -kv[1])
+                st.warning(
+                    "**Nothing met every condition.** What did the rejecting, across "
+                    f"{len(frame)} ticker(s): " +
+                    " · ".join(f"**{name}** rejected {count}" for name, count in ranked) +
+                    ". The table below shows each ticker's own numbers against your thresholds, "
+                    "so you can see how far off it was rather than guessing.")
+                top = ranked[0][0]
+                if top == "Expiry window":
+                    st.caption("The expiry condition is the usual culprit and it is doing what "
+                               "you asked: stocks only pass 8-12 days after their monthly "
+                               "expiry, so most calendar days reject every stock. Widen that "
+                               "window above, or switch the convention to Index (weekly).")
+                elif top == "Near level":
+                    st.caption("Widen 'Proximity to the level (%)' or lengthen the level "
+                               "lookback — with a 1% proximity most names simply are not "
+                               "pressing their extreme.")
+
         table = frame if show_all else full
-        order = [c for c in ["Ticker", "Timeframe", "Side", "Conditions met", "All met", "Spot",
-                             "Level", "Distance %", "Strike", "Volume x", "Volume needed",
-                             "Momentum %", "Momentum needed", "Expiry", "Expiry ok",
-                             "CE OI", "CE OI change", "PE OI", "PE OI change", "OI state",
-                             "Strike step", "Checked at"] if c in table.columns]
-        st.dataframe(table.sort_values(["All met", "Conditions met"], ascending=[False, False])
-                     [order], width="stretch", hide_index=True)
-        st.download_button("Download candidates (CSV)", table[order].to_csv(index=False).encode(),
-                           f"gamma_blast_{pd.Timestamp.now():%Y%m%d_%H%M}.csv", "text/csv")
-
-        pick = st.selectbox("Apply which ticker to the sidebar?", table["Ticker"].tolist(),
-                            key="gb_pick")
-        if st.button("Apply to the sidebar", width="stretch", key="gb_apply"):
-            st.session_state.pending_ticker = pick
-            st.session_state.pending_combo = {
-                "strategy": "48 \u00b7 Options: Gamma Blast (late-session)",
-                "sl_type": "ATR Multiple", "sl_value": 1.5,
-                "tp_type": "Risk : Reward Multiple", "tp_value": 2.0,
-                "filter_key": "", "widgets": {"cfg_interval": interval}}
-            st.rerun()
-
-    with st.expander("Option chain sampling (Dhan)"):
-        st.caption("Each sample stores the chain so OI CHANGE can be measured. Two samples are "
-                   "the minimum; the gap between them is the window the change is measured over.")
-        broker = cfg.get("broker") or {}
-        if not (broker.get("use_live_ltp") or broker.get("enabled")):
-            st.info("Enable Dhan market data in the sidebar to sample option chains.")
+        order = [c for c in ["Ticker", "Timeframe", "Side", "Conditions met", "All met",
+                             "Why not", "Near level", "Spot", "Level", "Distance %",
+                             "Proximity needed %", "Resistance", "Support", "Strike",
+                             "Volume x", "Volume needed", "Momentum %", "Momentum needed",
+                             "Expiry", "Expiry ok", "CE OI", "CE OI change", "PE OI",
+                             "PE OI change", "OI state", "Strike step", "Checked at"]
+                 if c in table.columns]
+        if table.empty:
+            st.info("No row met every condition. Tick **Show near-misses too** above to see "
+                    "every ticker's numbers and how far off each one was.")
         else:
+            sort_cols = [c for c in ["All met", "Met count", "Distance %"] if c in table.columns]
+            st.dataframe(
+                table.sort_values(sort_cols,
+                                  ascending=[c == "Distance %" for c in sort_cols])[order],
+                width="stretch", hide_index=True)
+        if not table.empty:
+            st.download_button("Download candidates (CSV)",
+                               table[order].to_csv(index=False).encode(),
+                               f"gamma_blast_{pd.Timestamp.now():%Y%m%d_%H%M}.csv", "text/csv")
+
+            pick = st.selectbox("Apply which ticker to the sidebar?", table["Ticker"].tolist(),
+                                key="gb_pick")
+            if st.button("Apply to the sidebar", width="stretch", key="gb_apply"):
+                st.session_state.pending_ticker = pick
+                st.session_state.pending_combo = {
+                    "strategy": "48 \u00b7 Options: Gamma Blast (late-session)",
+                    "sl_type": "ATR Multiple", "sl_value": 1.5,
+                    "tp_type": "Risk : Reward Multiple", "tp_value": 2.0,
+                    "filter_key": "", "widgets": {"cfg_interval": interval}}
+                st.rerun()
+
+    with st.expander("Option chain sampling (Dhan) — manual override"):
+        st.caption("The scan resolves and samples chains by itself when the box above is ticked. "
+                   "This panel is for a name the instrument master does not resolve, or an "
+                   "expiry other than the nearest one. Each sample stores the chain so OI CHANGE "
+                   "can be measured; two are the minimum, and the gap between them is the window "
+                   "the change is measured over.")
+        if not has_token:
+            st.info("Enter a Dhan client id and access token in the sidebar to sample chains.")
+        else:
+            if chosen:
+                probe = option_chain_underlying(chosen[0])
+                if probe:
+                    st.caption(f"Resolution check — `{chosen[0]}` maps to security id "
+                               f"`{probe[0]}` on `{probe[1]}`, nearest expiry `{probe[2]}`.")
+                else:
+                    st.caption(f"Resolution check — `{chosen[0]}` has no option series in the "
+                               f"Dhan master, so its OI cannot be read. Use the fields below.")
             s1, s2 = st.columns(2)
             scrip = s1.number_input("Underlying security id", 0, 10**9, 0, 1, key="gb_scrip",
                                     help="Dhan's id for the underlying. Resolve it in the "
@@ -10600,24 +10936,35 @@ def main() -> None:
         ["Backtesting Engine Studio", "Live Sandbox Operations", "Live Trade Log Ledger",
          "Signal Screener", "Auto Screener", "Strategy Optimiser", "Signal Lab",
          "Chart Patterns", "Gamma Blast"])
-    with t1:
-        tab_backtest(cfg)
-    with t2:
-        tab_live(cfg)
-    with t3:
-        tab_ledger(cfg)
-    with t4:
-        tab_screener(cfg)
-    with t5:
-        tab_auto_screener(cfg)
-    with t6:
-        tab_optimiser(cfg)
-    with t7:
-        tab_signal_lab(cfg)
-    with t8:
-        tab_patterns(cfg)
-    with t9:
-        tab_gamma_blast(cfg)
+    panels = ((t1, tab_backtest, "Backtesting Engine Studio"),
+              (t2, tab_live, "Live Sandbox Operations"),
+              (t3, tab_ledger, "Live Trade Log Ledger"),
+              (t4, tab_screener, "Signal Screener"),
+              (t5, tab_auto_screener, "Auto Screener"),
+              (t6, tab_optimiser, "Strategy Optimiser"),
+              (t7, tab_signal_lab, "Signal Lab"),
+              (t8, tab_patterns, "Chart Patterns"),
+              (t9, tab_gamma_blast, "Gamma Blast"))
+    for holder, render, name in panels:
+        with holder:
+            try:
+                render(cfg)
+            except Exception as exc:                                # noqa: BLE001
+                # One tab failing used to take the whole page down, and with it
+                # any sweep running in another tab. Now the broken panel says so
+                # and everything else carries on.
+                st.error(f"**{name} could not finish drawing.** {type(exc).__name__}: {exc}")
+                with st.expander("Details"):
+                    st.code(traceback.format_exc())
+
+    # The deferred continuation of any running sweep. It happens here, after
+    # every panel has drawn, so partial results are visible during the scan
+    # instead of the tab looking blank until the very end.
+    if st.session_state.pop("_sweep_rerun_pending", False):
+        # A breath between passes. Without it the reruns form a hot loop that
+        # starves the browser of the very updates this design exists to deliver.
+        time.sleep(0.15)
+        st.rerun()
 
 
 
@@ -12204,6 +12551,334 @@ def _test_batched_candle_arrival():
           f"mid-batch  OK")
 
 
+class _FakeSessionState(dict):
+    """A dict that also answers to attribute access, like st.session_state."""
+
+    def __getattr__(self, key):
+        try:
+            return self[key]
+        except KeyError:
+            raise AttributeError(key) from None
+
+    def __setattr__(self, key, value):
+        self[key] = value
+
+
+class _FakeSlot:
+    """A st.empty() placeholder that remembers what was drawn into it."""
+
+    def __init__(self, log: list):
+        self._log = log
+
+    def progress(self, value, text=""):
+        self._log.append(("progress", float(value), str(text)))
+
+    def caption(self, text=""):
+        self._log.append(("caption", 0.0, str(text)))
+
+    def empty(self):
+        self._log.append(("cleared", 0.0, ""))
+
+    def __getattr__(self, name):
+        def _noop(*args, **kwargs):
+            return None
+        return _noop
+
+
+class _FakeStreamlit:
+    """Enough of streamlit to drive the live engine outside a script run."""
+
+    def __init__(self, buttons: dict | None = None):
+        self.session_state = _FakeSessionState()
+        self.drawn: list = []
+        self.reruns = 0
+        self._buttons = dict(buttons or {})
+
+    def empty(self):
+        return _FakeSlot(self.drawn)
+
+    def columns(self, spec, **kwargs):
+        count = spec if isinstance(spec, int) else len(spec)
+        return [self for _ in range(count)]
+
+    def button(self, label="", **kwargs):
+        return bool(self._buttons.pop(kwargs.get("key", label), False))
+
+    def rerun(self, *args, **kwargs):
+        self.reruns += 1
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def __getattr__(self, name):
+        def _noop(*args, **kwargs):
+            return None
+        return _noop
+
+
+def _test_sweep_progress_is_visible_and_rerun_is_deferred():
+    """
+    The progress bar must be on screen WHILE the pass works, and the driver must
+    not abandon the script before its caller has drawn.
+
+    Both halves are regressions with a history. The bar was moved to after the
+    work slice to stop a stale count contradicting the finish message, which
+    fixed the contradiction by making the bar invisible for the whole pass and
+    drawn a moment before the rerun wiped it -- "the progress bar appears and
+    disappears". Separately, calling st.rerun() inside the driver abandoned the
+    script mid-tab, so every table below it never rendered and the Signal Lab
+    showed its own empty state while visibly scanning.
+    """
+    real_st = globals()["st"]
+    fake = _FakeStreamlit()
+    globals()["st"] = fake
+    try:
+        jobs = list(range(6))
+        fake.session_state.update({
+            "demo_queue": list(jobs), "demo_rows": [], "demo_errs": [],
+            "demo_running": True, "demo_total": len(jobs), "demo_seconds_per_job": 0.0,
+        })
+        order: list[str] = []
+
+        def worker(job):
+            order.append(f"job{job}")
+            return [{"Job": job}], []
+
+        rows, errs, finished = chunked_sweep("demo", jobs, worker, slice_seconds=0.01,
+                                             label="things")
+        bars = [entry for entry in fake.drawn if entry[0] == "progress"]
+        assert bars, "a progress bar must be drawn"
+        assert "%" in bars[0][2], f"the bar must carry a percentage: {bars[0][2]!r}"
+        # Drawn before any work happened: the first bar predates the first job.
+        first_bar = fake.drawn.index(bars[0])
+        assert first_bar == 0, "the bar must be painted before the work slice, not after it"
+        assert len(bars) >= 2, "the bar must be repainted with the true count after the work"
+        assert order, "a pass must always complete at least one job, never zero"
+        assert len(order) == 1, f"a 0.01s slice must stop after one job, did {len(order)}"
+        assert fake.reruns == 0, \
+            "the driver must NOT rerun inline -- the caller has not drawn its results yet"
+        assert fake.session_state.get("_sweep_rerun_pending") is True, \
+            "the next pass must be requested for the end of the script"
+        assert len(rows) == 1 and not errs and not finished
+
+        # And a worker that raises must not end the sweep.
+        fake.session_state["demo_running"] = True
+
+        def angry(job):
+            raise RuntimeError("bad ticker")
+
+        rows, errs, _ = chunked_sweep("demo", jobs, angry, slice_seconds=0.01, label="things")
+        assert len(errs) == 1 and "bad ticker" in errs[0]["Problem"], \
+            "one failing job must be recorded and the queue must carry on"
+        print("   sweep driver: bar painted before the work with a percentage, rerun deferred, "
+              "failing job isolated  OK")
+    finally:
+        globals()["st"] = real_st
+
+
+def _test_live_entry_is_not_poll_dependent():
+    """
+    A signal must be taken whichever poll happens to see it.
+
+    THE BUG THIS EXISTS FOR. The engine used to ask "does the candle that is
+    newest ON THIS EXACT POLL carry a signal?" -- a question that is almost
+    never true at the moment it matters. A delayed feed delivers candles in a
+    burst so the trigger lands mid-batch; the liveness gate returned before the
+    signal was even looked at, discarding it; and the entry window defaulted to
+    zero candles, so anything not newest-this-instant was dropped without a
+    word. Two clean 9/21 crossovers on Nifty produced no entry and no
+    explanation, which is precisely what these four scenarios reproduce.
+
+    Each scenario drives the REAL run_cycle against a stubbed feed. Nothing here
+    inspects intermediate state: it asserts on whether a position exists, which
+    is the only thing an operator cares about.
+    """
+    real_st = globals()["st"]
+    fake = _FakeStreamlit()
+    globals()["st"] = fake
+    saved = {name: globals()[name] for name in
+             ("refresh_candles", "fetch_live_ltp", "db_save_position", "send_email",
+              "_maybe_route_broker")}
+    try:
+        n = 500
+        idx = pd.date_range(end=pd.Timestamp.now().floor("5min"), periods=n, freq="5min")
+        base = np.concatenate([np.linspace(24000, 23600, n - 60),
+                               np.linspace(23600, 24100, 60)])
+        rng = np.random.default_rng(7)
+        close = base + rng.normal(0, 4, n)
+        raw = pd.DataFrame({"Open": close + rng.normal(0, 2, n),
+                            "High": close + np.abs(rng.normal(8, 3, n)),
+                            "Low": close - np.abs(rng.normal(8, 3, n)),
+                            "Close": close,
+                            "Volume": rng.integers(1000, 5000, n).astype(float)}, index=idx)
+        raw["High"] = raw[["Open", "High", "Close"]].max(axis=1)
+        raw["Low"] = raw[["Open", "Low", "Close"]].min(axis=1)
+
+        name = "01 · Dual EMA Crossover"
+        params = dict(DEFAULT_PARAMS, ema_fast=9, ema_slow=21)
+        full, _ = prepare(raw, name, params)
+        fired = full["signal"][full["signal"] != 0]
+        assert len(fired), "the fixture needs a crossover"
+        cross = int(full.index.get_loc(fired.index[-1]))
+
+        cfg = {"symbol": "^NSEI", "interval": "5m", "strategy": name, "params": params,
+               "risk": RiskConfig("Fixed Points", 40.0, "Fixed Points", 80.0, 1.0),
+               "poll_seconds": 5, "candle_seconds": 15.0, "quantity": 1.0,
+               "filter_cfg": default_filter_config(), "filter_extras": {}, "broker": {},
+               "entry_lookback": DEFAULT_ENTRY_LOOKBACK, "join_window": 3,
+               "enter_on_start": True}
+
+        served = {"upto": 0, "drift": 0.0}
+        globals()["refresh_candles"] = lambda c: (full.iloc[:served["upto"]].copy(), [], [], None)
+
+        def _ltp(c, f):
+            served["drift"] += 1.0
+            return float(f["Close"].iloc[-1]) + served["drift"] * 0.05, "stub"
+        globals()["fetch_live_ltp"] = _ltp
+        for stub in ("db_save_position", "send_email", "_maybe_route_broker"):
+            globals()[stub] = lambda *a, **k: None
+
+        def fresh():
+            fake.session_state.clear()
+            fake.session_state.update({
+                "live_running": True, "live_position": None, "live_trades": [],
+                "live_events": [], "live_last_bar": None, "live_last_signal_time": None,
+                "live_snapshot": None, "live_error": None, "live_poll_count": 0,
+                "live_frame": None, "live_frame_at": 0.0, "candle_refreshes": 0,
+                "feed_log": [], "last_seen_ltp": None, "last_ltp_change_ts": 0.0,
+                "live_fail_streak": 0, "live_backoff_until": 0.0, "live_first_cycle": True,
+                "suspect_ticks": 0, "live_reports": [], "live_frame_warnings": [],
+                "live_vix": None, "order_book": None, "live_config": cfg,
+                "last_closed_bar": None, "held_signal_polls": 0,
+                "newest_bar_seen": None, "newest_bar_advanced_ts": 0.0,
+                "bars_added_last_refresh": 0,
+            })
+
+        def poll(upto):
+            served["upto"] = upto
+            fake.session_state["live_frame_at"] = 0.0      # due a candle refresh
+            run_cycle(cfg)
+            return fake.session_state.get("live_position")
+
+        # 1. the ordinary case: the crossover bar closes while the engine watches
+        fresh()
+        poll(cross - 6)
+        poll(cross - 5)
+        assert poll(cross + 1) is not None, \
+            "the crossover bar is the newest closed candle and MUST produce an entry"
+
+        # 2. the burst: the feed jumps clean past the crossover in one refresh
+        fresh()
+        poll(cross - 6)
+        pos = poll(cross + 4)
+        assert pos is not None, \
+            "a signal delivered mid-burst must still be taken -- this is the reported failure"
+
+        # 3. the crossover arrives as the forming bar, then closes
+        fresh()
+        poll(cross)
+        assert poll(cross + 1) is not None, "a confirmed crossover must be acted on"
+
+        # 4. and a signal long past must NOT be chased
+        fresh()
+        fake.session_state["live_first_cycle"] = False
+        assert poll(cross + 14) is None, \
+            "a signal 13 candles old is a move that has happened; chasing it is not an entry"
+
+        # 5. the same signal is never traded twice
+        fresh()
+        poll(cross - 6)
+        first = poll(cross + 1)
+        assert first is not None
+        fake.session_state["live_position"] = None        # pretend it was squared off
+        assert poll(cross + 2) is None, "the same signal bar must not re-enter"
+        print("   live entry: newest bar, mid-burst, forming-then-closed, stale refused, "
+              "no double entry  OK")
+    finally:
+        globals()["st"] = real_st
+        globals().update(saved)
+
+
+def _test_gamma_blast_always_explains_itself():
+    """
+    A screener that answers "0" without saying why is indistinguishable from a
+    broken one, and that is exactly how this tab was reported: zero signals,
+    every time, with a Dhan token supplied and nothing on screen to argue with.
+
+    Two guarantees are asserted here. Every ticker comes back as a ROW carrying
+    its own measurements and a named list of the conditions it failed -- so the
+    operator can see a 3.4% distance against a 1% threshold instead of an empty
+    table. And the expiry convention behaves as specified: an index passes only
+    on its expiry day, a stock only inside its window of days after the monthly
+    expiry, which is itself the reason most calendar days legitimately produce
+    no candidates.
+    """
+    real_st = globals()["st"]
+    fake = _FakeStreamlit()
+    globals()["st"] = fake
+    saved = {"load_market_data": globals()["load_market_data"]}
+    try:
+        n = 300
+        idx = pd.date_range(end=pd.Timestamp("2026-09-29 15:15", tz="Asia/Kolkata"),
+                            periods=n, freq="15min", tz="Asia/Kolkata")
+        rng = np.random.default_rng(3)
+        close = 1000 + np.cumsum(rng.normal(0, 2, n))
+        raw = pd.DataFrame({"Open": close, "High": close + 3, "Low": close - 3, "Close": close,
+                            "Volume": rng.integers(5000, 9000, n).astype(float)}, index=idx)
+        # Push the last candle to a new high on heavy volume: near resistance,
+        # positive momentum, volume surge -- everything except the expiry clock.
+        raw.iloc[-1, raw.columns.get_loc("Close")] = float(raw["High"].max()) + 1.0
+        raw.iloc[-1, raw.columns.get_loc("High")] = float(raw["High"].max()) + 2.0
+        raw.iloc[-1, raw.columns.get_loc("Volume")] = float(raw["Volume"].mean() * 4)
+
+        globals()["load_market_data"] = lambda *a, **k: DataBundle(
+            frame=raw.copy(), symbol="RELIANCE.NS", interval="15m", period="60d")
+
+        base = {"kind": "Auto", "weekly_weekday": 3, "monthly_weekday": 3, "index_days": 0,
+                "stock_min_days": 8, "stock_max_days": 12, "level_lookback": 60,
+                "proximity_pct": 1.0, "vol_mult": 1.5, "vol_len": 20, "momentum_bars": 5,
+                "momentum_pct": 0.2, "strike_step": 0.0, "oi_drop": 0.0, "use_chain": False}
+
+        row = gamma_blast_scan_one("RELIANCE.NS", "15m", base, dict(DEFAULT_PARAMS))
+        assert isinstance(row, dict) and row, "every ticker must come back as a row"
+        for column in ("Spot", "Level", "Distance %", "Proximity needed %", "Near level",
+                       "Why not", "Conditions met", "Expiry"):
+            assert column in row, f"the row must carry `{column}` so a zero can be explained"
+        assert row["Near level"] == "yes", "a new high is by definition at resistance"
+        assert row["Side"].startswith("BULLISH")
+
+        # A ticker sitting mid-range must be REPORTED, not dropped.
+        mid = raw.copy()
+        mid.iloc[-1, mid.columns.get_loc("Close")] = float(
+            (mid["High"].max() + mid["Low"].min()) / 2.0)
+        globals()["load_market_data"] = lambda *a, **k: DataBundle(
+            frame=mid.copy(), symbol="RELIANCE.NS", interval="15m", period="60d")
+        quiet = gamma_blast_scan_one("RELIANCE.NS", "15m", base, dict(DEFAULT_PARAMS))
+        assert isinstance(quiet, dict), "a ticker far from its level must still return a row"
+        assert quiet["Near level"] == "no"
+        assert "Near level" in quiet["Why not"], \
+            "the failing condition must be named, not left to guesswork"
+
+        # The expiry convention, asserted on both sides.
+        sept_expiry = pd.Timestamp(monthly_expiry(2026, 9, 3))
+        ok_stock, note = expiry_gate("RELIANCE.NS", sept_expiry + pd.Timedelta(days=10), base)
+        assert ok_stock, f"ten days after the monthly expiry must pass: {note}"
+        bad_stock, note = expiry_gate("RELIANCE.NS", sept_expiry + pd.Timedelta(days=5), base)
+        assert not bad_stock, f"five days after must fail the 8-12 window: {note}"
+        on_expiry, note = expiry_gate("^NSEI", sept_expiry, base)
+        assert on_expiry, f"an index on its expiry day must pass: {note}"
+        off_expiry, _ = expiry_gate("^NSEI", sept_expiry - pd.Timedelta(days=2), base)
+        assert not off_expiry, "an index two days before expiry must fail with index_days=0"
+        print("   gamma blast: every ticker returns a row naming its failed conditions; "
+              "expiry conventions hold  OK")
+    finally:
+        globals()["st"] = real_st
+        globals().update(saved)
+
+
 def _test_signal_detail():
     """
     The enriched signal columns must reconcile with each other exactly.
@@ -12500,6 +13175,9 @@ def run_selftest() -> int:
         _test_sweep_progress_is_honest()
         _test_target_rows_are_reachable()
         _test_batched_candle_arrival()
+        _test_live_entry_is_not_poll_dependent()
+        _test_gamma_blast_always_explains_itself()
+        _test_sweep_progress_is_visible_and_rerun_is_deferred()
         print("-- filters --")
         _test_filters()
         _test_new_filters()
