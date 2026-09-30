@@ -5490,12 +5490,9 @@ def render_sidebar() -> dict:
     (sb.success if verdict == "Backtest-safe" else sb.warning)(
         f"Exit configuration is **{verdict}** for backtesting.")
 
-    use_dhan_data = sb.checkbox("Use Dhan market data (needs API token)", value=False,
-                                key="cfg_dhan_data",
-                                help="Replaces Yahoo's delayed quote with Dhan's real-time LTP. "
-                                     "Read-only: this places no orders. Credentials are entered "
-                                     "in the Dhan panel below.")
-
+    # There is exactly ONE switch for Dhan market data, and it lives in the Dhan
+    # panel next to the credentials it needs. A second copy up here asked the
+    # same question twice and neither copy said which one counted.
     email_cfg = {"enabled": False}
     with sb.expander("Email notifications (off by default)"):
         email_cfg["enabled"] = st.checkbox("Send email on entry and exit", value=False,
@@ -5661,7 +5658,7 @@ def render_sidebar() -> dict:
             "square_off_on_stop": bool(square_off_on_stop),
             "candle_seconds": float(candle_seconds), "costs": costs,
             "walk_forward": bool(walk_fwd), "wf_folds": int(wf_folds),
-            "use_dhan_data": bool(use_dhan_data), "email": email_cfg,
+            "use_dhan_data": bool(broker.get("use_live_ltp")), "email": email_cfg,
             "filter_cfg": filter_cfg, "filter_extras": filter_extras, "broker": broker,
             "currency": currency_symbol(symbol),
             "hide_weekends": not trades_around_the_clock(symbol)}
@@ -6472,6 +6469,16 @@ def _metric_style() -> None:
         </style>""", unsafe_allow_html=True)
 
 
+def _time_to_close(cfg: dict, snapshot: LiveSnapshot) -> str:
+    """How long until the forming candle closes, in words."""
+    bar = INTERVAL_SECONDS.get(cfg.get("interval", "5m"), 300)
+    left = bar - float(snapshot.feed_age_seconds or 0.0)
+    if not snapshot.last_is_forming or left <= 0:
+        return "an unknown amount of time (the feed is lagging, so the newest candle has " \
+               "already closed)"
+    return f"about {left / 60:.0f} minute(s)" if left >= 60 else f"about {left:.0f} second(s)"
+
+
 def _market_data_panel(cfg: dict, snapshot: LiveSnapshot) -> None:
     """The market half of the dashboard: price and where the EMAs stand."""
     frame = snapshot.frame
@@ -6498,12 +6505,45 @@ def _market_data_panel(cfg: dict, snapshot: LiveSnapshot) -> None:
                      "it means the same thing on Nifty and on Bitcoin. It moves on every tick; "
                      "computed from closed candles alone it would sit frozen until the bar "
                      "closed.")
-    if fast is None or slow is None:
-        c[4].metric("Crossover", "--")
-    elif fast > slow:
-        c[4].metric("Crossover", "Bullish \u2191", f"+{fmt(fast - slow)}")
+    # ---- CONFIRMED vs PROJECTED, never merged into one word ----
+    #
+    # This metric caused three rounds of "the crossover happened and nothing
+    # entered". It used to compare the PROJECTED averages -- both pushed to the
+    # live price as if this candle had already closed -- and print "Bullish".
+    # Meanwhile the strategy, correctly, was reading the CLOSED candles, where
+    # the fast average was still below the slow one and no crossover had
+    # occurred. The panel said a thing had happened; the engine knew it had not.
+    # The engine was right and the panel was lying, so the panel now reports the
+    # confirmed state and labels the projection as a projection.
+    if fast_closed is None or slow_closed is None:
+        c[4].metric("Crossover (confirmed)", "--")
     else:
-        c[4].metric("Crossover", "Bearish \u2193", f"-{fmt(slow - fast)}")
+        gap = float(fast_closed) - float(slow_closed)
+        confirmed = "Bullish \u2191" if gap > 0 else "Bearish \u2193"
+        c[4].metric("Crossover (confirmed)", confirmed, f"{fmt(gap)} on closed candles",
+                    help="Computed from CLOSED candles only \u2014 the same values the strategy "
+                         "reads. This is the one that decides whether a signal fires.")
+
+    if fast is not None and slow is not None and fast_closed is not None \
+            and slow_closed is not None:
+        live_gap = float(fast) - float(slow)
+        closed_gap = float(fast_closed) - float(slow_closed)
+        if (live_gap > 0) != (closed_gap > 0):
+            st.warning(
+                f"**The live price has crossed, but the candle has not closed.** Projected to "
+                f"{fmt(snapshot.ltp)} the pair reads "
+                f"{'bullish' if live_gap > 0 else 'bearish'} ({fmt(live_gap)}), while the "
+                f"CLOSED candles still read {'bullish' if closed_gap > 0 else 'bearish'} "
+                f"({fmt(closed_gap)}). No signal has fired and none will until a candle closes "
+                f"on the new side \u2014 which is the correct behaviour, because an intrabar cross "
+                f"that un-crosses before the close is not a crossover. The forming candle has "
+                f"{_time_to_close(cfg, snapshot)} to go.")
+        else:
+            st.caption(
+                f"Projected to the live price the pair reads "
+                f"{'bullish' if live_gap > 0 else 'bearish'} ({fmt(live_gap)}), which agrees "
+                f"with the closed candles. A projection is not a signal \u2014 only a candle close "
+                f"can fire one.")
 
     # Volume, and how it compares with its own average. Shown whenever the feed
     # carries it, so a volume-gated rule can be read rather than guessed at.
@@ -7828,6 +7868,39 @@ def _auto_slice_seconds() -> float:
     return 20.0
 
 
+def scan_cost_notice(jobs: int, per_job_hint: float = 0.0, prefix: str = "") -> None:
+    """
+    What this scan will actually cost, BEFORE it is started.
+
+    Every fetch carries the mandatory 0.3s guard on both sides, so throughput
+    has a hard floor of roughly 0.6s per ticker plus the round trip -- about a
+    second and a half in practice, and far more for the Lab, which backtests
+    many combinations per name. A 500-name universe is therefore genuinely tens
+    of minutes of work. That is not a thing to discover at 3:30pm, so it is
+    stated here with the market clock next to it.
+    """
+    measured = float(st.session_state.get(f"{prefix}_seconds_per_job") or 0.0)
+    per = measured or per_job_hint or 1.5
+    total = jobs * per
+    source = "measured on this scan" if measured else "estimated"
+    words = f"{total:.0f} seconds" if total < 90 else \
+            (f"{total / 60:.0f} minutes" if total < 5400 else f"{total / 3600:.1f} hours")
+    now = pd.Timestamp.now(tz="Asia/Kolkata")
+    finish = now + pd.Timedelta(seconds=total)
+    close = now.normalize() + pd.Timedelta(hours=15, minutes=30)
+
+    line = (f"**{jobs:,} job(s) at about {per:.1f}s each — roughly {words}** ({source}). "
+            f"Started now it would finish about {finish:%H:%M}.")
+    if now < close < finish:
+        st.error(line + " **That is after the 15:30 close.** Cut the ticker count, narrow the "
+                        "timeframes, or reduce the combinations before starting — a scan that "
+                        "lands after the bell cannot be traded.")
+    elif total > 600:
+        st.warning(line + " You can pause and resume it, and results appear as it works.")
+    else:
+        st.caption(line)
+
+
 def _sweep_job_budget(minimum: float = 5.0) -> float:
     """
     How long ONE job inside the current pass may take.
@@ -7975,6 +8048,30 @@ def chunked_sweep(prefix: str, jobs: list, worker, slice_seconds: float = 20.0,
         errs = list(st.session_state[e_key])
         processed = 0
         rate = float(st.session_state[rate_key] or 0.0)
+        # A pass is many jobs long, so a bar painted only at its edges sits
+        # still for the whole pass and then jumps. That is what "the progress
+        # bar doesn't progress based on tickers scanned" means, and it is fixed
+        # by repainting after EVERY job: Streamlit streams a placeholder update
+        # to the browser as the script runs, so the bar advances one ticker at a
+        # time exactly as it should.
+        def _tick(done_count: int) -> None:
+            if not total:
+                return
+            spent = time.time() - started
+            seen = float(st.session_state[rate_key] or 0.0)
+            if done_count:
+                measured = spent / done_count
+                seen = measured if seen <= 0 else (0.7 * seen + 0.3 * measured)
+            left = (total - (total - len(queue))) * seen
+            eta = ""
+            if queue and seen > 0:
+                eta = (f" · about {left:0.0f}s left" if left < 90
+                       else f" · about {left / 60:0.0f} min left")
+            done_now = total - len(queue)
+            bar.progress(done_now / total,
+                         text=f"{done_now} of {total} {label} scanned "
+                              f"({done_now / total * 100:.0f}%) — working{eta}")
+
         while queue:
             elapsed = time.time() - started
             # Always do at least one job -- a pass that does nothing is a hang --
@@ -7996,6 +8093,10 @@ def chunked_sweep(prefix: str, jobs: list, worker, slice_seconds: float = 20.0,
             except Exception as exc:                                # noqa: BLE001
                 errs.append({"Job": str(job), "Problem": f"unhandled: {str(exc)[:140]}"})
             processed += 1
+            st.session_state[q_key] = queue          # so a recycle loses one job, not the pass
+            st.session_state[r_key] = rows
+            st.session_state[e_key] = errs
+            _tick(processed)
         if processed:
             spent = time.time() - started
             previous = float(st.session_state[rate_key] or 0.0)
@@ -8180,6 +8281,7 @@ def tab_screener(cfg: dict) -> None:
 
     jobs = [(t, tf, sname) for t in tickers for tf in scan_timeframes
             for sname in scan_strategies]
+    scan_cost_notice(len(jobs), per_job_hint=1.5, prefix="scr")
     rows, errs, _done = chunked_sweep("scr", jobs, _scr_worker, slice_seconds, "scans")
     st.session_state.screener_results = (pd.DataFrame(rows), pd.DataFrame(errs))
 
@@ -9527,6 +9629,7 @@ def tab_patterns(cfg: dict) -> None:
         return rows_p.to_dict("records"), errs_p.to_dict("records")
 
     jobs = [(t, tf) for t in tickers for tf in timeframes]
+    scan_cost_notice(len(jobs), per_job_hint=1.5, prefix="pat")
     rows, errs, _done = chunked_sweep("pat", jobs, _pat_worker, slice_seconds, "symbol/timeframe")
     st.session_state.pattern_rows = pd.DataFrame(rows)
     st.session_state.pattern_errors = pd.DataFrame(errs)
@@ -9971,14 +10074,9 @@ def tab_signal_lab(cfg: dict) -> None:
     if note:
         st.warning(note)
     jobs = len(tickers) * len(timeframes)
-    est = jobs * int(iterations) * 0.05 + jobs * 1.2
     st.caption(f"{len(tickers)} ticker(s) x {len(timeframes)} timeframe(s) x {int(iterations)} "
-               f"combinations = {jobs * int(iterations):,} backtests. Rough estimate "
-               f"{est:0.0f}s.")
-
-    st.caption(f"Estimated total work: about {est / 60:.0f} minutes. It is spread across many "
-               f"short passes rather than one long run, so you can leave it going, pause it, or "
-               f"come back after a disconnection and resume where it stopped.")
+               f"combinations = {jobs * int(iterations):,} backtests.")
+    scan_cost_notice(jobs, per_job_hint=int(iterations) * 0.05 + 1.2, prefix="lab")
 
     # The Signal Lab now shares the same driver as every other sweep, so it gets
     # the same guarantees: honest progress, a disk mirror that survives the
@@ -10353,11 +10451,10 @@ def tab_auto_screener(cfg: dict) -> None:
 
     jobs = len(chosen) * max(1, len(timeframes))
     # Rough cost of one backtest, measured on this machine's own last run.
-    per_job = float(st.session_state.get("auto_seconds_per_job", 0.6))
-    est = jobs * per_job
     st.caption(f"{len(chosen)} ticker(s) x {len(timeframes)} timeframe(s) x {int(iterations)} "
-               f"combinations = {jobs * int(iterations):,} backtests, roughly "
-               f"{est / 60:.0f} minutes. Anything that cannot be tested is skipped and listed.")
+               f"combinations = {jobs * int(iterations):,} backtests. Anything that cannot be "
+               f"tested is skipped and listed.")
+    scan_cost_notice(jobs, per_job_hint=0.6, prefix="auto")
 
     if not chosen or not timeframes:
         st.error("Pick at least one ticker and one timeframe.")
@@ -10657,12 +10754,40 @@ def dhan_option_chain(broker: dict, underlying_scrip: int, underlying_seg: str,
         except (TypeError, ValueError):
             continue
         ce, pe = (legs or {}).get("ce") or {}, (legs or {}).get("pe") or {}
-        out[k] = {"ce_oi": float(ce.get("oi", 0) or 0), "pe_oi": float(pe.get("oi", 0) or 0),
-                  "ce_volume": float(ce.get("volume", 0) or 0),
-                  "pe_volume": float(pe.get("volume", 0) or 0),
-                  "ce_ltp": float(ce.get("last_price", 0) or 0),
-                  "pe_ltp": float(pe.get("last_price", 0) or 0)}
+        out[k] = {"ce_oi": _num(ce, "oi"), "pe_oi": _num(pe, "oi"),
+                  # Dhan returns the PREVIOUS session's open interest alongside
+                  # today's. That makes the day's OI change readable from a
+                  # SINGLE call, which is the difference between this panel
+                  # working now and it sitting blank until two snapshots have
+                  # been collected minutes apart. Waiting for two samples was
+                  # never necessary for the day change; it is only necessary for
+                  # the intraday delta, which is kept separately below.
+                  "ce_prev_oi": _num(ce, "previous_oi"),
+                  "pe_prev_oi": _num(pe, "previous_oi"),
+                  "ce_volume": _num(ce, "volume"), "pe_volume": _num(pe, "volume"),
+                  "ce_ltp": _num(ce, "last_price"), "pe_ltp": _num(pe, "last_price")}
     return out
+
+
+def _num(leg: dict, key: str) -> float:
+    """
+    One numeric field from an option-chain leg, under any of its spellings.
+
+    Dhan has shipped more than one casing for these keys, and a field read under
+    the wrong spelling silently becomes zero -- which looks exactly like "no
+    open interest" rather than "wrong key". NaN is returned for genuinely
+    missing data so a blank stays visibly blank instead of pretending to be 0.
+    """
+    parts = key.split("_")
+    camel = parts[0] + "".join(p.title() for p in parts[1:])
+    for candidate in (key, key.upper(), key.replace("_", ""), camel,
+                      "".join(p.title() for p in parts)):
+        if candidate in (leg or {}):
+            try:
+                return float(leg[candidate])
+            except (TypeError, ValueError):
+                return float("nan")
+    return float("nan")
 
 
 def record_oi_snapshot(ticker: str, chain: dict) -> None:
@@ -10758,20 +10883,45 @@ def sample_chain_for(broker: dict, ticker: str) -> tuple[dict, str]:
 
 
 def oi_change_at(ticker: str, strike: float) -> dict:
-    """CE/PE open-interest change at one strike, from the stored snapshots."""
+    """
+    Open interest at one strike, and how it has changed -- two different
+    changes, because they answer two different questions.
+
+    DAY change comes straight from the broker: Dhan serves the previous
+    session's open interest next to today's, so this is readable from the FIRST
+    call and needs no history at all. Waiting for two snapshots before showing
+    anything was the reason this panel stayed blank with a valid token.
+
+    INTRADAY change is the delta between snapshots this app has taken itself.
+    That one genuinely does need two samples, because no source publishes an
+    intraday open-interest history.
+    """
     store = (st.session_state.get("oi_snapshots") or {}) if st is not None else {}
     series = store.get(ticker) or []
-    if len(series) < 2:
-        return {"samples": len(series)}
-    first, last = series[0]["chain"].get(strike), series[-1]["chain"].get(strike)
-    if not first or not last:
-        return {"samples": len(series)}
-    return {"samples": len(series),
-            "ce_oi": last["ce_oi"], "pe_oi": last["pe_oi"],
-            "ce_oi_change": last["ce_oi"] - first["ce_oi"],
-            "pe_oi_change": last["pe_oi"] - first["pe_oi"],
-            "ce_volume": last["ce_volume"], "pe_volume": last["pe_volume"],
-            "minutes": (series[-1]["at"] - series[0]["at"]).total_seconds() / 60.0}
+    out: dict = {"samples": len(series)}
+    if not series:
+        return out
+
+    last = (series[-1].get("chain") or {}).get(strike)
+    if last:
+        out.update({"ce_oi": last.get("ce_oi"), "pe_oi": last.get("pe_oi"),
+                    "ce_volume": last.get("ce_volume"), "pe_volume": last.get("pe_volume"),
+                    "ce_prev_oi": last.get("ce_prev_oi"), "pe_prev_oi": last.get("pe_prev_oi")})
+        for side in ("ce", "pe"):
+            now, prev = last.get(f"{side}_oi"), last.get(f"{side}_prev_oi")
+            if now is not None and prev is not None \
+                    and np.isfinite(now) and np.isfinite(prev) and prev > 0:
+                out[f"{side}_day_change"] = float(now) - float(prev)
+
+    if len(series) >= 2:
+        first = (series[0].get("chain") or {}).get(strike)
+        if first and last:
+            for side in ("ce", "pe"):
+                a, b = first.get(f"{side}_oi"), last.get(f"{side}_oi")
+                if a is not None and b is not None and np.isfinite(a) and np.isfinite(b):
+                    out[f"{side}_oi_change"] = float(b) - float(a)
+            out["minutes"] = (series[-1]["at"] - series[0]["at"]).total_seconds() / 60.0
+    return out
 
 
 def gamma_blast_scan_one(ticker: str, interval: str, gcfg: dict, params: dict,
@@ -10852,21 +11002,26 @@ def gamma_blast_scan_one(ticker: str, interval: str, gcfg: dict, params: dict,
         _chain, chain_note = sample_chain_for(broker, ticker)
     oi = oi_change_at(ticker, strike)
     watched = int(oi.get("samples", 0))
-    ce_oi = pe_oi = None
-    if watched >= 1:
-        snaps = ((st.session_state.get("oi_snapshots") or {}) if st is not None else {})
-        latest = (snaps.get(ticker) or [{}])[-1].get("chain") or {}
-        leg = latest.get(strike) or {}
-        ce_oi, pe_oi = leg.get("ce_oi"), leg.get("pe_oi")
-    if watched >= 2 and "ce_oi_change" in oi:
-        change = oi.get("ce_oi_change", 0.0) if leaning_up else oi.get("pe_oi_change", 0.0)
+    ce_oi, pe_oi = oi.get("ce_oi"), oi.get("pe_oi")
+    leg = "CE" if leaning_up else "PE"
+    day_change = oi.get(f"{leg.lower()}_day_change")
+    intra_change = oi.get(f"{leg.lower()}_oi_change")
+
+    # The DAY change decides the condition, because it is available on the very
+    # first call. The intraday delta refines it once two snapshots exist; it is
+    # no longer a precondition for saying anything at all.
+    change = intra_change if intra_change is not None else day_change
+    if change is not None and np.isfinite(change):
         oi_ok = change <= -abs(float(gcfg.get("oi_drop", 0.0)))
-        oi_note = (f"{'CE' if leaning_up else 'PE'} OI change {fmt(change, 0)} over "
-                   f"{fmt(oi.get('minutes'), 0)}m")
+        basis = (f"intraday, over {fmt(oi.get('minutes'), 0)}m" if intra_change is not None
+                 else "vs the previous session's close")
+        oi_note = f"{leg} OI change {fmt(change, 0)} ({basis})"
+        if intra_change is not None and day_change is not None:
+            oi_note += f"; day change {fmt(day_change, 0)}"
     else:
         oi_ok = None                       # unknown, not false
-        oi_note = (f"{watched} snapshot(s) held — OI CHANGE needs two, taken minutes apart. "
-                   f"{chain_note}.")
+        oi_note = (f"no open-interest reading at strike {fmt(strike, 0)} — {chain_note}"
+                   if watched else f"no chain fetched — {chain_note}")
 
     conditions = {"Near level": near_level, "Volume surge": bool(vol_ok),
                   "Momentum": bool(direction_ok), "Expiry window": bool(exp_ok)}
@@ -10887,8 +11042,10 @@ def gamma_blast_scan_one(ticker: str, interval: str, gcfg: dict, params: dict,
         "Momentum %": round(momentum_pct, 3),
         "Momentum needed": float(gcfg.get("momentum_pct", 0.2)),
         "Expiry": exp_note, "Expiry ok": "yes" if exp_ok else "no",
-        "CE OI": ce_oi, "CE OI change": oi.get("ce_oi_change"),
-        "PE OI": pe_oi, "PE OI change": oi.get("pe_oi_change"),
+        "CE OI": ce_oi, "CE OI day change": oi.get("ce_day_change"),
+        "CE OI intraday change": oi.get("ce_oi_change"),
+        "PE OI": pe_oi, "PE OI day change": oi.get("pe_day_change"),
+        "PE OI intraday change": oi.get("pe_oi_change"),
         "OI state": oi_note,
         "Near level": "yes" if near_level else "no",
         "Conditions met": f"{met} of {len(conditions)}",
@@ -10970,14 +11127,35 @@ def gamma_blast_detail(ticker: str, interval: str, gcfg: dict, strike: float,
         increasing_line_color=_UP, decreasing_line_color=_DOWN,
         increasing_fillcolor=_UP, decreasing_fillcolor=_DOWN,
         line=dict(width=1), showlegend=False), row=1, col=1)
-    for level, label, colour in ((resistance, "Resistance", _DOWN), (support, "Support", _UP)):
-        fig.add_hline(y=level, line=dict(width=1.2, dash="dot", color=colour),
-                      annotation_text=f"{label} {fmt(level)}",
-                      annotation_position="top left", row=1, col=1)
-    if np.isfinite(strike):
-        fig.add_hline(y=strike, line=dict(width=1, dash="dash", color="#8d99ae"),
-                      annotation_text=f"Strike {fmt(strike, 0)}",
-                      annotation_position="bottom right", row=1, col=1)
+    # Scale the price panel to the CANDLES, then draw only the levels that fit.
+    #
+    # A strike several hundred points away from the market -- which is normal
+    # when the level lookback reaches back over a trend -- used to stretch the
+    # y-axis to cover it, squashing every candle into a strip at the bottom of
+    # an empty panel. The chart became unreadable because of one dashed line.
+    lo, hi = float(tail["Low"].min()), float(tail["High"].max())
+    pad = max((hi - lo) * 0.08, hi * 0.002)
+    y_lo, y_hi = lo - pad, hi + pad
+    off_chart = []
+    for level, label, colour in ((resistance, "Resistance", _DOWN), (support, "Support", _UP),
+                                 (strike, "Strike", "#8d99ae")):
+        if not np.isfinite(level):
+            continue
+        if y_lo <= level <= y_hi:
+            fig.add_hline(y=level, line=dict(width=1.2, dash="dot", color=colour),
+                          annotation_text=f"{label} {fmt(level)}",
+                          annotation_position="top left", row=1, col=1)
+        else:
+            # Keep the level honest without letting it wreck the scale: pin it
+            # to the edge it lies beyond and say how far away it really is.
+            edge = y_hi if level > y_hi else y_lo
+            away = abs(level - float(tail['Close'].iloc[-1]))
+            fig.add_annotation(x=1, xref="x domain", y=edge, yanchor="top" if level > y_hi
+                               else "bottom", xanchor="right", showarrow=False,
+                               text=f"{label} {fmt(level)} — {fmt(away)} away, off-chart",
+                               font=dict(size=10, color=colour), row=1, col=1)
+            off_chart.append(label)
+    fig.update_yaxes(range=[y_lo, y_hi], row=1, col=1)
 
     if has_volume:
         rising = tail["Close"].to_numpy() >= tail["Open"].to_numpy()
@@ -11050,8 +11228,26 @@ def gamma_blast_detail(ticker: str, interval: str, gcfg: dict, strike: float,
         "ce_oi_change": (ce_series[-1] - ce_series[0]) if len(ce_series) > 1 else float("nan"),
         "pe_oi_change": (pe_series[-1] - pe_series[0]) if len(pe_series) > 1 else float("nan"),
         "minutes": ((times[-1] - times[0]).total_seconds() / 60.0) if len(times) > 1 else 0.0,
+        # The day change needs no history at all -- the broker serves the
+        # previous session's open interest next to today's.
+        "ce_day_change": _leg_day_change(snaps, strike, "ce"),
+        "pe_day_change": _leg_day_change(snaps, strike, "pe"),
     }
     return fig, numbers
+
+
+def _leg_day_change(snaps: list, strike: float, side: str) -> float:
+    """Today's open interest minus the previous session's, from the newest snapshot."""
+    if not snaps:
+        return float("nan")
+    leg = (snaps[-1].get("chain") or {}).get(strike) or {}
+    now, prev = leg.get(f"{side}_oi"), leg.get(f"{side}_prev_oi")
+    try:
+        if now is None or prev is None or not (np.isfinite(now) and np.isfinite(prev)):
+            return float("nan")
+        return float(now) - float(prev)
+    except (TypeError, ValueError):
+        return float("nan")
 
 
 def oi_verdict(numbers: dict, side: str) -> tuple[str, str]:
@@ -11065,32 +11261,41 @@ def oi_verdict(numbers: dict, side: str) -> tuple[str, str]:
     price_up = numbers["price"] > numbers.get("prev_price", numbers["price"])
     vol_up = (np.isfinite(numbers["vol_multiple"]) and numbers["vol_multiple"] >= 1.0)
     bullish = side.startswith("BULL")
-    change = numbers["ce_oi_change"] if bullish else numbers["pe_oi_change"]
-
-    if numbers["snapshots"] < 2 or not np.isfinite(change):
-        return ("Not measurable yet",
-                f"Open-interest CHANGE needs two chain snapshots; {numbers['snapshots']} held. "
-                "Run the scan again in a few minutes with the Dhan chain fetch ticked and this "
-                "panel fills in. No source publishes OI history, so it can only be measured "
-                "from when this app starts watching.")
     leg = "CE" if bullish else "PE"
+    intra = numbers.get("ce_oi_change" if bullish else "pe_oi_change", float("nan"))
+    day = numbers.get("ce_day_change" if bullish else "pe_day_change", float("nan"))
+
+    # Prefer the intraday delta when it exists, fall back to the day change,
+    # which the broker supplies on the very first call.
+    change, basis = (intra, f"over {fmt(numbers.get('minutes'), 0)} minutes") \
+        if np.isfinite(intra) else (day, "against the previous session's close")
+
+    if not np.isfinite(change):
+        held = numbers.get("snapshots", 0)
+        return ("Not measurable yet",
+                f"No open-interest reading at this strike. {held} chain snapshot(s) held. "
+                "Tick **Fetch the option chain from Dhan while scanning** and run the scan — "
+                "the day's change reads immediately from the broker, and the intraday change "
+                "appears once a second scan gives it two points to compare.")
     if change < 0 and price_up and vol_up and bullish:
         return ("Short covering", f"{leg} open interest is DOWN {fmt(abs(change), 0)} contracts "
-                                  f"while price rises on above-average volume: call writers are "
-                                  f"buying back, which is the fuel a gamma move runs on.")
+                                  f"{basis} while price rises on above-average volume: call "
+                                  f"writers are buying back, which is the fuel a gamma move "
+                                  f"runs on.")
     if change < 0 and not price_up and vol_up and not bullish:
         return ("Short covering (puts)", f"{leg} open interest is DOWN {fmt(abs(change), 0)} "
-                                         f"while price falls on above-average volume: put "
-                                         f"writers are closing.")
+                                         f"{basis} while price falls on above-average volume: "
+                                         f"put writers are closing.")
     if change < 0 and not price_up and bullish:
-        return ("Long unwinding", f"{leg} open interest is DOWN {fmt(abs(change), 0)} but price "
-                                  f"is FALLING. Falling OI with falling price is call holders "
-                                  f"leaving, not writers being squeezed — the opposite setup.")
+        return ("Long unwinding", f"{leg} open interest is DOWN {fmt(abs(change), 0)} {basis} "
+                                  f"but price is FALLING. Falling OI with falling price is call "
+                                  f"holders leaving, not writers being squeezed — the opposite "
+                                  f"setup.")
     if change > 0 and price_up:
-        return ("Fresh longs / writing", f"{leg} open interest is UP {fmt(change, 0)}: positions "
-                                         f"are being ADDED, not closed. That is not covering.")
-    return ("No clear signature", f"{leg} OI change {fmt(change, 0)} over "
-                                  f"{fmt(numbers['minutes'], 0)} minutes with price "
+        return ("Fresh longs / writing", f"{leg} open interest is UP {fmt(change, 0)} {basis}: "
+                                         f"positions are being ADDED, not closed. That is not "
+                                         f"covering.")
+    return ("No clear signature", f"{leg} OI change {fmt(change, 0)} {basis} with price "
                                   f"{'up' if price_up else 'down'} and volume "
                                   f"{fmt(numbers['vol_multiple'])}x average. The three do not "
                                   f"line up into either pattern.")
@@ -11134,12 +11339,19 @@ def _gamma_detail_panel(table: pd.DataFrame, interval: str, gcfg: dict, cfg: dic
              f"level {fmt(row.get('Level'))}")
 
     e, f, g, h = st.columns(4)
-    e.metric("CE open interest", fmt(nums["ce_oi"], 0))
-    f.metric("CE OI change", fmt(nums["ce_oi_change"], 0),
-             f"over {fmt(nums['minutes'], 0)} min" if nums["snapshots"] > 1 else "needs 2 samples")
-    g.metric("PE open interest", fmt(nums["pe_oi"], 0))
-    h.metric("PE OI change", fmt(nums["pe_oi_change"], 0),
-             f"over {fmt(nums['minutes'], 0)} min" if nums["snapshots"] > 1 else "needs 2 samples")
+    e.metric("CE open interest", fmt(nums["ce_oi"], 0),
+             f"day change {fmt(nums.get('ce_day_change'), 0)}",
+             help="Today's open interest at the strike, and how it has moved since the "
+                  "previous session's close. The day change comes straight from the broker, so "
+                  "it reads on the first scan.")
+    f.metric("CE OI change (intraday)", fmt(nums["ce_oi_change"], 0),
+             f"over {fmt(nums['minutes'], 0)} min" if nums["snapshots"] > 1
+             else "needs a second scan")
+    g.metric("PE open interest", fmt(nums["pe_oi"], 0),
+             f"day change {fmt(nums.get('pe_day_change'), 0)}")
+    h.metric("PE OI change (intraday)", fmt(nums["pe_oi_change"], 0),
+             f"over {fmt(nums['minutes'], 0)} min" if nums["snapshots"] > 1
+             else "needs a second scan")
 
     st.plotly_chart(fig, width="stretch", config={"scrollZoom": True})
     st.caption("Three panels on one time axis rather than two y-axes on one plot: price, "
@@ -11217,9 +11429,14 @@ def tab_gamma_blast(cfg: dict) -> None:
     broker = cfg.get("broker") or {}
     has_token = bool(str(broker.get("access_token", "")).strip()
                      and str(broker.get("client_id", "")).strip())
+    # The key CHANGES when a token appears. A Streamlit widget keeps whatever
+    # value it was first created with, so a box defaulted to False before the
+    # token was typed stayed False forever afterwards -- the token was entered,
+    # the box looked available, and the chain was never fetched. A new key means
+    # a new widget, which takes the new default.
     use_chain = st.checkbox(
-        "Fetch the option chain from Dhan while scanning", value=has_token, disabled=not has_token,
-        key="gb_use_chain",
+        "Fetch the option chain from Dhan while scanning", value=has_token,
+        disabled=not has_token, key=f"gb_use_chain_{'tok' if has_token else 'none'}",
         help="On, the scan resolves each underlying and its nearest expiry from the Dhan "
              "instrument master and pulls the chain itself, so CE/PE open interest at the strike "
              "is real data. Open interest CHANGE still needs two scans a few minutes apart, "
@@ -11228,6 +11445,21 @@ def tab_gamma_blast(cfg: dict) -> None:
     if not has_token:
         st.info("Enter a Dhan client id and access token in the sidebar to read open interest. "
                 "Everything else on this screen works without it.")
+    else:
+        # Prove the resolution works BEFORE a scan, on a real name, so a broken
+        # security id or expiry is visible here instead of as a blank column
+        # forty tickers later.
+        probe_name = (chosen or all_tickers or ["^NSEI"])[0]
+        probe = option_chain_underlying(probe_name)
+        if probe:
+            st.caption(f"Resolved automatically — `{probe_name}` → security id `{probe[0]}` on "
+                       f"`{probe[1]}`, nearest expiry `{probe[2]}`. Security id, segment and "
+                       f"expiry are all derived from the Dhan instrument master; nothing here "
+                       f"is typed by hand.")
+        else:
+            st.warning(f"`{probe_name}` could not be resolved to an option series in the Dhan "
+                       f"instrument master, so its open interest cannot be read. Indices and "
+                       f"F&O stocks resolve; cash-only names have no options to read.")
 
     gcfg = {"kind": kind, "weekly_weekday": weekly_weekday, "monthly_weekday": weekly_weekday,
             "index_days": index_days, "stock_min_days": stock_min, "stock_max_days": stock_max,
@@ -11246,6 +11478,7 @@ def tab_gamma_blast(cfg: dict) -> None:
             return [], [{"Ticker": ticker, "Problem": str(exc)[:140]}]
         return ([row] if row else []), []
 
+    scan_cost_notice(len(chosen), per_job_hint=1.8, prefix="gb")
     rows, errs, _done = chunked_sweep("gb", list(chosen), _worker, slice_seconds, "tickers")
 
     frame = pd.DataFrame(rows)
@@ -11295,8 +11528,9 @@ def tab_gamma_blast(cfg: dict) -> None:
                              "Why not", "Near level", "Spot", "Level", "Distance %",
                              "Proximity needed %", "Resistance", "Support", "Strike",
                              "Volume x", "Volume needed", "Momentum %", "Momentum needed",
-                             "Expiry", "Expiry ok", "CE OI", "CE OI change", "PE OI",
-                             "PE OI change", "OI state", "Strike step", "Checked at"]
+                             "Expiry", "Expiry ok", "CE OI", "CE OI day change",
+                             "CE OI intraday change", "PE OI", "PE OI day change",
+                             "PE OI intraday change", "OI state", "Strike step", "Checked at"]
                  if c in table.columns]
         if table.empty:
             st.info("No row met every condition. Tick **Show near-misses too** above to see "
@@ -13357,6 +13591,61 @@ def _test_every_signal_gets_a_recorded_verdict():
         globals().update(saved)
 
 
+def _test_projected_cross_is_not_a_signal():
+    """
+    A projected crossover must never be reported as a crossover.
+
+    THE BUG THIS EXISTS FOR, and the most expensive one in this application's
+    history. The live dashboard computed both EMAs PROJECTED to the live price
+    -- where they would sit if the forming candle closed right now -- compared
+    those, and printed "Crossover: Bullish". The strategy, correctly, read the
+    CLOSED candles, where the fast average was still BELOW the slow one and no
+    crossover had happened. So the panel announced an event, the engine
+    declined to trade it, and the engine was right every time. Three rounds of
+    "the crossover happened and nothing entered" came from this one metric.
+
+    The fixture is taken from a real screenshot: closed fast 22,693.90 < closed
+    slow 22,697.61 (no cross), while projected fast 22,700.88 > projected slow
+    22,700.45 (looks bullish).
+    """
+    fast_closed, slow_closed = 22693.90, 22697.61
+    fast_proj, slow_proj = 22700.88, 22700.45
+
+    assert fast_closed < slow_closed, "the fixture must have NO confirmed crossover"
+    assert fast_proj > slow_proj, "the fixture must LOOK bullish when projected"
+
+    # The confirmed state is what the strategy sees, and it is bearish.
+    confirmed_bullish = fast_closed > slow_closed
+    projected_bullish = fast_proj > slow_proj
+    assert confirmed_bullish is False
+    assert projected_bullish is True
+    assert confirmed_bullish != projected_bullish, \
+        "this fixture exists precisely because the two disagree"
+
+    # And the strategy itself must agree with the CLOSED reading: build a frame
+    # whose last closed bar has fast below slow and assert no signal fires.
+    n = 300
+    idx = pd.date_range(end=pd.Timestamp("2026-09-30 04:15", tz="Asia/Kolkata"),
+                        periods=n, freq="5min", tz="Asia/Kolkata")
+    close = np.linspace(23000.0, 22690.0, n)            # a clean downtrend
+    raw = pd.DataFrame({"Open": close, "High": close + 5, "Low": close - 5, "Close": close,
+                        "Volume": np.full(n, 1000.0)}, index=idx)
+    params = dict(DEFAULT_PARAMS, ema_fast=9, ema_slow=21)
+    frame, _ = prepare(raw, "01 · Dual EMA Crossover", params)
+    last_closed = len(frame) - 2
+    assert float(frame["ema_fast"].iloc[last_closed]) < float(frame["ema_slow"].iloc[last_closed])
+    assert int(frame["signal"].iloc[last_closed]) == 0, \
+        "with the fast EMA below the slow one on CLOSED candles, no signal may fire"
+
+    # project_ema must move with the live price but must not be mistaken for it.
+    projected = project_ema(float(frame["ema_fast"].iloc[last_closed]), 25000.0, 9)
+    assert projected > float(frame["ema_fast"].iloc[last_closed]), \
+        "a projection must respond to the live price"
+    assert int(frame["signal"].iloc[last_closed]) == 0, \
+        "and projecting must not retroactively create a signal"
+    print("   projected vs confirmed cross: a projection never counts as a crossover  OK")
+
+
 def _test_gamma_blast_detail_chart():
     """
     The evidence panel must draw, carry ABSOLUTE numbers, and separate short
@@ -13418,6 +13707,57 @@ def _test_gamma_blast_detail_chart():
     finally:
         globals()["st"] = real_st
         globals().update(saved)
+
+
+def _test_dhan_previous_oi_gives_a_day_change():
+    """
+    Open-interest CHANGE must read on the FIRST call, not after two snapshots.
+
+    The panel sat blank with a valid token because every change was computed
+    from this app's own snapshot history, and a first scan has exactly one
+    snapshot. Dhan serves the previous session's open interest alongside
+    today's, so the day's change was available all along and simply was not
+    being read.
+    """
+    real_st = globals()["st"]
+    fake = _FakeStreamlit()
+    globals()["st"] = fake
+    try:
+        strike = 8400.0
+        fake.session_state["oi_snapshots"] = {"APOLLOHOSP.NS": [
+            {"at": pd.Timestamp("2026-09-30 09:45"),
+             "chain": {strike: {"ce_oi": 412000.0, "ce_prev_oi": 501000.0,
+                                "pe_oi": 288000.0, "pe_prev_oi": 265000.0,
+                                "ce_volume": 1.0, "pe_volume": 1.0}}}]}
+        oi = oi_change_at("APOLLOHOSP.NS", strike)
+        assert oi["samples"] == 1, "one snapshot only -- this is a first scan"
+        assert oi["ce_day_change"] == -89000.0, \
+            f"the day change must read from a single call, got {oi.get('ce_day_change')}"
+        assert oi["pe_day_change"] == 23000.0
+        assert "ce_oi_change" not in oi, \
+            "the INTRADAY change genuinely needs two snapshots and must stay absent"
+
+        # A second snapshot adds the intraday delta without losing the day one.
+        fake.session_state["oi_snapshots"]["APOLLOHOSP.NS"].append(
+            {"at": pd.Timestamp("2026-09-30 10:15"),
+             "chain": {strike: {"ce_oi": 395000.0, "ce_prev_oi": 501000.0,
+                                "pe_oi": 291000.0, "pe_prev_oi": 265000.0,
+                                "ce_volume": 1.0, "pe_volume": 1.0}}})
+        oi2 = oi_change_at("APOLLOHOSP.NS", strike)
+        assert oi2["ce_oi_change"] == -17000.0, oi2.get("ce_oi_change")
+        assert oi2["ce_day_change"] == -106000.0
+        assert abs(oi2["minutes"] - 30.0) < 1e-6
+
+        # Field spellings: a key read under the wrong casing must not become 0.
+        assert _num({"previous_oi": 5.0}, "previous_oi") == 5.0
+        assert _num({"PREVIOUS_OI": 5.0}, "previous_oi") == 5.0
+        assert _num({"previousOi": 5.0}, "previous_oi") == 5.0
+        assert not np.isfinite(_num({}, "previous_oi")), \
+            "a missing field must be NaN, never 0 -- 0 reads as 'no open interest'"
+        print("   dhan open interest: day change on the first call, intraday on the second, "
+              "missing fields stay blank  OK")
+    finally:
+        globals()["st"] = real_st
 
 
 def _test_gamma_blast_always_explains_itself():
@@ -13795,6 +14135,8 @@ def run_selftest() -> int:
         _test_batched_candle_arrival()
         _test_live_entry_is_not_poll_dependent()
         _test_every_signal_gets_a_recorded_verdict()
+        _test_projected_cross_is_not_a_signal()
+        _test_dhan_previous_oi_gives_a_day_change()
         _test_gamma_blast_always_explains_itself()
         _test_gamma_blast_detail_chart()
         _test_sweep_progress_is_visible_and_rerun_is_deferred()
