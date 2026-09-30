@@ -4300,6 +4300,37 @@ def log_event(message: str, level: str = "info") -> None:
     del st.session_state.live_events[300:]
 
 
+def entry_trace(verdict: str, detail: str, *, when=None, ago=None, direction: int = 0) -> None:
+    """
+    Record what this poll decided about entering, and why.
+
+    "It did not enter and I do not know why" is unanswerable without this. The
+    event feed only ever carried the interesting moments, so a signal that was
+    quietly passed over left no trace at all -- and a silent pass is exactly the
+    failure that matters. Every poll now files a verdict, and repeated identical
+    verdicts are counted rather than repeated, so the trace stays readable at
+    one poll per second.
+    """
+    if st is None:
+        return
+    try:
+        log = st.session_state.setdefault("entry_trace", [])
+    except Exception:                                               # noqa: BLE001
+        return
+    stamp = fmt_time(when) if when is not None else "-"
+    side = "LONG" if direction > 0 else ("SHORT" if direction < 0 else "-")
+    if log and log[0]["Verdict"] == verdict and log[0]["Signal bar"] == stamp:
+        log[0]["Polls"] = int(log[0].get("Polls", 1)) + 1
+        log[0]["Last seen"] = pd.Timestamp.now().strftime("%H:%M:%S")
+        return
+    log.insert(0, {"First seen": pd.Timestamp.now().strftime("%H:%M:%S"),
+                   "Last seen": pd.Timestamp.now().strftime("%H:%M:%S"),
+                   "Signal bar": stamp, "Side": side,
+                   "Bars ago": "-" if ago is None else int(ago),
+                   "Verdict": verdict, "Why": detail, "Polls": 1})
+    del log[300:]
+
+
 def record_live_trade(trade: dict) -> None:
     """
     The ONLY writer to the live ledger.
@@ -4355,6 +4386,10 @@ def reset_live_runtime() -> None:
     st.session_state.live_fail_streak = 0
     st.session_state.live_backoff_until = 0.0
     st.session_state.held_signal_polls = 0
+    st.session_state.entry_trace = []
+    st.session_state.newest_bar_seen = None
+    st.session_state.newest_bar_advanced_ts = 0.0
+    st.session_state.bars_added_last_refresh = 0
 
 
 # =============================================================================
@@ -4850,8 +4885,48 @@ def run_cycle(cfg: dict) -> None:
         position.low_since_entry = min(position.low_since_entry or snapshot.ltp, snapshot.ltp)
         if new_bar:
             db_save_position(position, cfg)          # persist the ratcheted stop
-        st.session_state.live_last_bar = snapshot.last_closed_time
-        return
+        # ---- a signal that fires while a trade is already open ----
+        #
+        # This is where most "the crossover happened and nothing entered"
+        # reports actually come from, and it is not a fault: the engine holds
+        # ONE position at a time, so every signal that fires between an entry
+        # and its exit is passed over. With a wide stop that can be hours and
+        # several crossovers. The rule applies identically to all 50 strategy
+        # profiles -- there is no per-strategy behaviour here.
+        #
+        # Two things were wrong about how it handled that. It said nothing, so
+        # the next flat poll reported a mysteriously old signal; and it offered
+        # no way to act on a genuine reversal without giving up a real stop by
+        # setting "Strategy Reverse Signal" as the stop TYPE.
+        fresh_sig = int(snapshot.recent_signal)
+        sig_time = snapshot.recent_signal_time
+        newer = (fresh_sig != 0 and sig_time is not None
+                 and pd.Timestamp(sig_time) > pd.Timestamp(position.signal_bar_time))
+        reverse_window = max(0, int(cfg.get("entry_lookback", DEFAULT_ENTRY_LOOKBACK)))
+        if (newer and cfg.get("reverse_on_opposite") and fresh_sig == -position.direction
+                and int(snapshot.recent_signal_bars_ago or 0) <= reverse_window):
+            side = "LONG" if position.direction > 0 else "SHORT"
+            square_off(f"Reversed on an opposite signal ({fmt_time(sig_time)})", snapshot.ltp)
+            entry_trace("Reversed out",
+                        f"An opposite signal closed the {side} position at {fmt(snapshot.ltp)}. "
+                        f"The new side is taken on this same poll.",
+                        when=sig_time, ago=snapshot.recent_signal_bars_ago, direction=fresh_sig)
+            position = None                  # fall through to the entry section below
+        else:
+            if newer:
+                st.session_state.live_last_signal_time = sig_time
+                entry_trace("Skipped — already in a trade",
+                            f"This {'LONG' if fresh_sig > 0 else 'SHORT'} signal fired while the "
+                            f"engine was already holding a "
+                            f"{'LONG' if position.direction > 0 else 'SHORT'} position opened on "
+                            f"{fmt_time(position.signal_bar_time)}. One position at a time is "
+                            f"the rule for every strategy. Tick 'Exit and reverse on an opposite "
+                            f"signal' in the sidebar to trade reversals instead of sitting "
+                            f"through them.",
+                            when=sig_time, ago=snapshot.recent_signal_bars_ago,
+                            direction=fresh_sig)
+            st.session_state.live_last_bar = snapshot.last_closed_time
+            return
 
     # ----------------------------------------------------- 2. fresh entries ---
     strat = get_strategy(cfg["strategy"])
@@ -4861,8 +4936,14 @@ def run_cycle(cfg: dict) -> None:
     if risk.daily_profit_target or risk.daily_loss_limit:
         booked = live_pnl_today()
         if risk.daily_profit_target and booked >= float(risk.daily_profit_target):
+            entry_trace("Blocked — daily profit target",
+                        f"Booked {fmt(booked)} today, which is at or past your daily target of "
+                        f"{fmt(risk.daily_profit_target)}. No further entries today.")
             return
         if risk.daily_loss_limit and booked <= -abs(float(risk.daily_loss_limit)):
+            entry_trace("Blocked — daily loss limit",
+                        f"Booked {fmt(booked)} today, which is at or past your daily loss limit "
+                        f"of {fmt(risk.daily_loss_limit)}. No further entries today.")
             return
 
     # -- the one source of truth for "something fired that we have not acted on"
@@ -4898,10 +4979,17 @@ def run_cycle(cfg: dict) -> None:
     first_cycle = bool(st.session_state.get("live_first_cycle"))
     if pending_dir == 0 or pending_time is None:
         st.session_state.live_first_cycle = False
+        entry_trace("Waiting — no signal",
+                    f"No candle in the loaded window carries a {cfg['strategy']} signal yet. "
+                    f"The newest closed candle is {fmt_time(snapshot.last_closed_time)}.")
         return
     if decided is not None and pd.Timestamp(pending_time) == pd.Timestamp(decided):
         st.session_state.live_first_cycle = False
-        return                              # this exact signal was already decided
+        entry_trace("Waiting — newest signal already handled",
+                    "The most recent signal in the window has already been acted on or ruled "
+                    "out. The engine is flat and waiting for the NEXT one.",
+                    when=pending_time, ago=pending_ago, direction=pending_dir)
+        return
 
     # -- how old a signal may be and still be worth taking
     #
@@ -4938,6 +5026,10 @@ def run_cycle(cfg: dict) -> None:
                   f"{max(0, window)} candle(s), so it is too old to take -- chasing it would "
                   f"buy a move that has already happened. Raise 'Enter on signals up to N "
                   f"candles old' in the sidebar if you want stale signals taken.", "warn")
+        entry_trace("Refused — older than the entry window",
+                    f"{ago} candles old against a window of {max(0, window)}. Raise "
+                    f"'Live: act on a signal up to N candles old' in the sidebar to take it.",
+                    when=pending_time, ago=ago, direction=pending_dir)
         return
 
     # -- liveness: hold, never discard
@@ -4958,6 +5050,10 @@ def run_cycle(cfg: dict) -> None:
                       f"ticks). The signal is NOT discarded -- it will be taken as soon as the "
                       f"tape proves it is live, or dropped once it ages past the entry window.",
                       "warn")
+        entry_trace("Held — waiting for proof the venue is open",
+                    "Candles are lagging and the quote has not been seen to move. The signal "
+                    "is kept, not discarded. Tick 'Live: allow entries on a frozen feed' to "
+                    "override.", when=pending_time, ago=ago, direction=pending_dir)
         return
     st.session_state.held_signal_polls = 0
 
@@ -4981,6 +5077,10 @@ def run_cycle(cfg: dict) -> None:
                       f"ago at {fmt(original_fill)}, but price has already reached its "
                       f"{done[1].lower()} at {fmt(snapshot.ltp)}. Not entering -- there is "
                       f"nothing left of that trade.", "warn")
+            entry_trace("Refused — the trade is already over",
+                        f"Signalled at {fmt(original_fill)}; price is now {fmt(snapshot.ltp)}, "
+                        f"which is past the {done[1].lower()} that signal implied.",
+                        when=pending_time, ago=ago, direction=pending_dir)
             return
 
     st.session_state.live_last_signal_time = pending_time
@@ -5007,6 +5107,8 @@ def run_cycle(cfg: dict) -> None:
                   "info")
 
     cfg["_ltp_at_fill"] = snapshot.ltp
+    entry_trace("ENTERED", f"Filled at {fmt(fill)} via {route}.",
+                when=pending_time, ago=ago, direction=pending_dir)
     _open_live_position(cfg, pending_dir, fill, closed_ctx, pending_time,
                         levels_from=levels_from, bars_ago=ago, route=route)
 
@@ -5275,6 +5377,15 @@ def render_sidebar() -> dict:
              "chasing. Past the first candle the N+1 open has gone, so the fill is the live "
              "price while the stop and target stay anchored to the original signal, and the "
              "trade row says so.")
+    reverse_on_opposite = sb.checkbox(
+        "Exit and reverse on an opposite signal", value=False, disabled=live,
+        key="cfg_reverse",
+        help="The engine holds ONE position at a time, for every strategy, so a signal that "
+             "fires while a trade is open is passed over — with a wide stop that can be several "
+             "crossovers. Tick this and an opposite signal closes the position and opens the new "
+             "side on the same poll, keeping your real stop and target rather than spending the "
+             "stop TYPE on 'Strategy Reverse Signal'. Whichever you choose, the Live tab's entry "
+             "decision log names every signal that was passed over and why.")
     square_off_on_stop = sb.checkbox(
         "Square off the open position when the engine stops", value=True, disabled=live,
         key="cfg_sq_stop",
@@ -5546,6 +5657,7 @@ def render_sidebar() -> dict:
             "allow_stale_entries": bool(allow_stale),
             "entry_lookback": int(entry_lookback), "square_off_eod": bool(square_off_eod),
             "enter_on_start": bool(enter_on_start), "join_window": int(join_window),
+            "reverse_on_opposite": bool(reverse_on_opposite),
             "square_off_on_stop": bool(square_off_on_stop),
             "candle_seconds": float(candle_seconds), "costs": costs,
             "walk_forward": bool(walk_fwd), "wf_folds": int(wf_folds),
@@ -6237,12 +6349,53 @@ def _live_body_inner() -> None:
     else:
         _searching_widget(cfg, snapshot)
     _strategy_status_panel(cfg, snapshot)
+    _entry_decision_log(cfg)
     _live_chart(cfg, snapshot)
     _recent_trades()
     _feed_diagnostics()
     _filter_panel(snapshot)
     _broker_panel()
     _event_feed()
+
+
+def _entry_decision_log(cfg: dict) -> None:
+    """
+    Every poll's entry verdict, newest first.
+
+    "The crossover happened and nothing entered" is unanswerable without this,
+    and it was asked three times before the app could answer it. The engine now
+    files a verdict on every poll -- entered, skipped because a position was
+    already open, refused as too old, held pending proof the venue is open --
+    so the question is settled by reading a line rather than by guessing.
+    """
+    trace = list(st.session_state.get("entry_trace") or [])
+    entered = sum(1 for r in trace if r["Verdict"] == "ENTERED")
+    skipped = sum(1 for r in trace if r["Verdict"].startswith("Skipped"))
+    refused = sum(1 for r in trace if r["Verdict"].startswith(("Refused", "Blocked")))
+    headline = (f"Why the engine did or did not enter — {entered} entered, "
+                f"{skipped} passed over while in a trade, {refused} refused")
+
+    with st.expander(headline, expanded=bool(skipped or refused) and not entered):
+        if not trace:
+            st.caption("No polls recorded yet.")
+            return
+        if skipped and not cfg.get("reverse_on_opposite"):
+            st.info(
+                f"**{skipped} signal(s) were passed over because a position was already open.** "
+                "The engine holds one position at a time and this is the same for all 50 "
+                "strategy profiles — it is not specific to the one you picked. If you want "
+                "reversals traded rather than sat through, tick **Exit and reverse on an "
+                "opposite signal** in the sidebar.")
+        frame = pd.DataFrame(trace)
+        order = [c for c in ["First seen", "Last seen", "Polls", "Verdict", "Side",
+                             "Signal bar", "Bars ago", "Why"] if c in frame.columns]
+        st.dataframe(frame[order].head(120), width="stretch", hide_index=True)
+        st.caption("One row per distinct verdict; `Polls` counts how many consecutive polls "
+                   "reached the same conclusion, so a quiet market stays one line.")
+        st.download_button("Download the decision log (CSV)",
+                           frame[order].to_csv(index=False).encode("utf-8"),
+                           f"entry_decisions_{pd.Timestamp.now():%Y%m%d_%H%M}.csv", "text/csv",
+                           key="dl_entry_trace")
 
 
 _LIVE_FRAGMENTS: dict[float, Callable] = {}
@@ -7297,7 +7450,7 @@ _FALLBACK_LISTS = {
 }
 
 
-def _fetch_nse_constituents(index_name: str, timeout: float = 20.0) -> list[str]:
+def _fetch_nse_constituents(index_name: str, timeout: float = 6.0) -> list[str]:
     """
     Download one index's constituent list from NSE.
 
@@ -7318,7 +7471,8 @@ def _fetch_nse_constituents(index_name: str, timeout: float = 20.0) -> list[str]
     }
     session = requests.Session()
     try:                                    # warm the cookie jar; NSE expects one
-        session.get("https://www.nseindia.com/", headers=headers, timeout=timeout)
+        session.get("https://www.nseindia.com/", headers=headers,
+                    timeout=min(timeout, 4.0))
     except Exception:                                               # noqa: BLE001
         pass
     resp = session.get(url, headers=headers, timeout=timeout)
@@ -7333,8 +7487,22 @@ def _fetch_nse_constituents(index_name: str, timeout: float = 20.0) -> list[str]
     return names
 
 
-def nse_constituents(index_name: str) -> tuple[list[str], str | None]:
-    """Cached constituent lookup. Returns ``(symbols, note)``; never raises."""
+def nse_constituents(index_name: str, force: bool = False) -> tuple[list[str], str | None]:
+    """
+    Constituent lookup, resolved AT MOST ONCE per session per index.
+
+    This used to be the slowest thing in the application and the reason the
+    screeners "took too long to list the tickers". NSE frequently refuses
+    datacentre traffic, so each lookup spent its full timeout twice -- once
+    warming a cookie, once on the CSV -- and then failed. Streamlit renders
+    every tab on every script run, so five tabs each resolved a universe on
+    every rerun, and a cache entry expiring mid-sweep stalled the whole app.
+
+    A result is now memoised in session state, INCLUDING a failure, so a
+    refusal costs one attempt rather than one per rerun. Refreshing is an
+    explicit act, which is also the honest arrangement: a constituent list that
+    silently refetches is a list nobody can reason about.
+    """
     def _load(name: str):
         try:
             return _fetch_nse_constituents(name), None
@@ -7343,12 +7511,35 @@ def nse_constituents(index_name: str) -> tuple[list[str], str | None]:
 
     if st is None:
         return _load(index_name)
-    if not hasattr(nse_constituents, "_impl"):
-        @st.cache_data(show_spinner=False, ttl=3600, max_entries=32)
-        def _impl(name: str):
-            return _load(name)
-        nse_constituents._impl = _impl
-    return nse_constituents._impl(index_name)
+    try:
+        store = st.session_state.setdefault("nse_lists", {})
+    except Exception:                                               # noqa: BLE001
+        return _load(index_name)
+    if force or index_name not in store:
+        store[index_name] = _load(index_name)
+        st.session_state["nse_lists_at"] = pd.Timestamp.now()
+    return store[index_name]
+
+
+def universe_tickers_ui(choice: str, custom_text: str, uploaded, prefix: str):
+    """
+    Resolve a universe for a tab, and give the operator the controls that go
+    with it: where the list came from and a way to refresh it on purpose.
+    """
+    tickers, note = _universe_tickers(choice, custom_text, uploaded)
+    if choice not in NSE_INDEX_CSV:
+        return tickers, note
+    left, right = st.columns([4, 1])
+    fetched = st.session_state.get("nse_lists_at")
+    left.caption(f"{len(tickers)} constituents"
+                 + (f", read from NSE at {fmt_time(fetched)}." if fetched is not None else "."))
+    if right.button("Refresh list", key=f"{prefix}_refresh_universe", width="stretch",
+                    help="Re-reads the constituent list from NSE. It is not re-read "
+                         "automatically: a lookup that silently retries on every refresh, in "
+                         "every tab, is what made these tabs slow to load."):
+        nse_constituents(choice, force=True)
+        st.rerun()
+    return tickers, note
 
 
 def _universe_tickers(choice: str, custom_text: str, uploaded) -> tuple[list[str], str | None]:
@@ -7949,7 +8140,7 @@ def tab_screener(cfg: dict) -> None:
     scan_timeframes = overrides.get("timeframes") or [cfg["interval"]]
     scan_strategies = overrides.get("strategies") or [cfg["strategy"]]
 
-    tickers, note = _universe_tickers(universe, custom_text, uploaded)
+    tickers, note = universe_tickers_ui(universe, custom_text, uploaded, "scr")
     tickers = tickers[:int(max_names)]
     if note:
         st.warning(f"{note} Index membership is reviewed periodically and this list is baked "
@@ -9287,7 +9478,7 @@ def tab_patterns(cfg: dict) -> None:
     custom_text, uploaded = "", None
     if universe.startswith("Custom"):
         custom_text = c1.text_area("Tickers", "RELIANCE\nTCS\nINFY", key="pat_custom")
-    all_tickers, note = _universe_tickers(universe, custom_text, uploaded)
+    all_tickers, note = universe_tickers_ui(universe, custom_text, uploaded, "pat")
 
     symbols = c1.multiselect("Symbols", all_tickers, default=all_tickers, key="pat_symbols")
     families = c2.multiselect("Pattern families", PATTERN_FAMILIES, default=PATTERN_FAMILIES,
@@ -9687,7 +9878,7 @@ def tab_signal_lab(cfg: dict) -> None:
     custom_text = ""
     if universe.startswith("Custom"):
         custom_text = st.text_area("Tickers", "RELIANCE\nTCS\nINFY", key="lab_custom")
-    tickers, note = _universe_tickers(universe, custom_text, None)
+    tickers, note = universe_tickers_ui(universe, custom_text, None, "lab")
 
     d1, d2, d3 = st.columns(3)
     # Keyed by universe: a Streamlit widget keeps its value once created, so a
@@ -10139,7 +10330,7 @@ def tab_auto_screener(cfg: dict) -> None:
     custom_text = ""
     if universe.startswith("Custom"):
         custom_text = st.text_area("Tickers", "BTC-USD\nRELIANCE", key="auto_custom")
-    all_tickers, note = _universe_tickers(universe, custom_text, None)
+    all_tickers, note = universe_tickers_ui(universe, custom_text, None, "auto")
     chosen = st.multiselect(f"Tickers ({len(all_tickers)} in {universe})", all_tickers,
                             default=all_tickers, key=f"auto_tickers_{universe}",
                             help="Defaults to the whole universe. Remove names to cut the "
@@ -10708,6 +10899,254 @@ def gamma_blast_scan_one(ticker: str, interval: str, gcfg: dict, params: dict,
     }
 
 
+# Open-interest series colours. Two categorical hues, validated for the
+# lightness band, chroma floor, CVD separation (protan dE 26.0, tritan 25.9),
+# normal-vision separation and 3:1 contrast against BOTH the dark and light
+# chart surfaces. They are also direct-labelled below, so identity never rests
+# on colour alone.
+_OI_CE, _OI_PE = "#3d87e8", "#cc7a33"
+
+
+def numbers_minutes(times: list) -> float:
+    """Minutes spanned by a list of snapshot timestamps."""
+    if len(times) < 2:
+        return 0.0
+    return float((pd.Timestamp(times[-1]) - pd.Timestamp(times[0])).total_seconds() / 60.0)
+
+
+def gamma_blast_detail(ticker: str, interval: str, gcfg: dict, strike: float,
+                       light: bool = False):
+    """
+    The evidence behind one candidate, as three stacked panels.
+
+    Price, volume and open interest are three different scales, so they get
+    three panels sharing one time axis rather than two y-axes on one plot. A
+    dual-axis chart lets the author slide one series against the other until
+    they appear to agree, which is precisely the claim being tested here --
+    whether price, volume and OI are actually moving together.
+
+    Returns ``(figure, numbers)`` where ``numbers`` holds the absolute values
+    behind every panel, because "volume is up 1.8x" is not checkable and
+    "412,300 against a 20-candle average of 229,100" is.
+    """
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    period, _ = lab_period_for(interval, WARMUP_BARS + 40)
+    frame = load_market_data(ticker, period, interval,
+                             freshness_seconds=120, min_bars=30).frame
+    tail = frame.tail(int(gcfg.get("chart_bars", 160)))
+    look = int(gcfg.get("level_lookback", 60))
+    vol_len = int(gcfg.get("vol_len", 20))
+
+    resistance = float(frame["High"].iloc[-(look + 1):-1].max())
+    support = float(frame["Low"].iloc[-(look + 1):-1].min())
+    vol_avg = sma(frame["Volume"], vol_len)
+    has_volume = float(frame["Volume"].tail(100).abs().sum()) > 0
+
+    snaps = ((st.session_state.get("oi_snapshots") or {}) if st is not None else {}).get(ticker) or []
+    times = [pd.Timestamp(s["at"]) for s in snaps]
+    ce_series = [float((s["chain"].get(strike) or {}).get("ce_oi", float("nan")))
+                 for s in snaps]
+    pe_series = [float((s["chain"].get(strike) or {}).get("pe_oi", float("nan")))
+                 for s in snaps]
+    has_oi = bool(snaps) and any(np.isfinite(v) for v in ce_series + pe_series)
+
+    rows = 3 if has_oi else 2
+    heights = [0.56, 0.22, 0.22] if has_oi else [0.72, 0.28]
+    titles = ["Price", f"Volume (bars) and {vol_len}-candle average (line)"]
+    if has_oi:
+        titles.append(f"Open interest at strike {fmt(strike, 0)} — CE and PE, contracts")
+    fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=0.075,
+                        row_heights=heights, subplot_titles=titles)
+    # Left-align the panel titles to match the rest of the application, and to
+    # stop them colliding with the level annotations in the middle of the plot.
+    for note in fig.layout.annotations:
+        note.update(x=0, xanchor="left", font=dict(size=12))
+
+    fig.add_trace(go.Candlestick(
+        x=tail.index, open=tail["Open"], high=tail["High"], low=tail["Low"],
+        close=tail["Close"], name="Price",
+        increasing_line_color=_UP, decreasing_line_color=_DOWN,
+        increasing_fillcolor=_UP, decreasing_fillcolor=_DOWN,
+        line=dict(width=1), showlegend=False), row=1, col=1)
+    for level, label, colour in ((resistance, "Resistance", _DOWN), (support, "Support", _UP)):
+        fig.add_hline(y=level, line=dict(width=1.2, dash="dot", color=colour),
+                      annotation_text=f"{label} {fmt(level)}",
+                      annotation_position="top left", row=1, col=1)
+    if np.isfinite(strike):
+        fig.add_hline(y=strike, line=dict(width=1, dash="dash", color="#8d99ae"),
+                      annotation_text=f"Strike {fmt(strike, 0)}",
+                      annotation_position="bottom right", row=1, col=1)
+
+    if has_volume:
+        rising = tail["Close"].to_numpy() >= tail["Open"].to_numpy()
+        fig.add_trace(go.Bar(x=tail.index, y=tail["Volume"], name="Volume",
+                             marker=dict(color=np.where(rising, _UP, _DOWN),
+                                         line=dict(width=0)),
+                             opacity=0.55, showlegend=False,
+                             hovertemplate="%{x}<br>Volume %{y:,.0f}<extra></extra>"),
+                      row=2, col=1)
+        fig.add_trace(go.Scatter(x=tail.index, y=vol_avg.reindex(tail.index),
+                                 name=f"{vol_len}-candle average", mode="lines",
+                                 line=dict(width=2, color="#e9c46a"), showlegend=False,
+                                 hovertemplate="%{x}<br>Average %{y:,.0f}<extra></extra>"),
+                      row=2, col=1)
+    else:
+        fig.add_annotation(text="This instrument reports no volume on Yahoo",
+                           xref="x domain", yref="y2 domain", x=0.5, y=0.5,
+                           showarrow=False, row=2, col=1)
+
+    if has_oi:
+        for values, label, colour in ((ce_series, "CE OI", _OI_CE),
+                                      (pe_series, "PE OI", _OI_PE)):
+            fig.add_trace(go.Scatter(
+                x=times, y=values, name=label, mode="lines+markers",
+                line=dict(width=2, color=colour), marker=dict(size=8, color=colour),
+                hovertemplate="%{x}<br>" + label + " %{y:,.0f}<extra></extra>"),
+                row=3, col=1)
+            if len(times):
+                fig.add_annotation(x=times[-1], y=values[-1], text=f" {label}",
+                                   showarrow=False, xanchor="left",
+                                   font=dict(size=11), row=3, col=1)
+
+    # The window open interest was actually observed over, marked on the price
+    # and volume panels too. Without it the OI panel covers an hour while the
+    # others cover two days, and the eye compares a rising price across the
+    # whole chart against an OI fall that only happened at the very end. The
+    # question is whether they moved together IN THE SAME WINDOW, so the window
+    # is drawn on all three.
+    if has_oi and len(times) > 1:
+        for r in (1, 2):
+            fig.add_vrect(x0=times[0], x1=times[-1], row=r, col=1,
+                          fillcolor="rgba(128,128,128,0.16)", line_width=0, layer="below")
+        fig.add_annotation(x=times[0], y=1, yref="y domain", xanchor="left", yanchor="bottom",
+                           text=f"open interest observed here ({fmt(numbers_minutes(times), 0)}"
+                                f" min)", showarrow=False, font=dict(size=10), row=1, col=1)
+
+    fig.update_layout(
+        height=760 if has_oi else 620, margin=dict(l=62, r=92, t=54, b=44),
+        hovermode="x unified", dragmode="pan", bargap=0.15,
+        legend=dict(orientation="h", yanchor="bottom", y=1.03, xanchor="right", x=1),
+        template="plotly_white" if light else None,
+        title=dict(text=f"{ticker} · {interval} · last {len(tail)} candles",
+                   x=0.01, xanchor="left", font=dict(size=15)))
+    fig.update_xaxes(rangeslider_visible=False, showgrid=False)
+    fig.update_yaxes(showgrid=True, gridcolor="rgba(128,128,128,0.15)")
+    if not (ticker.endswith("-USD") or ticker.endswith("=X")):
+        fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
+
+    last_vol = float(tail["Volume"].iloc[-1]) if has_volume else float("nan")
+    avg_vol = float(vol_avg.iloc[-1]) if has_volume else float("nan")
+    numbers = {
+        "price": float(tail["Close"].iloc[-1]),
+        "prev_price": float(tail["Close"].iloc[-2]) if len(tail) > 1 else float("nan"),
+        "resistance": resistance, "support": support, "strike": strike,
+        "volume": last_vol, "avg_volume": avg_vol, "vol_len": vol_len,
+        "vol_multiple": (last_vol / avg_vol) if (has_volume and avg_vol) else float("nan"),
+        "has_volume": has_volume, "snapshots": len(snaps),
+        "ce_oi": ce_series[-1] if ce_series else float("nan"),
+        "pe_oi": pe_series[-1] if pe_series else float("nan"),
+        "ce_oi_change": (ce_series[-1] - ce_series[0]) if len(ce_series) > 1 else float("nan"),
+        "pe_oi_change": (pe_series[-1] - pe_series[0]) if len(pe_series) > 1 else float("nan"),
+        "minutes": ((times[-1] - times[0]).total_seconds() / 60.0) if len(times) > 1 else 0.0,
+    }
+    return fig, numbers
+
+
+def oi_verdict(numbers: dict, side: str) -> tuple[str, str]:
+    """
+    Name what the three series are doing together, or say it cannot be told.
+
+    Short covering and long unwinding both show OI FALLING; what separates them
+    is which way price is going and which leg is being closed. Guessing between
+    them from OI alone is the mistake this spells out.
+    """
+    price_up = numbers["price"] > numbers.get("prev_price", numbers["price"])
+    vol_up = (np.isfinite(numbers["vol_multiple"]) and numbers["vol_multiple"] >= 1.0)
+    bullish = side.startswith("BULL")
+    change = numbers["ce_oi_change"] if bullish else numbers["pe_oi_change"]
+
+    if numbers["snapshots"] < 2 or not np.isfinite(change):
+        return ("Not measurable yet",
+                f"Open-interest CHANGE needs two chain snapshots; {numbers['snapshots']} held. "
+                "Run the scan again in a few minutes with the Dhan chain fetch ticked and this "
+                "panel fills in. No source publishes OI history, so it can only be measured "
+                "from when this app starts watching.")
+    leg = "CE" if bullish else "PE"
+    if change < 0 and price_up and vol_up and bullish:
+        return ("Short covering", f"{leg} open interest is DOWN {fmt(abs(change), 0)} contracts "
+                                  f"while price rises on above-average volume: call writers are "
+                                  f"buying back, which is the fuel a gamma move runs on.")
+    if change < 0 and not price_up and vol_up and not bullish:
+        return ("Short covering (puts)", f"{leg} open interest is DOWN {fmt(abs(change), 0)} "
+                                         f"while price falls on above-average volume: put "
+                                         f"writers are closing.")
+    if change < 0 and not price_up and bullish:
+        return ("Long unwinding", f"{leg} open interest is DOWN {fmt(abs(change), 0)} but price "
+                                  f"is FALLING. Falling OI with falling price is call holders "
+                                  f"leaving, not writers being squeezed — the opposite setup.")
+    if change > 0 and price_up:
+        return ("Fresh longs / writing", f"{leg} open interest is UP {fmt(change, 0)}: positions "
+                                         f"are being ADDED, not closed. That is not covering.")
+    return ("No clear signature", f"{leg} OI change {fmt(change, 0)} over "
+                                  f"{fmt(numbers['minutes'], 0)} minutes with price "
+                                  f"{'up' if price_up else 'down'} and volume "
+                                  f"{fmt(numbers['vol_multiple'])}x average. The three do not "
+                                  f"line up into either pattern.")
+
+
+def _gamma_detail_panel(table: pd.DataFrame, interval: str, gcfg: dict, cfg: dict) -> None:
+    """Per-candidate evidence: the three panels plus the absolute numbers."""
+    st.markdown("#### Inspect a candidate")
+    c1, c2, c3 = st.columns([2, 1, 1])
+    names = table["Ticker"].tolist()
+    chosen = c1.selectbox("Ticker", names, key="gb_detail_pick")
+    bars = c2.number_input("Candles to plot", 40, 600, 160, 20, key="gb_detail_bars")
+    show = c3.checkbox("Show the chart", value=False, key="gb_detail_show",
+                       help="Off by default: drawing a chart costs a data fetch per ticker, "
+                            "and the scan should not pay for one you have not asked to see.")
+    if not show:
+        return
+
+    row = table[table["Ticker"] == chosen].iloc[0].to_dict()
+    strike = float(row.get("Strike") or float("nan"))
+    try:
+        fig, nums = gamma_blast_detail(chosen, interval, dict(gcfg, chart_bars=int(bars)),
+                                       strike, light=bool(cfg.get("light_charts")))
+    except Exception as exc:                                        # noqa: BLE001
+        st.error(f"Could not draw `{chosen}`: {exc}")
+        return
+
+    verdict, explanation = oi_verdict(nums, str(row.get("Side", "")))
+    (st.success if verdict.startswith("Short covering") else
+     st.warning if verdict in ("Long unwinding", "Fresh longs / writing") else st.info)(
+        f"**{verdict}.** {explanation}")
+
+    # Absolute numbers, because a multiple is not checkable and a count is.
+    a, b, c, d = st.columns(4)
+    a.metric("Last price", fmt(nums["price"]),
+             f"{fmt(nums['price'] - nums['prev_price'])} vs previous candle")
+    b.metric("Candle volume", fmt(nums["volume"], 0),
+             None if not nums["has_volume"] else f"{fmt(nums['vol_multiple'])}x average")
+    c.metric(f"Average volume ({nums['vol_len']} candles)", fmt(nums["avg_volume"], 0))
+    d.metric("Strike", fmt(nums["strike"], 0),
+             f"level {fmt(row.get('Level'))}")
+
+    e, f, g, h = st.columns(4)
+    e.metric("CE open interest", fmt(nums["ce_oi"], 0))
+    f.metric("CE OI change", fmt(nums["ce_oi_change"], 0),
+             f"over {fmt(nums['minutes'], 0)} min" if nums["snapshots"] > 1 else "needs 2 samples")
+    g.metric("PE open interest", fmt(nums["pe_oi"], 0))
+    h.metric("PE OI change", fmt(nums["pe_oi_change"], 0),
+             f"over {fmt(nums['minutes'], 0)} min" if nums["snapshots"] > 1 else "needs 2 samples")
+
+    st.plotly_chart(fig, width="stretch", config={"scrollZoom": True})
+    st.caption("Three panels on one time axis rather than two y-axes on one plot: price, "
+               "volume and open interest are different scales, and overlaying them lets any "
+               "two be slid into apparent agreement — which is the exact claim being tested.")
+
+
 def tab_gamma_blast(cfg: dict) -> None:
     st.subheader("Gamma Blast Screener")
     st.caption("Spot pressing a level, participation rising, price leaning the right way, and "
@@ -10727,7 +11166,7 @@ def tab_gamma_blast(cfg: dict) -> None:
     custom_text = ""
     if universe.startswith("Custom"):
         custom_text = st.text_area("Tickers", "RELIANCE\nTATAMOTORS\n^NSEI", key="gb_custom")
-    all_tickers, note = _universe_tickers(universe, custom_text, None)
+    all_tickers, note = universe_tickers_ui(universe, custom_text, None, "gb")
     chosen = st.multiselect(f"Tickers ({len(all_tickers)} in {universe})", all_tickers,
                             default=all_tickers, key=f"gb_tickers_{universe}")
     if note:
@@ -10869,6 +11308,7 @@ def tab_gamma_blast(cfg: dict) -> None:
                                   ascending=[c == "Distance %" for c in sort_cols])[order],
                 width="stretch", hide_index=True)
         if not table.empty:
+            _gamma_detail_panel(table, interval, gcfg, cfg)
             st.download_button("Download candidates (CSV)",
                                table[order].to_csv(index=False).encode(),
                                f"gamma_blast_{pd.Timestamp.now():%Y%m%d_%H%M}.csv", "text/csv")
@@ -11355,11 +11795,16 @@ def _test_live_entry_and_gates():
 
 
 def _reset_constituent_cache() -> None:
-    """Drop both the wrapper and Streamlit's own cache for the constituent lookup."""
+    """Drop every layer that could serve a stale constituent list."""
     nse_constituents.__dict__.pop("_impl", None)
     if st is not None:
         try:
             st.cache_data.clear()
+        except Exception:                                           # noqa: BLE001
+            pass
+        try:                    # the per-session memo added to stop repeat lookups
+            st.session_state.pop("nse_lists", None)
+            st.session_state.pop("nse_lists_at", None)
         except Exception:                                           # noqa: BLE001
             pass
 
@@ -12802,6 +13247,179 @@ def _test_live_entry_is_not_poll_dependent():
         globals().update(saved)
 
 
+def _test_every_signal_gets_a_recorded_verdict():
+    """
+    Across a whole simulated session, no signal may be passed over in silence,
+    and with reversing enabled none may be passed over at all.
+
+    THE BUG THIS EXISTS FOR. After the entry path was made poll-independent,
+    crossovers were STILL not being traded, and a 600-bar simulation showed why:
+    24 of 29 were skipped because a position was already open, with nothing
+    written down anywhere. The engine was behaving correctly and reporting
+    nothing, which is indistinguishable from being broken. This asserts both
+    halves of the remedy -- every poll files a verdict, and reversing turns
+    those skips into trades.
+    """
+    real_st = globals()["st"]
+    fake = _FakeStreamlit()
+    globals()["st"] = fake
+    saved = {name: globals()[name] for name in
+             ("refresh_candles", "fetch_live_ltp", "db_save_position", "send_email",
+              "_maybe_route_broker")}
+    try:
+        n = 900
+        idx = pd.date_range(end=pd.Timestamp.now(tz="Asia/Kolkata").floor("5min"),
+                            periods=n, freq="5min", tz="Asia/Kolkata")
+        rng = np.random.default_rng(42)
+        close = 24000 + np.cumsum(rng.normal(0, 6, n))
+        raw = pd.DataFrame({"Open": close + rng.normal(0, 2, n),
+                            "High": close + np.abs(rng.normal(9, 3, n)),
+                            "Low": close - np.abs(rng.normal(9, 3, n)),
+                            "Close": close,
+                            "Volume": rng.integers(1000, 5000, n).astype(float)}, index=idx)
+        raw["High"] = raw[["Open", "High", "Close"]].max(axis=1)
+        raw["Low"] = raw[["Open", "Low", "Close"]].min(axis=1)
+
+        name = "01 · Dual EMA Crossover"
+        params = dict(DEFAULT_PARAMS, ema_fast=9, ema_slow=21)
+        full, _ = prepare(raw, name, params)
+        fired = [i for i, v in enumerate(full["signal"].to_numpy()) if v != 0]
+        assert len(fired) > 10, "the fixture needs plenty of crossovers"
+
+        served = {"upto": 0, "t": 0.0}
+        globals()["refresh_candles"] = lambda c: (full.iloc[:served["upto"]].copy(), [], [], None)
+
+        def _ltp(c, f):
+            served["t"] += 1
+            return float(f["Close"].iloc[-1]) + (served["t"] % 7) * 0.1, "stub"
+        globals()["fetch_live_ltp"] = _ltp
+        for stub in ("db_save_position", "send_email", "_maybe_route_broker"):
+            globals()[stub] = lambda *a, **k: None
+
+        def walk(reverse: bool) -> dict:
+            cfg = {"symbol": "^NSEI", "interval": "5m", "strategy": name, "params": params,
+                   "risk": RiskConfig("Fixed Points", 40.0, "Fixed Points", 80.0, 1.0),
+                   "poll_seconds": 5, "candle_seconds": 15.0, "quantity": 1.0,
+                   "filter_cfg": default_filter_config(), "filter_extras": {}, "broker": {},
+                   "entry_lookback": DEFAULT_ENTRY_LOOKBACK, "join_window": 3,
+                   "enter_on_start": True, "reverse_on_opposite": reverse}
+            fake.session_state.clear()
+            fake.session_state.update({
+                "live_running": True, "live_position": None, "live_trades": [],
+                "live_events": [], "live_last_bar": None, "live_last_signal_time": None,
+                "live_snapshot": None, "live_error": None, "live_poll_count": 0,
+                "live_frame": None, "live_frame_at": 0.0, "candle_refreshes": 0,
+                "feed_log": [], "last_seen_ltp": None, "last_ltp_change_ts": 0.0,
+                "live_fail_streak": 0, "live_backoff_until": 0.0, "live_first_cycle": True,
+                "suspect_ticks": 0, "live_reports": [], "live_frame_warnings": [],
+                "live_vix": None, "order_book": None, "live_config": cfg,
+                "last_closed_bar": None, "held_signal_polls": 0, "entry_trace": [],
+                "newest_bar_seen": None, "newest_bar_advanced_ts": 0.0,
+                "bars_added_last_refresh": 0,
+            })
+            start = n - 400
+            for upto in range(start, n):
+                served["upto"] = upto
+                for _ in range(3):
+                    fake.session_state["live_frame_at"] = 0.0
+                    run_cycle(cfg)
+            tally: dict[str, int] = {}
+            for row in fake.session_state.get("entry_trace", []):
+                key = row["Verdict"].split(" —")[0]
+                tally[key] = tally.get(key, 0) + 1
+            visible = sum(1 for i in fired if start <= i < n - 1)
+            return {"tally": tally, "visible": visible}
+
+        plain = walk(reverse=False)
+        assert plain["visible"] > 5, "the walk must see several crossovers"
+        # Every signal that did not become a trade has a written reason.
+        accounted = sum(plain["tally"].get(k, 0)
+                        for k in ("ENTERED", "Skipped", "Refused", "Held", "Blocked"))
+        assert accounted >= plain["visible"], (
+            f"only {accounted} verdicts recorded for {plain['visible']} visible signals -- "
+            f"a signal passed over in silence is the bug this test exists for: {plain['tally']}")
+        assert plain["tally"].get("Skipped", 0) > 0, \
+            "with a wide stop some crossovers MUST land inside an open trade, and be recorded"
+
+        reversed_run = walk(reverse=True)
+        assert reversed_run["tally"].get("Skipped", 0) == 0, (
+            "with reversing on, no signal may be passed over: "
+            f"{reversed_run['tally']}")
+        took = (reversed_run["tally"].get("ENTERED", 0)
+                + reversed_run["tally"].get("Reversed out", 0))
+        assert took >= reversed_run["visible"], (
+            f"reversing must act on every visible crossover: {took} acted on vs "
+            f"{reversed_run['visible']} visible")
+        print(f"   entry verdicts: {plain['visible']} signals all accounted for; reversing "
+              f"turned {plain['tally'].get('Skipped', 0)} skips into trades  OK")
+    finally:
+        globals()["st"] = real_st
+        globals().update(saved)
+
+
+def _test_gamma_blast_detail_chart():
+    """
+    The evidence panel must draw, carry ABSOLUTE numbers, and separate short
+    covering from long unwinding rather than calling any OI fall "covering".
+    """
+    real_st = globals()["st"]
+    fake = _FakeStreamlit()
+    globals()["st"] = fake
+    saved = {"load_market_data": globals()["load_market_data"]}
+    try:
+        n = 220
+        idx = pd.date_range(end=pd.Timestamp("2026-09-29 15:15", tz="Asia/Kolkata"),
+                            periods=n, freq="15min", tz="Asia/Kolkata")
+        rng = np.random.default_rng(5)
+        close = 1000 + np.cumsum(rng.normal(0, 2, n))
+        raw = pd.DataFrame({"Open": close, "High": close + 3, "Low": close - 3,
+                            "Close": close,
+                            "Volume": rng.integers(5000, 9000, n).astype(float)}, index=idx)
+        globals()["load_market_data"] = lambda *a, **k: DataBundle(
+            frame=raw.copy(), symbol="RELIANCE.NS", interval="15m", period="60d")
+
+        strike = 1000.0
+        fake.session_state["oi_snapshots"] = {"RELIANCE.NS": [
+            {"at": pd.Timestamp("2026-09-29 14:00"),
+             "chain": {strike: {"ce_oi": 500000.0, "pe_oi": 300000.0,
+                                "ce_volume": 1.0, "pe_volume": 1.0}}},
+            {"at": pd.Timestamp("2026-09-29 15:00"),
+             "chain": {strike: {"ce_oi": 410000.0, "pe_oi": 320000.0,
+                                "ce_volume": 1.0, "pe_volume": 1.0}}},
+        ]}
+        gcfg = {"level_lookback": 60, "vol_len": 20, "chart_bars": 120}
+        fig, nums = gamma_blast_detail("RELIANCE.NS", "15m", gcfg, strike)
+
+        assert len(fig.data) >= 4, "price, volume, volume average and two OI lines are expected"
+        # Three panels, never two y-scales on one plot.
+        axes = {getattr(tr, "yaxis", "y") or "y" for tr in fig.data}
+        assert len(axes) == 3, f"the three measures must sit on three panels, got {axes}"
+
+        assert nums["ce_oi"] == 410000.0 and nums["ce_oi_change"] == -90000.0, \
+            "open interest must be reported as absolute contract counts, not multiples"
+        assert nums["avg_volume"] > 0 and nums["volume"] > 0, \
+            "volume and its average must both be absolute numbers"
+        assert abs(nums["vol_multiple"] - nums["volume"] / nums["avg_volume"]) < 1e-9
+
+        # Short covering: CE OI down, price up, volume at or above average.
+        up = dict(nums, price=1010.0, prev_price=1000.0, vol_multiple=1.8)
+        verdict, _ = oi_verdict(up, "BULLISH (CE)")
+        assert verdict == "Short covering", verdict
+        # The same OI fall with price going the other way is NOT covering.
+        down = dict(nums, price=990.0, prev_price=1000.0, vol_multiple=1.8)
+        verdict2, _ = oi_verdict(down, "BULLISH (CE)")
+        assert verdict2 == "Long unwinding", verdict2
+        # And with one snapshot it must refuse to guess.
+        thin = dict(nums, snapshots=1, ce_oi_change=float("nan"))
+        verdict3, _ = oi_verdict(thin, "BULLISH (CE)")
+        assert verdict3 == "Not measurable yet", verdict3
+        print("   gamma blast detail: 3 panels not 2 axes, absolute OI/volume, covering "
+              "distinguished from unwinding  OK")
+    finally:
+        globals()["st"] = real_st
+        globals().update(saved)
+
+
 def _test_gamma_blast_always_explains_itself():
     """
     A screener that answers "0" without saying why is indistinguishable from a
@@ -13176,7 +13794,9 @@ def run_selftest() -> int:
         _test_target_rows_are_reachable()
         _test_batched_candle_arrival()
         _test_live_entry_is_not_poll_dependent()
+        _test_every_signal_gets_a_recorded_verdict()
         _test_gamma_blast_always_explains_itself()
+        _test_gamma_blast_detail_chart()
         _test_sweep_progress_is_visible_and_rerun_is_deferred()
         print("-- filters --")
         _test_filters()
