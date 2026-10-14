@@ -72,14 +72,43 @@ FILTER_DEFAULTS = {
 # ════════════════════════════════════════════════════════════════════════════
 _HERE = os.path.dirname(os.path.abspath(__file__))
 BASE_FILE = os.environ.get("ALGO_BASE_FILE", os.path.join(_HERE, "algo_trading.py"))
+_BASE_MARKERS = ("class DhanBrokerIntegration", "def render_config_ui", "def live_trading_iteration")
+
+
+def _find_base_file():
+    """Use algo_trading.py if present; otherwise auto-detect the original trading file
+    (any .py in this folder or its sub-folders that contains the original app's code)."""
+    if os.path.exists(BASE_FILE):
+        return BASE_FILE
+    me = os.path.abspath(__file__)
+    for root, dirs, files in os.walk(_HERE):
+        dirs[:] = [d for d in dirs if not d.startswith((".", "__")) and d not in ("venv", ".venv", "site-packages")]
+        for fn in sorted(files):
+            path = os.path.abspath(os.path.join(root, fn))
+            if not fn.endswith(".py") or path == me:
+                continue
+            try:
+                with open(path, encoding="utf-8", errors="ignore") as fh:
+                    text = fh.read()
+            except Exception:
+                continue
+            if all(m in text for m in _BASE_MARKERS) and "algo_trading_plus" not in fn:
+                return path
+    return None
 
 
 def _load_base():
-    if not os.path.exists(BASE_FILE):
-        raise FileNotFoundError(
-            f"Original trading file not found at {BASE_FILE}. Save your original code as "
-            f"'algo_trading.py' next to this file, or set ALGO_BASE_FILE.")
-    spec = importlib.util.spec_from_file_location("algo_base", BASE_FILE)
+    path = _find_base_file()
+    if path is None:
+        st.set_page_config(page_title="Algo Trading PLUS", layout="wide")
+        here = sorted(f for f in os.listdir(_HERE) if f.endswith(".py"))
+        st.error(
+            "**Original trading code not found.**\n\n"
+            "Add your original code to this repo as **`algo_trading.py`** (same folder as "
+            "`algo_trading_plus.py`) and set the Streamlit Cloud *Main file path* to "
+            f"`algo_trading_plus.py`.\n\nPython files found here: {', '.join(here) or 'none'}")
+        st.stop()
+    spec = importlib.util.spec_from_file_location("algo_base", path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
