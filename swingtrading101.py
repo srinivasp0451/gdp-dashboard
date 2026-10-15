@@ -3972,13 +3972,39 @@ def _equity_curve(trades: pd.DataFrame, index: pd.Index) -> pd.Series:
     return curve.cumsum()
 
 
+def _risk_shape(avg_win: float, avg_loss: float, win_rate: float,
+                net_pnl: float, max_dd: float) -> dict:
+    """
+    The shape of an edge, as opposed to its size.
+
+    Two systems can both show "+5,000 net, 88% win rate" while one is robust
+    and the other is a coin-flip away from bleeding. What separates them is the
+    size of a win against the size of a loss, and how much of the equity curve
+    had to be given back on the way. These four numbers say which one you have.
+    """
+    loss = abs(float(avg_loss))
+    win = abs(float(avg_win))
+    reward_risk = (win / loss) if loss > 0 else float("inf")
+    # The win rate this reward:risk NEEDS in order to break even.
+    breakeven = (loss / (win + loss) * 100.0) if (win + loss) > 0 else 0.0
+    dd = abs(float(max_dd))
+    return {
+        "reward_risk": round(reward_risk, 3) if np.isfinite(reward_risk) else float("inf"),
+        "breakeven_win_rate": round(breakeven, 2),
+        "win_rate_margin": round(float(win_rate) - breakeven, 2),
+        "return_over_dd": round(float(net_pnl) / dd, 2) if dd > 0 else float("inf"),
+    }
+
+
 def _statistics(trades: pd.DataFrame, equity: pd.Series, risk: RiskConfig) -> dict:
     if trades.empty:
         return {"total_trades": 0, "wins": 0, "losses": 0, "win_rate": 0.0, "gross_points": 0.0,
                 "net_pnl": 0.0, "profit_factor": 0.0, "avg_win": 0.0, "avg_loss": 0.0,
                 "expectancy": 0.0, "max_drawdown": 0.0, "best_trade": 0.0, "worst_trade": 0.0,
                 "longs": 0, "shorts": 0, "avg_bars": 0.0, "sharpe": 0.0,
-                "trades_per_year": 0.0, "total_costs": 0.0, "gross_pnl": 0.0}
+                "trades_per_year": 0.0, "total_costs": 0.0, "gross_pnl": 0.0,
+                "reward_risk": 0.0, "breakeven_win_rate": 0.0, "win_rate_margin": 0.0,
+                "return_over_dd": 0.0}
     pnl = trades["PnL"]
     wins, losses = pnl[pnl > 0], pnl[pnl <= 0]
     gross_win, gross_loss = float(wins.sum()), float(-losses.sum())
@@ -4011,6 +4037,28 @@ def _statistics(trades: pd.DataFrame, equity: pd.Series, risk: RiskConfig) -> di
         "avg_loss": round(float(losses.mean()), 2) if len(losses) else 0.0,
         "expectancy": round(float(pnl.mean()), 2),
         "max_drawdown": round(float(dd.min()), 2),
+        # ---- the three numbers that expose a fragile edge ----
+        #
+        # Net PnL and win rate can both look excellent while the system is one
+        # bad week from giving everything back. These say how.
+        #
+        # reward_risk      average win divided by average loss. Below 1 the
+        #                  system is paying more for a mistake than it earns
+        #                  for being right, which is survivable only on a very
+        #                  high win rate.
+        # breakeven_win_rate  the win rate that exact reward:risk REQUIRES just
+        #                  to break even. It is the honest reading of "is this
+        #                  win rate good" -- 85% is superb at 1:1 and a losing
+        #                  system at 1:10.
+        # win_rate_margin  how much headroom there is between the two. A margin
+        #                  of 1.5 points means a slightly worse month turns a
+        #                  winner into a loser; it is the single best measure
+        #                  of how fragile an edge is.
+        # return_over_dd   net profit per unit of worst peak-to-trough pain.
+        **_risk_shape(float(wins.mean()) if len(wins) else 0.0,
+                      float(losses.mean()) if len(losses) else 0.0,
+                      len(wins) / len(trades) * 100.0,
+                      float(pnl.sum()), float(dd.min())),
         "best_trade": round(float(pnl.max()), 2), "worst_trade": round(float(pnl.min()), 2),
         "longs": int((trades["Direction"] == "LONG").sum()),
         "shorts": int((trades["Direction"] == "SHORT").sum()),
@@ -6056,9 +6104,35 @@ def _trust_header(result: BacktestResult, meta: dict) -> None:
     if not meta["risk"].costs.enabled and s["total_trades"]:
         cautions.append("Costs are excluded. Brokerage, taxes and slippage often exceed the edge "
                         "on fast intraday profiles -- enable the cost model before believing this.")
-    if s["total_trades"] and s["max_drawdown"] and abs(s["max_drawdown"]) > abs(s["net_pnl"]):
-        cautions.append("Maximum drawdown exceeds total profit. Even if the edge is real, it "
-                        "would be very hard to sit through.")
+    rdd = s.get("return_over_dd")
+    if s["total_trades"] and isinstance(rdd, (int, float)) and np.isfinite(rdd):
+        if rdd < 1.0:
+            problems.append(
+                f"**Return / max drawdown is {fmt(rdd)}.** The worst peak-to-trough fall was "
+                f"{fmt(abs(s['max_drawdown']))} against total profit of {fmt(s['net_pnl'])} — "
+                f"you would have been more underwater than you ended up ahead. A live drawdown "
+                f"is normally DEEPER than the backtested one.")
+        elif rdd < 2.0:
+            cautions.append(
+                f"Return / max drawdown is {fmt(rdd)}. To make {fmt(s['net_pnl'])} you had to "
+                f"sit through {fmt(abs(s['max_drawdown']))} at the worst point. Below 2 the "
+                f"profit is small next to the pain it cost, and most people stop trading a "
+                f"system long before its backtested drawdown is over.")
+
+    margin = s.get("win_rate_margin")
+    if s["total_trades"] and isinstance(margin, (int, float)) and np.isfinite(margin):
+        if margin < 0:
+            problems.append(
+                f"**This configuration loses money by construction.** Its reward:risk of "
+                f"{fmt(s.get('reward_risk'))}:1 needs a {fmt(s.get('breakeven_win_rate'))}% win "
+                f"rate just to break even, and it wins {fmt(s['win_rate'])}% of the time.")
+        elif margin < 5:
+            cautions.append(
+                f"Only {fmt(margin)} percentage points of headroom. The average win is "
+                f"{fmt(s.get('avg_win'))} against an average loss of {fmt(abs(s.get('avg_loss', 0)))}, "
+                f"so this reward:risk needs {fmt(s.get('breakeven_win_rate'))}% to break even "
+                f"and it is getting {fmt(s['win_rate'])}%. A slightly worse month turns it "
+                f"negative.")
     if not meta.get("walk_forward"):
         cautions.append("No segment stability check was run, so it is unknown whether one lucky "
                         "stretch carried the result.")
@@ -6093,11 +6167,26 @@ def _render_backtest(result: BacktestResult, meta: dict) -> None:
     a[2].metric(f"Net PnL ({cur})", fmt_signed(s["net_pnl"]), f"{fmt_signed(s['gross_points'])} pts")
     pf = s["profit_factor"]
     a[3].metric("Profit Factor", "inf" if pf == float("inf") else fmt(pf))
-    a[4].metric(f"Max Drawdown ({cur})", fmt(s["max_drawdown"]))
+    rdd = s.get("return_over_dd")
+    a[4].metric(f"Max Drawdown ({cur})", fmt(s["max_drawdown"]),
+                "inf" if rdd == float("inf") else f"{fmt(rdd)}x covered by profit",
+                help="The worst peak-to-trough fall in the equity curve, and how many times "
+                     "over the total profit covers it. Below 2 the profit is small next to "
+                     "the pain it cost. A live drawdown is normally deeper than a backtested "
+                     "one, so treat this as a best case.")
     b = st.columns(5)
     b[0].metric("Expectancy / trade", fmt_signed(s["expectancy"]))
-    b[1].metric("Average Win", fmt(s["avg_win"]))
-    b[2].metric("Average Loss", fmt(s["avg_loss"]))
+    rr = s.get("reward_risk")
+    b[1].metric("Average Win", fmt(s["avg_win"]),
+                "inf" if rr == float("inf") else f"reward:risk {fmt(rr)} : 1",
+                help="What one correct trade earns, against what one mistake costs. Below 1:1 "
+                     "a mistake costs more than being right earns, which only survives on a "
+                     "very high win rate.")
+    b[2].metric("Average Loss", fmt(s["avg_loss"]),
+                f"breakeven needs {fmt(s.get('breakeven_win_rate'))}% wins",
+                help="The win rate THIS reward:risk requires simply to break even. Compare it "
+                     "with the actual win rate above: the gap between them is the whole margin "
+                     "of safety.")
     b[3].metric("Best / Worst", f"{fmt(s['best_trade'], 0)} / {fmt(s['worst_trade'], 0)}")
     b[4].metric("Warm-up Bars", f"{s['warmup_bars']:,}", f"{s['bars_tested']:,} tested")
     c = st.columns(5)
@@ -6109,7 +6198,13 @@ def _render_backtest(result: BacktestResult, meta: dict) -> None:
     c[2].metric(f"Costs charged ({cur})", fmt(s.get("total_costs", 0.0)),
                 meta["risk"].costs.summary())
     c[3].metric("Avg Bars Held", fmt(s["avg_bars"], 1))
-    c[4].metric("Gap Exits", f"{s['gap_exits']:,}")
+    margin = s.get("win_rate_margin")
+    c[4].metric("Margin over breakeven", f"{fmt(margin)} pts",
+                "fragile" if (isinstance(margin, (int, float))
+                              and np.isfinite(margin) and margin < 5) else "has headroom",
+                help="Actual win rate minus the win rate this reward:risk needs to break even. "
+                     "This is the fragility measure: 2 points of margin means a slightly worse "
+                     "month turns the system negative. Bigger is safer.")
 
     if meta.get("walk_forward") and not result.walk_forward.empty:
         st.markdown("#### Segment Stability")
@@ -9790,7 +9885,9 @@ def _meets_thresholds(row, gates: dict) -> bool:
     """Every gate the operator set must hold. An unset gate is not a gate."""
     checks = (("Win %", gates.get("win")), ("Sharpe", gates.get("sharpe")),
               ("Expectancy", gates.get("expectancy")), ("Profit Factor", gates.get("pf")),
-              ("Net PnL", gates.get("pnl")))
+              ("Net PnL", gates.get("pnl")),
+              ("Return/DD", gates.get("rdd")), ("Reward:Risk", gates.get("rr")),
+              ("Win margin %", gates.get("margin")))
     for col, floor in checks:
         if floor in (None, 0.0):
             continue
@@ -9799,6 +9896,17 @@ def _meets_thresholds(row, gates: dict) -> bool:
         except (TypeError, ValueError, KeyError):
             return False
         if not np.isfinite(value) or value < float(floor):
+            return False
+
+    # Drawdown is a CEILING, not a floor: a gate of 2,000 means "no deeper than
+    # 2,000", so it is the one check that runs the other way round.
+    cap = gates.get("maxdd")
+    if cap not in (None, 0.0):
+        try:
+            value = abs(float(row["Max DD"]))
+        except (TypeError, ValueError, KeyError):
+            return False
+        if not np.isfinite(value) or value > abs(float(cap)):
             return False
     return True
 
@@ -9925,7 +10033,13 @@ def run_signal_lab(tickers: list[str], cfg: dict, objective: str, iterations: in
             "Filter": best["Filter"], "Filter Key": fkey,
             "Trades": best["Trades"], "Win %": best["Win %"], "Sharpe": best["Sharpe"],
             "Expectancy": best["Expectancy"], "Net PnL": best["Net PnL"],
-            "Profit Factor": best["Profit Factor"], "Reliability": best["Reliability"],
+            "Profit Factor": best["Profit Factor"],
+            "Max DD": best.get("Max DD"), "Return/DD": best.get("Return/DD"),
+            "Reward:Risk": best.get("Reward:Risk"),
+            "Breakeven Win %": best.get("Breakeven Win %"),
+            "Win margin %": best.get("Win margin %"),
+            "Avg Win": best.get("Avg Win"), "Avg Loss": best.get("Avg Loss"),
+            "Reliability": best["Reliability"],
             "Score": best["Score"], "Close": round(float(frame["Close"].iloc[-1]), 2),
         })
     if not budget_hit and progress is not None:
@@ -10008,7 +10122,9 @@ def tab_signal_lab(cfg: dict) -> None:
     # number the operator typed is the number actually applied.
     _GATE_KEYS = {"Win rate (accuracy)": "win", "Sharpe ratio": "sharpe",
                   "Net PnL": "pnl", "Expectancy per trade": "expectancy",
-                  "Profit factor": "pf"}
+                  "Profit factor": "pf", "Return / max drawdown": "rdd",
+                  "Smallest max drawdown": "maxdd", "Reward : risk ratio": "rr",
+                  "Win-rate margin over breakeven": "margin"}
     gates: dict = {}
     apply_target = st.checkbox(
         f"Require at least {fmt(lab_target)} on {objective.lower()}", value=False,
@@ -10028,10 +10144,26 @@ def tab_signal_lab(cfg: dict) -> None:
             "pf": g4.number_input("Min profit factor", 0.0, 20.0, 0.0, 0.1, key="lab_g_pf"),
             "pnl": g5.number_input("Min net PnL", 0.0, 1e9, 0.0, 100.0, key="lab_g_pnl"),
         }
-        if float(gates.get("win") or 0) >= 80:
-            st.warning("A win rate that high is almost always bought with a bad reward:risk — "
-                       "many small wins funding a few large losses. Check expectancy and profit "
-                       "factor before believing it.")
+        h1, h2, h3 = st.columns(3)
+        gates["rdd"] = h1.number_input(
+            "Min return / max drawdown", 0.0, 100.0, 0.0, 0.5, key="lab_g_rdd",
+            help="Net profit per unit of worst peak-to-trough fall. 3 is a reasonable bar; "
+                 "below 2 the profit is small next to the pain it cost.")
+        gates["maxdd"] = h2.number_input(
+            "Max drawdown allowed", 0.0, 1e9, 0.0, 500.0, key="lab_g_maxdd",
+            help="A CEILING, not a floor: combinations whose worst drawdown is deeper than "
+                 "this are rejected. 0 means no limit.")
+        gates["rr"] = h3.number_input(
+            "Min reward : risk", 0.0, 50.0, 0.0, 0.1, key="lab_g_rr",
+            help="Average win over average loss. Below 1 a mistake costs more than being "
+                 "right earns, which only survives on a very high win rate.")
+        if float(gates.get("win") or 0) >= 80 and not (gates.get("rr") or gates.get("rdd")):
+            st.warning(
+                "**A win rate that high almost always hides a bad reward:risk** — many small "
+                "wins funding a few large losses. At 0.07:1 you need a 93.75% win rate just to "
+                "break even, so a system winning 90% of the time is LOSING money. Set the "
+                "**Min reward : risk** gate beside it, or optimise for "
+                "**Win-rate margin over breakeven** instead, which measures the two together.")
 
     if use_mtf:
         timeframes = st.multiselect(
@@ -10370,7 +10502,13 @@ def run_auto_screen(tickers: list[str], cfg: dict, min_value: float, min_trades:
             "TP Value": best["TP Value"], "Filter": best["Filter"], "Filter Key": fkey,
             "Win %": best["Win %"], "Trades": best["Trades"], "Sharpe": best["Sharpe"],
             "Expectancy": best["Expectancy"], "Profit Factor": best["Profit Factor"],
-            "Net PnL": best["Net PnL"], "Reliability": best["Reliability"],
+            "Net PnL": best["Net PnL"],
+            "Max DD": best.get("Max DD"), "Return/DD": best.get("Return/DD"),
+            "Reward:Risk": best.get("Reward:Risk"),
+            "Breakeven Win %": best.get("Breakeven Win %"),
+            "Win margin %": best.get("Win margin %"),
+            "Avg Win": best.get("Avg Win"), "Avg Loss": best.get("Avg Loss"),
+            "Reliability": best["Reliability"],
             "Price Now": round(float(frame["Close"].iloc[-1]), 2),
             "Clears bar": "yes" if clears_bar else "no",
             "Bar metric": metric, "Bar value": best[column],
@@ -12803,18 +12941,35 @@ def _test_objective_targets():
         "Win %": [95.0, 68.0, 55.0], "Sharpe": [0.4, 2.2, 1.1],
         "Net PnL": [10.0, 900.0, 250.0], "Expectancy": [0.2, 9.0, 3.0],
         "Profit Factor": [1.05, 3.4, 1.8], "Score": [40.0, 80.0, 60.0],
+        # The shape-of-the-edge columns. Row 0 is the trap this whole family of
+        # objectives exists to catch: a 95% win rate that pays 0.07 for every 1
+        # it risks, and a drawdown bigger than the profit.
+        "Max DD": [-800.0, -300.0, -120.0],
+        "Return/DD": [0.01, 3.0, 2.08],
+        "Reward:Risk": [0.07, 2.4, 1.3],
+        "Win margin %": [-3.5, 25.0, 11.0],
     })
     # Each objective picks out a different winner, which is the whole point of
-    # having five of them.
+    # having several of them.
     winners = {}
     for objective, spec in OBJECTIVE_TARGETS.items():
         column = spec["column"]
         assert column in results.columns, f"{objective}: column {column} is not produced"
         assert spec["min"] <= spec["default"] <= spec["max"], f"{objective}: default out of range"
         assert spec["step"] > 0 and spec["note"]
-        winners[objective] = int(pd.to_numeric(results[column]).idxmax())
+        series = pd.to_numeric(results[column])
+        # Drawdown is the one objective where smaller is better.
+        winners[objective] = int(series.abs().idxmin() if objective == "Smallest max drawdown"
+                                 else series.idxmax())
     assert winners["Win rate (accuracy)"] != winners["Sharpe ratio"], \
         "accuracy and Sharpe should not agree on this sample"
+    # The headline case: optimising for accuracy picks the fragile row; every
+    # shape-aware objective rejects it.
+    assert winners["Win rate (accuracy)"] == 0, "the 95% row must win on accuracy alone"
+    for objective in ("Return / max drawdown", "Reward : risk ratio",
+                      "Win-rate margin over breakeven", "Smallest max drawdown"):
+        assert winners[objective] != 0, \
+            f"{objective} must NOT pick the 95%-win-rate row with a 0.07:1 payoff"
 
     # Counting against the objective's column, not a blended score.
     measured = pd.to_numeric(results[OBJECTIVE_TARGETS["Win rate (accuracy)"]["column"]])
@@ -13591,6 +13746,82 @@ def _test_every_signal_gets_a_recorded_verdict():
         globals().update(saved)
 
 
+def _test_drawdown_and_reward_risk_objectives():
+    """
+    The objectives that measure the SHAPE of an edge rather than its size.
+
+    Net PnL and win rate can both look excellent on a system that is one bad
+    week from giving everything back. Two cases are asserted literally, both
+    taken from the operator's own questions:
+
+      * +5,000 profit bought with a 4,000 drawdown -- a return/DD of 1.25,
+        meaning you were nearly as far underwater as you ended up ahead.
+      * a +10 average win against a -150 average loss -- a 0.067:1 reward:risk
+        that needs a 93.75% win rate just to break even, so a system winning
+        90% of the time is LOSING money while looking superb.
+    """
+    # -- case 1: profit that cost nearly as much drawdown as it made
+    shape = _risk_shape(avg_win=50.0, avg_loss=-50.0, win_rate=60.0,
+                        net_pnl=5000.0, max_dd=-4000.0)
+    assert shape["return_over_dd"] == 1.25, shape
+    assert _objective_value({"return_over_dd": 1.25}, "Return / max drawdown") == 1.25
+
+    # -- case 2: tiny wins funding huge losses
+    thin = _risk_shape(avg_win=10.0, avg_loss=-150.0, win_rate=90.0,
+                       net_pnl=1.0, max_dd=-100.0)
+    assert abs(thin["reward_risk"] - 0.067) < 0.001, thin
+    assert abs(thin["breakeven_win_rate"] - 93.75) < 0.01, thin
+    assert thin["win_rate_margin"] < 0, \
+        "winning 90% of the time on a 0.067:1 payoff is a LOSING system and must read negative"
+    # ... and the arithmetic that proves it.
+    expectancy = 0.90 * 10.0 - 0.10 * 150.0
+    assert expectancy < 0 and abs(expectancy + 6.0) < 1e-9, expectancy
+
+    # A healthier shape must score better on every one of the new objectives.
+    good = _risk_shape(avg_win=120.0, avg_loss=-60.0, win_rate=55.0,
+                       net_pnl=6000.0, max_dd=-1200.0)
+    assert good["reward_risk"] == 2.0
+    assert abs(good["breakeven_win_rate"] - 33.33) < 0.01
+    assert good["win_rate_margin"] > 20
+    assert good["return_over_dd"] == 5.0
+    for objective in ("Return / max drawdown", "Reward : risk ratio",
+                      "Win-rate margin over breakeven"):
+        better = _objective_value(good, objective)
+        worse = _objective_value(thin, objective)
+        assert better > worse, f"{objective}: {better} should beat {worse}"
+
+    # -- drawdown is MINIMISED: the shallower one must win the search
+    shallow = _objective_value({"max_drawdown": -500.0}, "Smallest max drawdown")
+    deep = _objective_value({"max_drawdown": -9000.0}, "Smallest max drawdown")
+    assert shallow > deep, \
+        "asking for the smallest drawdown must not return the deepest one"
+
+    # -- an infinite ratio is a sample with no loss yet, not a perfect system
+    flawless = _risk_shape(avg_win=50.0, avg_loss=0.0, win_rate=100.0,
+                           net_pnl=500.0, max_dd=0.0)
+    assert flawless["reward_risk"] == float("inf")
+    assert _objective_value(flawless, "Reward : risk ratio") == 0.0, \
+        "an infinite ratio must not win every search outright"
+    assert _objective_value(flawless, "Return / max drawdown") == 0.0
+
+    # -- the drawdown gate is a CEILING while the others are floors
+    row = {"Win %": 60.0, "Sharpe": 1.0, "Expectancy": 5.0, "Profit Factor": 1.5,
+           "Net PnL": 5000.0, "Max DD": -4000.0, "Return/DD": 1.25,
+           "Reward:Risk": 1.0, "Win margin %": 10.0}
+    assert _meets_thresholds(row, {"maxdd": 5000.0}), "a 4,000 fall is inside a 5,000 ceiling"
+    assert not _meets_thresholds(row, {"maxdd": 2000.0}), \
+        "a 4,000 fall must be rejected by a 2,000 ceiling"
+    assert not _meets_thresholds(row, {"rdd": 3.0}), "return/DD of 1.25 must fail a floor of 3"
+    assert _meets_thresholds(row, {"rdd": 1.0})
+
+    # -- every objective must be selectable and have a results column
+    for objective in OPTIMISER_OBJECTIVES:
+        assert objective in OBJECTIVE_TARGETS, f"{objective} has no target spec"
+        assert OBJECTIVE_TARGETS[objective]["column"], f"{objective} has no column"
+    print("   drawdown & reward:risk objectives: return/DD, breakeven win rate, fragility "
+          "margin; drawdown minimised and capped  OK")
+
+
 def _test_projected_cross_is_not_a_signal():
     """
     A projected crossover must never be reported as a crossover.
@@ -14135,6 +14366,7 @@ def run_selftest() -> int:
         _test_batched_candle_arrival()
         _test_live_entry_is_not_poll_dependent()
         _test_every_signal_gets_a_recorded_verdict()
+        _test_drawdown_and_reward_risk_objectives()
         _test_projected_cross_is_not_a_signal()
         _test_dhan_previous_oi_gives_a_day_change()
         _test_gamma_blast_always_explains_itself()
@@ -14342,7 +14574,10 @@ _OPTIMISER_EXCLUDE = ("16 \u00b7", "17 \u00b7", "28 \u00b7", "29 \u00b7", "44 \u
                       "45 \u00b7", "46 \u00b7", "50 \u00b7")
 
 OPTIMISER_OBJECTIVES = ["Win rate (accuracy)", "Sharpe ratio", "Net PnL", "Expectancy per trade",
-                        "Profit factor"]
+                        "Profit factor",
+                        # --- objectives about the SHAPE of the edge, not its size ---
+                        "Return / max drawdown", "Smallest max drawdown",
+                        "Reward : risk ratio", "Win-rate margin over breakeven"]
 
 # For each objective: the results column it lives in, a sensible default target,
 # the range and step the input should use, and how to label it. A single default
@@ -14369,7 +14604,37 @@ OBJECTIVE_TARGETS = {
                              "step": 0.1, "unit": "",
                              "note": "Gross wins over gross losses. Below 1.0 the system loses "
                                      "money however high the win rate is."},
+    "Return / max drawdown": {"column": "Return/DD", "default": 3.0, "min": 0.0, "max": 100.0,
+                              "step": 0.5, "unit": "x",
+                              "note": "Net profit divided by the worst peak-to-trough fall. "
+                                      "Below 2 the profit is small next to the pain it cost; "
+                                      "above 3 is respectable. A live drawdown is normally "
+                                      "WORSE than the backtested one, so treat this as a "
+                                      "best case."},
+    "Smallest max drawdown": {"column": "Max DD", "default": 0.0, "min": -1e9, "max": 1e9,
+                              "step": 100.0, "unit": "",
+                              "note": "Minimised, not maximised: the search keeps the SHALLOWEST "
+                                      "drawdown. Used alone it will happily pick a configuration "
+                                      "that barely trades, so pair it with a minimum trade count "
+                                      "and check the net PnL column."},
+    "Reward : risk ratio":   {"column": "Reward:Risk", "default": 1.5, "min": 0.0, "max": 50.0,
+                              "step": 0.1, "unit": ": 1",
+                              "note": "Average win over average loss. Below 1 you are paying "
+                                      "more for being wrong than you collect for being right, "
+                                      "which only survives on a very high win rate."},
+    "Win-rate margin over breakeven":
+                            {"column": "Win margin %", "default": 10.0, "min": -100.0,
+                             "max": 100.0, "step": 1.0, "unit": "pts",
+                             "note": "Actual win rate minus the win rate this reward:risk NEEDS "
+                                     "to break even. This is the fragility measure: a margin of "
+                                     "2 points means a slightly worse month turns the system "
+                                     "negative. Bigger is safer."},
 }
+
+# Objectives where SMALLER is better. The search maximises a score, so these are
+# negated before ranking -- otherwise asking for the smallest drawdown would
+# return the deepest one.
+_MINIMISE_OBJECTIVES = {"Smallest max drawdown"}
 
 
 def objective_target_input(container, prefix: str, objective: str, label: str = "Desired value"):
@@ -14400,10 +14665,35 @@ _OPT_FILTERS = [None, "adx", "rsi", "ema20", "supertrend", "macd", "regime"]
 
 
 def _objective_value(stats: dict, objective: str) -> float:
-    return {"Win rate (accuracy)": stats["win_rate"], "Sharpe ratio": stats["sharpe"],
-            "Net PnL": stats["net_pnl"], "Expectancy per trade": stats["expectancy"],
-            "Profit factor": 0.0 if stats["profit_factor"] == float("inf")
-            else stats["profit_factor"]}.get(objective, 0.0)
+    """
+    The score a search maximises, for one objective.
+
+    An infinite ratio is what a sample with no losing trade produces. It is not
+    a perfect system, it is a sample too small to have met its first loss, so
+    it scores 0 rather than winning every search outright.
+    """
+    def _finite(value, cap=None):
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        if not np.isfinite(number):
+            return 0.0
+        return float(min(number, cap)) if cap is not None else number
+
+    raw = {
+        "Win rate (accuracy)": _finite(stats.get("win_rate")),
+        "Sharpe ratio": _finite(stats.get("sharpe")),
+        "Net PnL": _finite(stats.get("net_pnl")),
+        "Expectancy per trade": _finite(stats.get("expectancy")),
+        "Profit factor": _finite(stats.get("profit_factor")),
+        "Return / max drawdown": _finite(stats.get("return_over_dd")),
+        # Negated so that "largest score" means "shallowest drawdown".
+        "Smallest max drawdown": -abs(_finite(stats.get("max_drawdown"))),
+        "Reward : risk ratio": _finite(stats.get("reward_risk")),
+        "Win-rate margin over breakeven": _finite(stats.get("win_rate_margin")),
+    }.get(objective, 0.0)
+    return float(raw)
 
 
 def parse_number_list(text: str, fallback: list[float]) -> list[float]:
@@ -14585,7 +14875,13 @@ def optimise(df: pd.DataFrame, base_params: dict, quantity: float, costs: CostMo
             "Trades": st_["total_trades"],
             "Win %": st_["win_rate"], "Sharpe": st_["sharpe"], "Net PnL": st_["net_pnl"],
             "Expectancy": st_["expectancy"], "Profit Factor": st_["profit_factor"],
-            "Max DD": st_["max_drawdown"], "Reliability": st_["reliability"],
+            "Max DD": st_["max_drawdown"],
+            "Return/DD": st_.get("return_over_dd"),
+            "Reward:Risk": st_.get("reward_risk"),
+            "Breakeven Win %": st_.get("breakeven_win_rate"),
+            "Win margin %": st_.get("win_rate_margin"),
+            "Avg Win": st_.get("avg_win"), "Avg Loss": st_.get("avg_loss"),
+            "Reliability": st_["reliability"],
             "Score": _objective_value(st_, objective),
         })
 
