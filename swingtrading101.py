@@ -9389,8 +9389,15 @@ def tab_optimiser(cfg: dict) -> None:
              "because they are execution helpers, not edges.")
 
     c1, c2, c3, c4 = st.columns(4)
-    objective = c1.selectbox("Optimise for", OPTIMISER_OBJECTIVES, key="opt_obj")
-    target, target_column = objective_target_input(c2, "opt", objective)
+    with c1:
+        objective, obj_column, obj_weights, obj_floor = render_objective_picker("opt")
+    if isinstance(objective, list):
+        target, target_column = c2.number_input(
+            "Desired combined score (0-100)", 0.0, 100.0, 70.0, 5.0,
+            key="opt_target_combo",
+            help="The average percentile across every ticked measure."), "Score"
+    else:
+        target, target_column = objective_target_input(c2, "opt", objective)
     min_trades = c3.number_input("Minimum trades", 5, 1000, 30, 5, key="opt_min",
                                  help="Combinations with fewer trades are discarded: below "
                                       "roughly 30 the statistics are noise.")
@@ -9426,7 +9433,8 @@ def tab_optimiser(cfg: dict) -> None:
         part = optimise(bundle.frame, cfg["params"], cfg["quantity"], cfg["costs"],
                         objective, int(min_trades), int(size), seed=11 + offset,
                         safe_exits_only=safe_only, grid=grid, exhaustive=exhaustive,
-                        scale_points=scale_points)
+                        scale_points=scale_points, weights=obj_weights,
+                        min_percentile=obj_floor)
         return (part.drop(columns=["Rank"], errors="ignore").to_dict("records")
                 if not part.empty else []), []
 
@@ -9442,7 +9450,14 @@ def tab_optimiser(cfg: dict) -> None:
                                 "Filter") if c in results.columns]
         if key_cols:
             results = results.drop_duplicates(subset=key_cols)
-        results = results.sort_values("Score", ascending=False).reset_index(drop=True)
+        if isinstance(objective, list):
+            # A percentile only means something against the set it was measured
+            # in. Each batch scored its own rows against its own members, so the
+            # merged table has to be re-scored across everything before the
+            # ranking is comparable.
+            results = combine_objective_scores(results, objective, obj_weights, obj_floor)
+        else:
+            results = results.sort_values("Score", ascending=False).reset_index(drop=True)
         results.insert(0, "Rank", range(1, len(results) + 1))
     st.session_state.optimizer_results = (results, objective, float(target), target_column)
 
@@ -9476,7 +9491,8 @@ def tab_optimiser(cfg: dict) -> None:
                f"(measured on the `{column}` column).")
     if hits.empty and not results.empty:
         best = float(measured.max()) if measured.notna().any() else float("nan")
-        st.info(f"Nothing reached {fmt(target)}{unit}. The best {objective.lower()} found was "
+        st.info(f"Nothing reached {fmt(target)}{unit}. The best {objective_label(objective)} "
+                f"found was "
                 f"{fmt(best)}{unit} — the full ranking is still below, so you can lower the "
                 f"target or take the best available.")
 
@@ -9887,7 +9903,8 @@ def _meets_thresholds(row, gates: dict) -> bool:
               ("Expectancy", gates.get("expectancy")), ("Profit Factor", gates.get("pf")),
               ("Net PnL", gates.get("pnl")),
               ("Return/DD", gates.get("rdd")), ("Reward:Risk", gates.get("rr")),
-              ("Win margin %", gates.get("margin")))
+              ("Win margin %", gates.get("margin")),
+              ("Score", gates.get("score")))
     for col, floor in checks:
         if floor in (None, 0.0):
             continue
@@ -9911,12 +9928,13 @@ def _meets_thresholds(row, gates: dict) -> bool:
     return True
 
 
-def run_signal_lab(tickers: list[str], cfg: dict, objective: str, iterations: int,
+def run_signal_lab(tickers: list[str], cfg: dict, objective, iterations: int,
                    min_trades: int, signal_window: int, safe_only: bool,
                    timeframes: list[str] | None = None, gates: dict | None = None,
                    progress=None, grid: dict | None = None, exhaustive: bool = False,
                    scale_points: bool = True, time_budget: float = 600.0,
-                   on_partial=None) -> tuple[pd.DataFrame, pd.DataFrame]:
+                   on_partial=None, weights: dict | None = None,
+                   min_percentile: float = 0.0) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     For each ticker: search for the best configuration on its own history, then
     ask whether that winning configuration is signalling right now.
@@ -9976,7 +9994,8 @@ def run_signal_lab(tickers: list[str], cfg: dict, objective: str, iterations: in
         try:
             table = optimise(bundle.frame, params, cfg["quantity"], costs, objective,
                              min_trades, iterations, seed=11, safe_exits_only=safe_only,
-                             grid=grid, exhaustive=exhaustive, scale_points=scale_points)
+                             grid=grid, exhaustive=exhaustive, scale_points=scale_points,
+                             weights=weights, min_percentile=min_percentile)
         except Exception as exc:                                    # noqa: BLE001
             errors.append({"Ticker": ticker, "Timeframe": interval,
                            "Problem": f"optimiser: {str(exc)[:120]}"})
@@ -10086,11 +10105,18 @@ def tab_signal_lab(cfg: dict) -> None:
              "overstates it again. Treat the output as a shortlist to validate on a different "
              "period, never as a result.")
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2 = st.columns([1, 2])
     universe = c1.selectbox("Universe", SCREENER_UNIVERSES, key="lab_universe")
-    objective = c2.selectbox("Optimise for", OPTIMISER_OBJECTIVES, key="lab_obj")
-    lab_target, lab_target_column = objective_target_input(c3, "lab", objective, "Target")
-    signal_window = st.number_input("Signal window (candles)", 1, 20, 3, key="lab_window")
+    signal_window = c1.number_input("Signal window (candles)", 1, 20, 3, key="lab_window")
+    with c2:
+        objective, obj_column, obj_weights, obj_floor = render_objective_picker("lab")
+    if isinstance(objective, list):
+        lab_target = st.number_input("Target combined score (0-100)", 0.0, 100.0, 70.0, 5.0,
+                                     key="lab_target_combo")
+        lab_target_column = "Score"
+    else:
+        lab_target, lab_target_column = objective_target_input(
+            st, "lab", objective, "Target")
 
     custom_text = ""
     if universe.startswith("Custom"):
@@ -10127,12 +10153,17 @@ def tab_signal_lab(cfg: dict) -> None:
                   "Win-rate margin over breakeven": "margin"}
     gates: dict = {}
     apply_target = st.checkbox(
-        f"Require at least {fmt(lab_target)} on {objective.lower()}", value=False,
+        f"Require at least {fmt(lab_target)} on {objective_label(objective)}", value=False,
         key="lab_use_target",
         help="Off by default: the lab simply keeps the top-ranked combination per ticker. On, "
              "a ticker only qualifies if its best combination reaches this number.")
     if apply_target:
-        gates[_GATE_KEYS.get(objective, "win")] = float(lab_target)
+        # With a combination there is no single column to gate on, so the bar
+        # applies to the blended score instead of to one of its parts.
+        gates["score"] = float(lab_target) if isinstance(objective, list) else None
+        if gates["score"] is None:
+            gates.pop("score")
+            gates[_GATE_KEYS.get(objective, "win")] = float(lab_target)
     if use_gates:
         st.markdown("**Quality thresholds** — a combination must clear every gate you set. "
                     "Leave a gate at 0 to ignore it.")
@@ -10220,7 +10251,8 @@ def tab_signal_lab(cfg: dict) -> None:
         part_rows, part_errs = run_signal_lab(
             [ticker], cfg, objective, int(iterations), int(min_trades),
             int(signal_window), safe_only, [interval], gates, None, grid,
-            exhaustive, scale_points, time_budget=_sweep_job_budget())
+            exhaustive, scale_points, time_budget=_sweep_job_budget(),
+            weights=obj_weights, min_percentile=obj_floor)
         return part_rows.to_dict("records"), part_errs.to_dict("records")
 
     rows, errs, _finished = chunked_sweep(
@@ -10299,7 +10331,7 @@ def tab_signal_lab(cfg: dict) -> None:
     if lab_target_column in signalling.columns and len(signalling):
         shown_hits = int((pd.to_numeric(signalling[lab_target_column], errors="coerce")
                           >= lab_target).sum())
-    d.metric(f"Reach {fmt(lab_target)} on {objective.split(' (')[0].lower()}",
+    d.metric(f"Reach {fmt(lab_target)} on {objective_label(objective).split(' (')[0]}",
              f"{hit_target} of {len(results)}",
              f"{shown_hits} of the {len(signalling)} signalling",
              help="The first number counts EVERY qualified row. The table below may be "
@@ -10316,7 +10348,7 @@ def tab_signal_lab(cfg: dict) -> None:
         reaching = results[measured >= lab_target]
         if len(reaching):
             with st.expander(f"The {len(reaching)} row(s) reaching {fmt(lab_target)} on "
-                             f"{objective.lower()}", expanded=not len(
+                             f"{objective_label(objective)}", expanded=not len(
                                  reaching[reaching["Signal"] != "-"])):
                 cols = [c for c in ["Ticker", "Timeframe", "Signal", "When", lab_target_column,
                                     "Trades", "Expectancy", "Profit Factor", "Sharpe",
@@ -10399,13 +10431,22 @@ AUTO_METRICS = {
     "Net PnL": ("Net PnL", "Net PnL", 0.0),
     "Profit factor": ("Profit Factor", "Profit factor", 1.5),
     "Expectancy per trade": ("Expectancy", "Expectancy per trade", 0.0),
+    # The shape-of-the-edge measures. These were only reachable from the Signal
+    # Lab, which left this tab able to optimise for a 95% win rate but with no
+    # way to ask for a shallow drawdown or a payoff worth taking.
+    "Return / max drawdown": ("Return/DD", "Return / max drawdown", 3.0),
+    "Smallest max drawdown": ("Max DD", "Smallest max drawdown", 0.0),
+    "Reward : risk ratio": ("Reward:Risk", "Reward : risk ratio", 1.5),
+    "Win-rate margin over breakeven": ("Win margin %", "Win-rate margin over breakeven", 10.0),
 }
 
 
 def run_auto_screen(tickers: list[str], cfg: dict, min_value: float, min_trades: int,
                     iterations: int, timeframes: list[str], signal_window: int,
                     safe_only: bool, progress=None, metric: str = "Accuracy (win rate %)",
-                    time_budget: float = 600.0, on_partial=None):
+                    time_budget: float = 600.0, on_partial=None,
+                    objective=None, column: str | None = None,
+                    weights: dict | None = None, min_percentile: float = 0.0):
     """
     Search every timeframe, strategy, stop, target and filter for configurations
     that clear an accuracy bar, then split them by whether they are signalling now.
@@ -10460,10 +10501,15 @@ def run_auto_screen(tickers: list[str], cfg: dict, min_value: float, min_trades:
         params["intraday"] = interval in INTRADAY_INTERVALS
         params["square_off_eod"] = cfg.get("square_off_eod", True)
         try:
-            column, objective, _ = AUTO_METRICS.get(metric, AUTO_METRICS["Accuracy (win rate %)"])
-            table = optimise(bundle.frame, params, cfg["quantity"], costs, objective,
+            if objective is None:
+                col, obj, _ = AUTO_METRICS.get(metric,
+                                               AUTO_METRICS["Accuracy (win rate %)"])
+            else:
+                col, obj = (column or "Score"), objective
+            table = optimise(bundle.frame, params, cfg["quantity"], costs, obj,
                              int(min_trades), int(iterations), seed=11,
-                             safe_exits_only=safe_only)
+                             safe_exits_only=safe_only, weights=weights,
+                             min_percentile=min_percentile)
         except Exception as exc:                                    # noqa: BLE001
             skipped.append({"Ticker": ticker, "Timeframe": interval,
                             "Reason": f"search failed: {str(exc)[:110]}"})
@@ -10477,9 +10523,15 @@ def run_auto_screen(tickers: list[str], cfg: dict, min_value: float, min_trades:
         # throws away the answer. The best available combination is returned
         # either way; it is simply labelled as below the bar so the distinction
         # stays visible.
-        measured = pd.to_numeric(table[column], errors="coerce").replace(
+        if col not in table.columns:
+            col = "Score"
+        measured = pd.to_numeric(table[col], errors="coerce").replace(
             [np.inf, -np.inf], np.nan)
-        hits = table[measured >= float(min_value)]
+        # Drawdown is the one measure where the bar is a CEILING.
+        if obj == "Smallest max drawdown" and float(min_value) > 0:
+            hits = table[measured.abs() <= abs(float(min_value))]
+        else:
+            hits = table[measured >= float(min_value)]
         clears_bar = not hits.empty
         best = hits.iloc[0] if clears_bar else table.iloc[0]
         fcfg = default_filter_config()
@@ -10511,7 +10563,10 @@ def run_auto_screen(tickers: list[str], cfg: dict, min_value: float, min_trades:
             "Reliability": best["Reliability"],
             "Price Now": round(float(frame["Close"].iloc[-1]), 2),
             "Clears bar": "yes" if clears_bar else "no",
-            "Bar metric": metric, "Bar value": best[column],
+            "Bar metric": (", ".join(_OBJECTIVE_SHORT.get(o, o) for o in obj)
+                           if isinstance(obj, (list, tuple)) else (obj or metric)),
+            "Bar value": best.get(col),
+            "Weakest %ile": best.get("Weakest %ile"),
         }
         row["Quality"] = _quality_score(row)
         if not clears_bar:
@@ -10547,21 +10602,35 @@ def tab_auto_screener(cfg: dict) -> None:
              "expectancy and profit factor sit next to it below. Treat everything here as a "
              "shortlist to validate on another period.")
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2 = st.columns([1, 2])
     universe = c1.selectbox("Universe", SCREENER_UNIVERSES, key="auto_universe")
-    metric = c2.selectbox("Qualify on", list(AUTO_METRICS), index=0, key="auto_metric",
-                          help="The search optimises for this metric and the bar below is "
-                               "applied to it. Accuracy is the default, but it is the weakest "
-                               "of the five on its own — a high win rate says nothing about the "
-                               "size of the losses paying for it.")
-    default_bar = AUTO_METRICS[metric][2]
-    min_value = c3.number_input(f"Minimum {metric.lower()}", -1e9, 1e9, float(default_bar),
-                                0.5 if default_bar < 10 else 1.0, key=f"auto_bar_{metric}")
-    signal_window = c4.number_input("Signal window (candles)", 1, 20, 3, key="auto_window")
-    if metric.startswith("Accuracy") and min_value >= 85:
-        st.warning("An accuracy bar this high almost always selects setups with a tiny target "
-                   "and a wide stop. Check the expectancy and profit factor columns before "
-                   "believing the win rate.")
+    signal_window = c1.number_input("Signal window (candles)", 1, 20, 3, key="auto_window")
+
+    with c2:
+        objective, column, weights, floor = render_objective_picker("auto", "Qualify on")
+    combo = isinstance(objective, list)
+    metric = ", ".join(objective) if combo else objective
+
+    b1, _ = st.columns([1, 2])
+    if combo:
+        min_value = b1.number_input(
+            "Minimum combined score (0-100)", 0.0, 100.0, 70.0, 5.0, key="auto_bar_combo",
+            help="The combined score is the average percentile across every measure you "
+                 "ticked, so 70 means 'better than roughly 70% of the combinations tried, "
+                 "across the board'.")
+    else:
+        spec = OBJECTIVE_TARGETS[objective]
+        ceiling = objective in _MINIMISE_OBJECTIVES
+        min_value = b1.number_input(
+            f"{'Maximum' if ceiling else 'Minimum'} {objective.lower()}",
+            float(spec["min"]), float(spec["max"]), float(spec["default"]), float(spec["step"]),
+            key=f"auto_bar_{objective}", help=spec["note"])
+        if objective == "Win rate (accuracy)" and min_value >= 85:
+            st.warning(
+                "An accuracy bar this high almost always selects setups with a tiny target and "
+                "a wide stop — many small wins funding a few large losses. Tick **Combine "
+                "several objectives** above and add **Reward : risk ratio** or **Win-rate "
+                "margin over breakeven** so the payoff has to be worth taking too.")
 
     custom_text = ""
     if universe.startswith("Custom"):
@@ -10605,7 +10674,8 @@ def tab_auto_screener(cfg: dict) -> None:
         hot_p, quiet_p, near_p, skip_p = run_auto_screen(
             [ticker], cfg, float(min_value), int(min_trades), int(iterations),
             [interval], int(signal_window), safe_only, None, metric=metric,
-            time_budget=_sweep_job_budget())
+            time_budget=_sweep_job_budget(),
+            objective=objective, column=column, weights=weights, min_percentile=floor)
         rows = ([dict(r, Bucket="signalling") for r in hot_p.to_dict("records")]
                 + [dict(r, Bucket="quiet") for r in quiet_p.to_dict("records")]
                 + [dict(r, Bucket="below bar") for r in near_p.to_dict("records")])
@@ -13822,6 +13892,88 @@ def _test_drawdown_and_reward_risk_objectives():
           "margin; drawdown minimised and capped  OK")
 
 
+def _test_combined_objective_ranking():
+    """
+    Ranking by several objectives at once.
+
+    Adding raw numbers would be meaningless -- a win rate runs 0-100, a Sharpe
+    0-3 and a net PnL into the tens of thousands, so a plain sum is net PnL
+    wearing a disguise. Each measure becomes its percentile inside the search
+    and the percentiles are averaged, which is scale-free.
+
+    The case that matters is row A: the 95%-accuracy trap that tops an accuracy
+    search while risking 150 to make 10. A combination that includes payoff or
+    drawdown must not pick it.
+    """
+    frame = pd.DataFrame({
+        "Strategy": ["A", "B", "C", "D"],
+        # A: superb accuracy, dreadful everything else.      <- the trap
+        # B: balanced and good.                               <- should win
+        # C: huge PnL bought with a huge drawdown.
+        # D: tiny drawdown but barely makes anything.
+        "Win %":        [95.0, 62.0, 58.0, 51.0],
+        "Net PnL":      [120.0, 6000.0, 20000.0, 300.0],
+        "Sharpe":       [0.2, 2.1, 1.4, 0.9],
+        "Expectancy":   [0.4, 22.0, 40.0, 2.0],
+        "Profit Factor": [1.02, 2.6, 1.7, 1.2],
+        "Max DD":       [-900.0, -1500.0, -18000.0, -150.0],
+        "Return/DD":    [0.13, 4.0, 1.11, 2.0],
+        "Reward:Risk":  [0.07, 2.2, 1.6, 1.1],
+        "Win margin %": [-3.5, 23.0, 12.0, 3.0],
+    })
+
+    # 1. Accuracy alone picks the trap. That is the whole problem.
+    by_accuracy = frame.sort_values("Win %", ascending=False).iloc[0]["Strategy"]
+    assert by_accuracy == "A", "the fixture must have a high-accuracy trap at the top"
+
+    # 2. A combination of profit, drawdown and payoff must not.
+    combo = ["Net PnL", "Return / max drawdown", "Win-rate margin over breakeven"]
+    ranked = combine_objective_scores(frame, combo)
+    assert ranked.iloc[0]["Strategy"] != "A", \
+        f"a combined ranking must reject the 0.07:1 trap, picked {ranked.iloc[0]['Strategy']}"
+    assert ranked.iloc[0]["Strategy"] == "B", \
+        f"the balanced row should win a balanced search, got {ranked.iloc[0]['Strategy']}"
+
+    # 3. Scores are percentiles: 0-100, and scale-free. Net PnL spans 120 to
+    #    20,000 but cannot dominate a 0-100 win margin.
+    assert ranked["Score"].between(0, 100).all(), ranked["Score"].tolist()
+    for column in ("%ile Net PnL", "%ile Return/DD", "%ile Win margin", "Weakest %ile"):
+        assert column in ranked.columns, f"{column} must be shown so a score is traceable"
+
+    # 4. Drawdown is MINIMISED inside a combination too.
+    dd_only = combine_objective_scores(frame, ["Smallest max drawdown"])
+    assert dd_only.iloc[0]["Strategy"] == "D", \
+        f"the shallowest drawdown must rank first, got {dd_only.iloc[0]['Strategy']}"
+    assert dd_only.iloc[-1]["Strategy"] == "C", "the deepest drawdown must rank last"
+
+    # 5. Weights shift the ranking without silencing anything.
+    heavy_pnl = combine_objective_scores(frame, combo, weights={"Net PnL": 8.0})
+    assert heavy_pnl.iloc[0]["Strategy"] == "C", \
+        f"weighting PnL eight-fold should surface the big-PnL row, got "\
+        f"{heavy_pnl.iloc[0]['Strategy']}"
+
+    # 6. The weakest-link floor rejects lopsided combinations.
+    floored = combine_objective_scores(frame, combo, min_percentile=50.0)
+    assert (floored["Weakest %ile"] >= 50.0).all(), floored[["Strategy", "Weakest %ile"]]
+    assert "A" not in set(floored["Strategy"]), "the trap is below the median on payoff"
+    # A floor nothing can clear must not wipe the table out.
+    impossible = combine_objective_scores(frame, combo, min_percentile=99.9)
+    assert not impossible.empty, "an unreachable floor must not return an empty result"
+
+    # 7. An unmeasurable value ranks LAST, never first.
+    with_inf = frame.copy()
+    with_inf.loc[0, "Reward:Risk"] = float("inf")
+    rr = combine_objective_scores(with_inf, ["Reward : risk ratio"])
+    assert rr.iloc[-1]["Strategy"] == "A", \
+        "an infinite ratio is a sample with no loss yet, and must not win the search"
+
+    # 8. Every objective is selectable in a combination.
+    everything = combine_objective_scores(frame, list(OPTIMISER_OBJECTIVES))
+    assert not everything.empty and everything["Score"].between(0, 100).all()
+    print("   combined objectives: percentile-averaged, scale-free, drawdown minimised, "
+          "weights and weakest-link floor honoured  OK")
+
+
 def _test_projected_cross_is_not_a_signal():
     """
     A projected crossover must never be reported as a crossover.
@@ -14367,6 +14519,7 @@ def run_selftest() -> int:
         _test_live_entry_is_not_poll_dependent()
         _test_every_signal_gets_a_recorded_verdict()
         _test_drawdown_and_reward_risk_objectives()
+        _test_combined_objective_ranking()
         _test_projected_cross_is_not_a_signal()
         _test_dhan_previous_oi_gives_a_day_change()
         _test_gamma_blast_always_explains_itself()
@@ -14637,6 +14790,62 @@ OBJECTIVE_TARGETS = {
 _MINIMISE_OBJECTIVES = {"Smallest max drawdown"}
 
 
+#: A sensible starting combination: make money, keep the drawdown shallow, and
+#: do not pay more for a mistake than being right earns.
+DEFAULT_COMBO = ["Net PnL", "Return / max drawdown", "Win-rate margin over breakeven"]
+
+
+def render_objective_picker(prefix: str, label: str = "Optimise for"):
+    """
+    Pick ONE objective, or several and rank by all of them at once.
+
+    Returns ``(objective, column, weights, min_percentile)`` where objective is
+    a string in single mode and a list in combined mode. Everything downstream
+    takes either, so the tabs do not need to know which was chosen.
+    """
+    combined = st.checkbox(
+        "Combine several objectives", value=False, key=f"{prefix}_combo_on",
+        help="Off: rank by one measure. On: rank by all the measures you tick. Each is "
+             "converted to its percentile within this search and the percentiles are "
+             "averaged, so a win rate, a Sharpe ratio and a rupee PnL can be weighed against "
+             "each other without the largest number winning by default.")
+    if not combined:
+        objective = st.selectbox(label, OPTIMISER_OBJECTIVES, key=f"{prefix}_obj")
+        return objective, OBJECTIVE_TARGETS[objective]["column"], {}, 0.0
+
+    st.caption("Tick every measure that matters. A combination has to be good at all of them "
+               "to rank highly, which is a far harder test than topping any single one.")
+    picked, weights = [], {}
+    columns = st.columns(3)
+    for i, objective in enumerate(OPTIMISER_OBJECTIVES):
+        if columns[i % 3].checkbox(objective, value=objective in DEFAULT_COMBO,
+                                   key=f"{prefix}_combo_{objective}"):
+            picked.append(objective)
+
+    if not picked:
+        st.warning("Nothing ticked, so the search falls back to ranking on net PnL alone.")
+        return "Net PnL", "Net PnL", {}, 0.0
+
+    with st.expander(f"Weights and the weakest-link floor ({len(picked)} selected)"):
+        st.caption("A weight of 1 counts an objective once. Raise it to let one measure pull "
+                   "harder without silencing the others.")
+        wcols = st.columns(min(len(picked), 4))
+        for i, objective in enumerate(picked):
+            weights[objective] = wcols[i % len(wcols)].number_input(
+                _OBJECTIVE_SHORT.get(objective, objective), 0.0, 10.0, 1.0, 0.5,
+                key=f"{prefix}_w_{objective}")
+        floor = st.slider(
+            "Minimum percentile on EVERY selected objective", 0, 90, 0, 5,
+            key=f"{prefix}_combo_floor",
+            help="The averaging alone lets a combination that is superb on three measures and "
+                 "dreadful on the fourth still win. Set this and every measure must clear the "
+                 "bar. 0 turns it off; 50 means 'never worse than the median at anything'.")
+    st.caption("Ranked on: " + ", ".join(_OBJECTIVE_SHORT.get(o, o) for o in picked)
+               + ". The results table shows each measure's own percentile plus the weakest "
+                 "of them, so a high score is always traceable.")
+    return picked, "Score", weights, float(floor)
+
+
 def objective_target_input(container, prefix: str, objective: str, label: str = "Desired value"):
     """
     A target input whose default and range follow the selected objective.
@@ -14694,6 +14903,90 @@ def _objective_value(stats: dict, objective: str) -> float:
         "Win-rate margin over breakeven": _finite(stats.get("win_rate_margin")),
     }.get(objective, 0.0)
     return float(raw)
+
+
+# Short names for the per-objective percentile columns, so a combined table
+# stays readable instead of carrying nine long headings.
+_OBJECTIVE_SHORT = {
+    "Win rate (accuracy)": "Accuracy", "Sharpe ratio": "Sharpe", "Net PnL": "Net PnL",
+    "Expectancy per trade": "Expectancy", "Profit factor": "Profit factor",
+    "Return / max drawdown": "Return/DD", "Smallest max drawdown": "Drawdown",
+    "Reward : risk ratio": "Reward:Risk", "Win-rate margin over breakeven": "Win margin",
+}
+
+
+def objective_label(objective) -> str:
+    """A readable name for one objective or for a combination of them."""
+    if isinstance(objective, (list, tuple)):
+        names = [_OBJECTIVE_SHORT.get(o, o) for o in objective]
+        return ("a combined score across " + ", ".join(names)) if names else "net PnL"
+    return str(objective).lower()
+
+
+def combine_objective_scores(frame: pd.DataFrame, objectives: list[str],
+                             weights: dict | None = None,
+                             min_percentile: float = 0.0) -> pd.DataFrame:
+    """
+    Rank one search by SEVERAL objectives at once.
+
+    Adding the raw numbers together is meaningless: a win rate runs 0-100, a
+    Sharpe ratio 0-3 and a net PnL into the tens of thousands, so a plain sum is
+    just net PnL wearing a disguise. Each objective is therefore converted to
+    its PERCENTILE within this search -- "better than 80% of the combinations
+    tried" -- and the percentiles are averaged. That is scale-free, so every
+    objective genuinely counts, and the result reads as 0-100 whatever is
+    selected.
+
+    Direction is handled per objective: drawdown is ranked so that the
+    shallowest wins. A value that cannot be measured (an infinite profit factor
+    from a sample with no losing trade) ranks LAST on that objective rather
+    than first, because an unmeasurable result is not a good one.
+
+    ``min_percentile`` is the weakest-link floor. Averaging alone lets a
+    combination that is excellent on three objectives and dreadful on the
+    fourth still win; with a floor set, every selected objective must clear it.
+    """
+    if frame.empty or not objectives:
+        return frame
+    out = frame.copy()
+    weights = {k: float(v) for k, v in (weights or {}).items()}
+
+    percentiles, used = [], []
+    for objective in objectives:
+        spec = OBJECTIVE_TARGETS.get(objective)
+        if not spec or spec["column"] not in out.columns:
+            continue
+        series = pd.to_numeric(out[spec["column"]], errors="coerce")
+        series = series.replace([np.inf, -np.inf], np.nan)
+        if objective in _MINIMISE_OBJECTIVES:
+            # Shallowest drawdown wins, so rank the magnitude in reverse.
+            series = series.abs()
+            ranked = series.rank(pct=True, ascending=False, na_option="bottom")
+        else:
+            ranked = series.rank(pct=True, ascending=True, na_option="bottom")
+        ranked = (ranked * 100.0).where(series.notna(), 0.0)
+        label = f"%ile {_OBJECTIVE_SHORT.get(objective, objective)}"
+        out[label] = ranked.round(1)
+        percentiles.append((objective, ranked))
+        used.append(label)
+
+    if not percentiles:
+        return frame
+
+    total_weight = sum(max(weights.get(obj, 1.0), 0.0) for obj, _ in percentiles) or 1.0
+    blended = sum(series * max(weights.get(obj, 1.0), 0.0)
+                  for obj, series in percentiles) / total_weight
+    out["Score"] = blended.round(2)
+    out["Weakest %ile"] = pd.concat([s for _, s in percentiles], axis=1).min(axis=1).round(1)
+    out["Objectives"] = ", ".join(_OBJECTIVE_SHORT.get(o, o) for o, _ in percentiles)
+
+    floor = float(min_percentile or 0.0)
+    if floor > 0:
+        keep = out["Weakest %ile"] >= floor
+        # Never return nothing: if the floor eliminates every combination, say
+        # so by keeping the best-of-the-rejected rather than an empty table.
+        out = out[keep] if bool(keep.any()) else out
+    return out.sort_values("Score", ascending=False).reset_index(drop=True)
 
 
 def parse_number_list(text: str, fallback: list[float]) -> list[float]:
@@ -14798,10 +15091,11 @@ def grid_size(grid: dict) -> int:
 
 
 def optimise(df: pd.DataFrame, base_params: dict, quantity: float, costs: CostModel,
-             objective: str, min_trades: int, iterations: int, seed: int = 11,
+             objective, min_trades: int, iterations: int, seed: int = 11,
              safe_exits_only: bool = True, progress=None,
              grid: dict | None = None, exhaustive: bool = False,
-             scale_points: bool = True) -> pd.DataFrame:
+             scale_points: bool = True, weights: dict | None = None,
+             min_percentile: float = 0.0) -> pd.DataFrame:
     """
     Randomised search over strategy x stop x target x one optional filter.
 
@@ -14809,7 +15103,14 @@ def optimise(df: pd.DataFrame, base_params: dict, quantity: float, costs: CostMo
     of backtests. And a caution that matters more than the search itself: the
     more combinations tried, the more likely the winner is luck. Treat the
     ranking as a shortlist to validate out of sample, never as a result.
+
+    ``objective`` is either one objective name or a LIST of them. With a list
+    the ranking is the average percentile across all of them, which is how a
+    search can be asked for profit AND a shallow drawdown AND a sane
+    reward:risk at the same time rather than one at the expense of the others.
     """
+    combo = [o for o in objective] if isinstance(objective, (list, tuple, set)) else []
+    primary = combo[0] if combo else objective
     rng = np.random.default_rng(seed)
     if grid is None:
         grid = {"strategies": [n for n in STRATEGY_NAMES
@@ -14882,13 +15183,19 @@ def optimise(df: pd.DataFrame, base_params: dict, quantity: float, costs: CostMo
             "Win margin %": st_.get("win_rate_margin"),
             "Avg Win": st_.get("avg_win"), "Avg Loss": st_.get("avg_loss"),
             "Reliability": st_["reliability"],
-            "Score": _objective_value(st_, objective),
+            "Score": _objective_value(st_, primary),
         })
 
     frame = pd.DataFrame(rows)
     if frame.empty:
         return frame
-    frame = frame.sort_values("Score", ascending=False).reset_index(drop=True)
+    if combo:
+        # Re-score across every selected objective. This has to happen after
+        # the whole search, because a percentile only means something relative
+        # to the other combinations tried.
+        frame = combine_objective_scores(frame, combo, weights, min_percentile)
+    else:
+        frame = frame.sort_values("Score", ascending=False).reset_index(drop=True)
     frame.insert(0, "Rank", range(1, len(frame) + 1))
     return frame
 
