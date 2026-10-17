@@ -7489,6 +7489,14 @@ NIFTY_NEXT_50 = [
     "TATAPOWER", "TORNTPHARM", "TVSMOTOR", "UNITDSPR", "VBL", "VEDL", "ZYDUSLIFE",
 ]
 
+# Ticker -> sector, filled in from the NSE constituent CSVs as universes are
+# resolved. Seeded with the index symbols, which have no "industry" of their
+# own. Anything unknown is shown as "--" rather than guessed at.
+SECTOR_BY_TICKER: dict[str, str] = {
+    "^NSEI": "Index", "^NSEBANK": "Index", "^BSESN": "Index",
+    "NIFTY_FIN_SERVICE.NS": "Index", "^NSMIDCP": "Index",
+}
+
 SECTOR_INDICES = {
     "Nifty 50": "^NSEI", "Nifty Bank": "^NSEBANK", "Nifty IT": "^CNXIT",
     "Nifty Pharma": "^CNXPHARMA", "Nifty Auto": "^CNXAUTO", "Nifty FMCG": "^CNXFMCG",
@@ -7619,6 +7627,15 @@ def _fetch_nse_constituents(index_name: str, timeout: float = 6.0) -> list[str]:
     names = [str(v).strip().upper() for v in frame[col].dropna()]
     if not names:
         raise ValueError("NSE returned an empty constituent list")
+
+    # The same CSV carries each constituent's industry, so the sector labels a
+    # screener shows come from the index provider rather than from a hand-typed
+    # mapping that would drift the moment the index is rebalanced.
+    industry = next((c for c in frame.columns if c.strip().lower() == "industry"), None)
+    if industry is not None:
+        for symbol, sector in zip(frame[col], frame[industry]):
+            if pd.notna(symbol) and pd.notna(sector):
+                SECTOR_BY_TICKER[f"{str(symbol).strip().upper()}.NS"] = str(sector).strip()
     return names
 
 
@@ -11802,6 +11819,761 @@ def tab_gamma_blast(cfg: dict) -> None:
     render_analyst_panel("gamma", "these gamma blast candidates", _frame_context(frame))
 
 
+# =============================================================================
+# SECTION 19f -- MOMENTUM PULSE SCREENER   (intraday checklist screener)
+# =============================================================================
+# A condition-count screener: each ticker is scored out of four on the bullish
+# side and four on the bearish side, and the counts are shown side by side.
+#
+# WHAT THE FOUR CONDITIONS MEAN HERE. The abbreviations come from a screen the
+# operator saw, not from a published specification, so each one is implemented
+# as the most standard reading of its name and the definition is printed in the
+# tab. They are configurable where a number is involved, so a different reading
+# can be dialled in rather than argued about.
+#
+#   BULLISH            BEARISH
+#   Breakout  above the opening range high      below the opening range low
+#   Volume    current volume >= N x average     (same test, on the bear side)
+#   PDH       trading above the PREVIOUS day's high
+#   Range     today's range has EXPANDED beyond its recent average
+#   VWAP                                        trading below session VWAP
+#   DL                                          at or near today's LOW
+#   PDL                                         trading below the PREVIOUS day's low
+#
+# A count is not a signal. Four of four means four conditions are true at this
+# instant, which is a reason to look at a chart, not an instruction to trade.
+
+PULSE_BULL = ["Breakout", "Volume", "PDH", "Range"]
+PULSE_BEAR = ["Breakout", "VWAP", "DL", "PDL"]
+
+
+def previous_session_levels(frame: pd.DataFrame) -> tuple[float, float, float]:
+    """
+    Previous session's high, low and close, from an intraday frame.
+
+    Taken by grouping the intraday candles into calendar sessions rather than
+    by fetching a second daily series: one download per ticker is already the
+    throughput ceiling of this whole application.
+    """
+    sessions = session_key(frame.index)
+    unique = list(dict.fromkeys(sessions.tolist()))
+    if len(unique) < 2:
+        return float("nan"), float("nan"), float("nan")
+    previous = frame[sessions == unique[-2]]
+    if previous.empty:
+        return float("nan"), float("nan"), float("nan")
+    return (float(previous["High"].max()), float(previous["Low"].min()),
+            float(previous["Close"].iloc[-1]))
+
+
+def momentum_pulse_scan_one(ticker: str, interval: str, pcfg: dict) -> dict:
+    """
+    Score one ticker on both checklists. ALWAYS returns a row.
+
+    Returning a row even when nothing is true is deliberate: a screener that
+    silently drops the quiet names cannot be told apart from one that is
+    broken, and the counts are the whole point -- 0/4 is information.
+    """
+    period, _ = lab_period_for(interval, 200)
+    bundle = load_market_data(ticker, period, interval, freshness_seconds=120, min_bars=30)
+    frame = bundle.frame
+    sessions = session_key(frame.index)
+    today = frame[sessions == sessions.iloc[-1]]
+    if today.empty:
+        today = frame.tail(1)
+
+    price = float(frame["Close"].iloc[-1])
+    pdh, pdl, pdc = previous_session_levels(frame)
+    day_high, day_low = float(today["High"].max()), float(today["Low"].min())
+
+    # Opening range: the first N candles of the current session.
+    or_bars = int(pcfg.get("or_bars", 3))
+    opening = today.head(or_bars)
+    or_high = float(opening["High"].max()) if len(opening) else float("nan")
+    or_low = float(opening["Low"].min()) if len(opening) else float("nan")
+
+    # Volume against its own recent average. Indices report none, so the test
+    # is reported as unavailable rather than silently passed or failed.
+    vol_len = int(pcfg.get("vol_len", 20))
+    has_volume = float(frame["Volume"].tail(100).abs().sum()) > 0
+    vol_now = float(frame["Volume"].iloc[-1])
+    vol_avg = float(sma(frame["Volume"], vol_len).iloc[-1] or 0.0)
+    vol_ratio = (vol_now / vol_avg) if (has_volume and vol_avg) else float("nan")
+    vol_ok = bool(np.isfinite(vol_ratio) and vol_ratio >= float(pcfg.get("vol_mult", 1.5)))
+
+    # Range expansion: today's range so far against the average session range.
+    day_range = day_high - day_low
+    past = frame[sessions != sessions.iloc[-1]]
+    if len(past):
+        per_session = past.groupby(session_key(past.index)).agg(
+            hi=("High", "max"), lo=("Low", "min"))
+        avg_range = float((per_session["hi"] - per_session["lo"]).tail(
+            int(pcfg.get("range_len", 10))).mean())
+    else:
+        avg_range = float("nan")
+    range_ratio = (day_range / avg_range) if (np.isfinite(avg_range) and avg_range > 0) \
+        else float("nan")
+    range_ok = bool(np.isfinite(range_ratio)
+                    and range_ratio >= float(pcfg.get("range_mult", 1.0)))
+
+    series, volume_backed = vwap(frame, True)
+    vwap_now = float(series.iloc[-1]) if len(series) else float("nan")
+
+    near_pct = float(pcfg.get("near_pct", 0.25)) / 100.0
+    bull = {
+        "Breakout": bool(np.isfinite(or_high) and price > or_high),
+        "Volume": vol_ok,
+        "PDH": bool(np.isfinite(pdh) and price > pdh),
+        "Range": range_ok,
+    }
+    bear = {
+        "Breakout": bool(np.isfinite(or_low) and price < or_low),
+        "VWAP": bool(np.isfinite(vwap_now) and price < vwap_now),
+        "DL": bool(np.isfinite(day_low) and day_low > 0
+                   and (price - day_low) <= day_low * near_pct),
+        "PDL": bool(np.isfinite(pdl) and price < pdl),
+    }
+    change_pct = ((price - pdc) / pdc * 100.0) if (np.isfinite(pdc) and pdc) else float("nan")
+
+    row = {
+        "Ticker": ticker, "Timeframe": interval,
+        "Sector": SECTOR_BY_TICKER.get(ticker, "--"),
+        "Price": round(price, 2),
+        "Change %": round(change_pct, 2) if np.isfinite(change_pct) else None,
+        "Bullish": f"{sum(bull.values())}/4", "Bearish": f"{sum(bear.values())}/4",
+        "Bull count": sum(bull.values()), "Bear count": sum(bear.values()),
+        "Bias": ("BULLISH" if sum(bull.values()) > sum(bear.values())
+                 else "BEARISH" if sum(bear.values()) > sum(bull.values()) else "MIXED"),
+        "OR High": round(or_high, 2) if np.isfinite(or_high) else None,
+        "OR Low": round(or_low, 2) if np.isfinite(or_low) else None,
+        "PDH": round(pdh, 2) if np.isfinite(pdh) else None,
+        "PDL": round(pdl, 2) if np.isfinite(pdl) else None,
+        "Day High": round(day_high, 2), "Day Low": round(day_low, 2),
+        "VWAP": round(vwap_now, 2) if np.isfinite(vwap_now) else None,
+        "VWAP is real": "yes" if volume_backed else "no (zero-volume feed, TWAP)",
+        "Volume x": round(vol_ratio, 2) if np.isfinite(vol_ratio) else None,
+        "Volume needed": float(pcfg.get("vol_mult", 1.5)),
+        "Range x": round(range_ratio, 2) if np.isfinite(range_ratio) else None,
+        "Range needed": float(pcfg.get("range_mult", 1.0)),
+        "Checked at": pd.Timestamp.now(),
+    }
+    for name, passed in bull.items():
+        row[f"B:{name}"] = "YES" if passed else "NO"
+    for name, passed in bear.items():
+        row[f"S:{name}"] = "YES" if passed else "NO"
+    return row
+
+
+def _pulse_checklist(row: dict) -> None:
+    """The two four-row checklists, as the operator's reference screen shows them."""
+    left, right = st.columns(2)
+    with left:
+        st.markdown(f"**BULLISH {row.get('Bullish', '--')}**")
+        for name in PULSE_BULL:
+            passed = str(row.get(f"B:{name}")) == "YES"
+            st.markdown(f"{name} &nbsp; {':green[**YES**]' if passed else ':red[**NO**]'}",
+                        unsafe_allow_html=True)
+    with right:
+        st.markdown(f"**BEARISH {row.get('Bearish', '--')}**")
+        for name in PULSE_BEAR:
+            passed = str(row.get(f"S:{name}")) == "YES"
+            st.markdown(f"{name} &nbsp; {':green[**YES**]' if passed else ':red[**NO**]'}",
+                        unsafe_allow_html=True)
+    st.caption("Not a buy/sell signal. These are four conditions being true at this instant, "
+               "which is a reason to open a chart, not an instruction to trade.")
+
+
+def tab_momentum_pulse(cfg: dict) -> None:
+    st.subheader("Momentum Pulse \u2014 intraday condition screener")
+    st.warning(
+        "**A condition count is not a strategy, and this tab does not backtest anything.** "
+        "It reports which of four bullish and four bearish conditions are true right now. "
+        "Nothing here has been tested for whether 4/4 makes money -- to find that out, apply a "
+        "name to the sidebar and run it through the Backtesting tab or the Signal Lab.")
+
+    c1, c2, c3 = st.columns(3)
+    universe = c1.selectbox("Universe", SCREENER_UNIVERSES, key="pulse_universe")
+    intraday_choices = [i for i in INTERVALS if i in INTRADAY_INTERVALS]
+    interval = c2.selectbox(
+        "Timeframe", intraday_choices, index=intraday_choices.index("5m"),
+        key="pulse_tf",
+        help="The reference screen does not state its timeframe. 5m is the usual choice for "
+             "an intraday breakout screen: fast enough to catch a move, slow enough that the "
+             "opening-range and volume tests are not pure noise. 15m is the steadier option.")
+    bias_filter = c3.selectbox("Show", ["Everything", "Bullish only", "Bearish only",
+                                        "4/4 only"], key="pulse_bias")
+
+    custom_text = ""
+    if universe.startswith("Custom"):
+        custom_text = st.text_area("Tickers", "RELIANCE\nTCS\nINFY", key="pulse_custom")
+    all_tickers, note = universe_tickers_ui(universe, custom_text, None, "pulse")
+    chosen = st.multiselect(f"Tickers ({len(all_tickers)} in {universe})", all_tickers,
+                            default=all_tickers, key=f"pulse_tickers_{universe}")
+    if note:
+        st.caption(note)
+
+    with st.expander("What each condition means, and its threshold", expanded=False):
+        st.markdown(
+            "| Condition | Bullish test | Bearish test |\n|---|---|---|\n"
+            "| **Breakout** | above the opening-range high | below the opening-range low |\n"
+            "| **Volume** | current volume >= N x its average | the same test |\n"
+            "| **PDH / PDL** | above the PREVIOUS day's high | below the previous day's low |\n"
+            "| **Range** | today's range has expanded past its average | -- |\n"
+            "| **VWAP** | -- | trading below session VWAP |\n"
+            "| **DL** | -- | sitting at or near today's low |\n")
+        st.caption("These are the standard readings of the abbreviations; the source screen "
+                   "publishes no definitions. Every number below is yours to change.")
+        st.info(
+            "**Volume and Range are direction-neutral.** They appear only on the bullish "
+            "checklist, exactly as the reference screen has them, but a hard sell-off also "
+            "has heavy volume and an expanded range. So a falling stock can legitimately "
+            "read **2/4 bullish** alongside **4/4 bearish** — the two counts are not "
+            "opposites and do not sum to four. The directional tests are Breakout and "
+            "PDH/PDL; those are the ones that disagree with each other.")
+        p1, p2, p3 = st.columns(3)
+        or_bars = p1.number_input("Opening range (candles)", 1, 24, 3, 1, key="pulse_or")
+        vol_mult = p2.number_input("Volume multiple", 1.0, 10.0, 1.5, 0.1, key="pulse_vol")
+        range_mult = p3.number_input("Range expansion multiple", 0.1, 5.0, 1.0, 0.05,
+                                     key="pulse_range")
+        q1, q2, q3 = st.columns(3)
+        vol_len = q1.number_input("Volume average (candles)", 5, 200, 20, 5, key="pulse_vlen")
+        range_len = q2.number_input("Range average (sessions)", 2, 60, 10, 1, key="pulse_rlen")
+        near_pct = q3.number_input("\"At the low\" tolerance (%)", 0.0, 5.0, 0.25, 0.05,
+                                   key="pulse_near")
+
+    pcfg = {"or_bars": or_bars, "vol_mult": vol_mult, "range_mult": range_mult,
+            "vol_len": vol_len, "range_len": range_len, "near_pct": near_pct}
+
+    def _worker(ticker):
+        try:
+            return [momentum_pulse_scan_one(ticker, interval, pcfg)], []
+        except Exception as exc:                                    # noqa: BLE001
+            return [], [{"Ticker": ticker, "Problem": str(exc)[:140]}]
+
+    scan_cost_notice(len(chosen), per_job_hint=1.5, prefix="pulse")
+    rows, errs, _done = chunked_sweep("pulse", list(chosen), _worker,
+                                      _auto_slice_seconds(), "tickers")
+
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        st.info("Nothing scanned yet. Press **Run** above.")
+        if errs:
+            with st.expander(f"Tickers that could not be read ({len(errs)})"):
+                st.dataframe(pd.DataFrame(errs), width="stretch", hide_index=True)
+        return
+
+    a, b, c, d = st.columns(4)
+    a.metric("Scanned", len(frame))
+    a_bull = frame[frame["Bias"] == "BULLISH"]
+    a_bear = frame[frame["Bias"] == "BEARISH"]
+    b.metric("Leaning bullish", len(a_bull))
+    c.metric("Leaning bearish", len(a_bear))
+    d.metric("4 of 4 either way",
+             int(((frame["Bull count"] == 4) | (frame["Bear count"] == 4)).sum()))
+
+    view = frame
+    if bias_filter == "Bullish only":
+        view = frame[frame["Bias"] == "BULLISH"]
+    elif bias_filter == "Bearish only":
+        view = frame[frame["Bias"] == "BEARISH"]
+    elif bias_filter == "4/4 only":
+        view = frame[(frame["Bull count"] == 4) | (frame["Bear count"] == 4)]
+
+    if view.empty:
+        st.info("Nothing matches that filter. Switch **Show** back to Everything to see the "
+                "full scan and how close each name came.")
+        return
+
+    order = [c for c in ["Ticker", "Sector", "Price", "Change %", "Bias", "Bullish", "Bearish",
+                         "B:Breakout", "B:Volume", "B:PDH", "B:Range",
+                         "S:Breakout", "S:VWAP", "S:DL", "S:PDL",
+                         "Volume x", "Volume needed", "Range x", "Range needed",
+                         "OR High", "OR Low", "PDH", "PDL", "Day High", "Day Low",
+                         "VWAP", "VWAP is real", "Timeframe", "Checked at"]
+             if c in view.columns]
+    st.dataframe(
+        view.sort_values(["Bull count", "Bear count", "Change %"],
+                         ascending=[False, False, False])[order],
+        width="stretch", hide_index=True,
+        column_config={"Change %": st.column_config.NumberColumn("Change %", format="%.2f%%")})
+    st.download_button("Download the scan (CSV)", view[order].to_csv(index=False).encode(),
+                       f"momentum_pulse_{pd.Timestamp.now():%Y%m%d_%H%M}.csv", "text/csv",
+                       key="pulse_dl")
+
+    st.markdown("#### Inspect and apply")
+    s1, s2 = st.columns([2, 1])
+    pick = s1.selectbox("Ticker", view["Ticker"].tolist(), key="pulse_pick")
+    picked = view[view["Ticker"] == pick].iloc[0].to_dict()
+    _pulse_checklist(picked)
+    if s2.button("Apply to the sidebar", width="stretch", key="pulse_apply",
+                 help="Sends this ticker and timeframe to the control console so it can be "
+                      "backtested, optimised or traded live with a real strategy."):
+        st.session_state.pending_ticker = pick
+        st.session_state.pending_combo = {
+            "strategy": "05 \u00b7 Opening Range Breakout (ORB)",
+            "sl_type": "ATR Multiple", "sl_value": 1.5,
+            "tp_type": "Risk : Reward Multiple", "tp_value": 2.0,
+            "filter_key": "", "widgets": {"cfg_interval": interval}}
+        st.rerun()
+
+    if errs:
+        with st.expander(f"Tickers that could not be read ({len(errs)})"):
+            st.dataframe(pd.DataFrame(errs), width="stretch", hide_index=True)
+    render_analyst_panel("pulse", "these momentum pulse candidates", _frame_context(frame))
+
+
+# =============================================================================
+# SECTION 19g -- VOLATILITY LEVELS SCREENER
+# =============================================================================
+# Three independent pieces, each honest about where it applies.
+#
+# 1. STANDARD-DEVIATION LEVELS
+#    The operator's formula is (India VIX / 1600) * spot = one standard
+#    deviation of a DAY's move. That constant is not arbitrary: VIX quotes an
+#    ANNUALISED implied volatility in percent, so a daily sigma is
+#    VIX / 100 / sqrt(252) = VIX / 1587. Rounding 1587 to 1600 is the usual
+#    desk shorthand, and the divisor is exposed below so it can be set exactly.
+#
+#    WHERE IT APPLIES. India VIX is computed from NIFTY option prices. It is a
+#    statement about Nifty and nothing else. Using it on Bank Nifty understates
+#    the move -- Bank Nifty is materially more volatile than Nifty -- and on a
+#    single stock or on Bitcoin it has no meaning at all. For anything that is
+#    not Nifty the honest input is the instrument's OWN volatility, measured
+#    from its own returns, which is what REALISED mode does.
+#
+# 2. ATR EXPANSION
+#    ATR(14) against its own 20-period average. Instrument-agnostic: it needs
+#    only OHLC, so it is as valid on Bitcoin as on Nifty.
+#
+# 3. OPEN-INTEREST MOMENTUM RATIO
+#    change in PUT OI divided by change in CALL OI over an interval. This is a
+#    statement about an options market, so it exists only where an options
+#    market exists: the Indian indices and F&O stocks. There is no Indian
+#    option chain for Bitcoin or for a cash-only stock, and the tab says so
+#    rather than printing a number that cannot mean anything.
+
+SD_MULTIPLES = (1, 2, 3)
+
+
+def realised_daily_sigma(frame: pd.DataFrame, lookback: int = 20) -> float:
+    """
+    One day's standard deviation as a FRACTION of price, from the instrument's
+    own daily returns.
+
+    This is what replaces India VIX on anything that is not Nifty. It is
+    backward looking where VIX is forward looking, which is a real difference
+    and is stated in the tab rather than glossed over.
+    """
+    closes = frame["Close"].dropna()
+    if len(closes) < max(5, lookback // 2):
+        return float("nan")
+    returns = np.log(closes / closes.shift(1)).dropna().tail(int(lookback))
+    if len(returns) < 3:
+        return float("nan")
+    sigma = float(returns.std(ddof=1))
+    return sigma if np.isfinite(sigma) and sigma > 0 else float("nan")
+
+
+def sd_levels(spot: float, sigma_fraction: float,
+              multiples=SD_MULTIPLES) -> dict:
+    """Spot plus and minus each standard-deviation multiple."""
+    out: dict = {}
+    if not (np.isfinite(spot) and np.isfinite(sigma_fraction)):
+        return out
+    one = float(spot) * float(sigma_fraction)
+    out["1SD points"] = round(one, 2)
+    for n in multiples:
+        out[f"+{n}SD"] = round(float(spot) + n * one, 2)
+        out[f"-{n}SD"] = round(float(spot) - n * one, 2)
+    return out
+
+
+def vix_daily_sigma(vix: float, divisor: float = 1600.0) -> float:
+    """India VIX -> one day's sigma as a fraction of spot."""
+    try:
+        return float(vix) / float(divisor)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return float("nan")
+
+
+def atr_expansion(frame: pd.DataFrame, atr_len: int = 14, avg_len: int = 20) -> float:
+    """
+    ATR against its own average. Above 1 volatility is expanding, below 1 it is
+    contracting. Instrument-agnostic: it needs only OHLC.
+    """
+    series = atr(frame["High"], frame["Low"], frame["Close"], int(atr_len))
+    average = sma(series, int(avg_len))
+    try:
+        now, mean = float(series.iloc[-1]), float(average.iloc[-1])
+    except (IndexError, TypeError, ValueError):
+        return float("nan")
+    if not (np.isfinite(now) and np.isfinite(mean)) or mean <= 0:
+        return float("nan")
+    return now / mean
+
+
+def has_option_chain(ticker: str) -> bool:
+    """
+    Is there an Indian option chain for this name at all?
+
+    The open-interest test is a statement about an options market. Bitcoin, spot
+    FX, commodity futures and US equities have no NSE chain, so the ratio is not
+    merely unavailable there -- it is undefined, and is reported as such.
+    """
+    t = (ticker or "").upper()
+    if t.endswith("-USD") or t.endswith("=X") or t.endswith("=F"):
+        return False
+    return t.startswith("^") or t.endswith(".NS") or t in {"NIFTY_FIN_SERVICE.NS"}
+
+
+def oi_momentum_ratio(ticker: str, spot: float, strikes_each_side: int = 5,
+                      window_minutes: float = 15.0) -> dict:
+    """
+    change in PUT open interest over change in CALL open interest.
+
+    Summed across the strikes either side of spot rather than read off one
+    strike: a single strike's open interest is noisy and the claim being tested
+    -- "put writers are adding faster than call writers" -- is about the band
+    around the money, not about one line of the chain.
+
+    The ratio is only formed when BOTH sides are genuinely adding. When call
+    open interest is FALLING the denominator is negative and the quotient stops
+    meaning what the rule says it means, so the raw changes are returned and
+    the ratio is left undefined. Dividing anyway would produce a confident
+    number pointing the wrong way.
+    """
+    store = (st.session_state.get("oi_snapshots") or {}) if st is not None else {}
+    series = store.get(ticker) or []
+    out = {"samples": len(series)}
+    if len(series) < 2:
+        out["note"] = (f"{len(series)} chain snapshot(s) held. The ratio is a CHANGE over "
+                       f"time, so it needs two samples about {window_minutes:.0f} minutes "
+                       f"apart. Run the scan again after that gap.")
+        return out
+
+    first, last = series[0], series[-1]
+    minutes = (pd.Timestamp(last["at"]) - pd.Timestamp(first["at"])).total_seconds() / 60.0
+    out["minutes"] = round(minutes, 1)
+
+    strikes = sorted(set(first.get("chain", {})) & set(last.get("chain", {})))
+    if not strikes:
+        out["note"] = "The two snapshots share no strikes, so nothing can be compared."
+        return out
+    step = min((b - a for a, b in zip(strikes, strikes[1:]) if b > a), default=0.0)
+    band = step * int(strikes_each_side) if step else float("inf")
+    near = [k for k in strikes if abs(k - float(spot)) <= band] or strikes
+    out["strikes compared"] = len(near)
+
+    d_ce = d_pe = 0.0
+    for k in near:
+        a, b = first["chain"].get(k) or {}, last["chain"].get(k) or {}
+        for side, bucket in (("ce", "d_ce"), ("pe", "d_pe")):
+            was, now = a.get(f"{side}_oi"), b.get(f"{side}_oi")
+            if was is None or now is None:
+                continue
+            if np.isfinite(was) and np.isfinite(now):
+                if bucket == "d_ce":
+                    d_ce += float(now) - float(was)
+                else:
+                    d_pe += float(now) - float(was)
+    out["CE OI change"] = round(d_ce, 0)
+    out["PE OI change"] = round(d_pe, 0)
+
+    if d_ce > 0 and d_pe > 0:
+        out["MR"] = round(d_pe / d_ce, 3)
+    elif d_ce <= 0 < d_pe:
+        out["note"] = ("Put open interest is rising while CALL open interest is FALLING. "
+                       "That is call writers closing, not put writers outpacing them, and the "
+                       "ratio is undefined with a non-positive denominator. Read it as bullish "
+                       "pressure, but not through this formula.")
+    elif d_pe <= 0 < d_ce:
+        out["note"] = ("Call open interest is rising while PUT open interest is FALLING -- "
+                       "bearish pressure, but again not something this ratio can express.")
+    else:
+        out["note"] = "Open interest fell on both sides: positions are being closed, not added."
+    return out
+
+
+def volatility_scan_one(ticker: str, vcfg: dict, broker: dict | None = None) -> dict:
+    """One ticker: standard-deviation levels, ATR expansion, and the OI ratio."""
+    # --- daily frame for the levels -----------------------------------------
+    daily = load_market_data(ticker, "1y", "1d", freshness_seconds=300, min_bars=30).frame
+    spot = float(daily["Close"].iloc[-1])
+
+    mode = str(vcfg.get("sigma_mode", "Auto"))
+    is_nifty = (ticker or "").upper() in {"^NSEI"}
+    use_vix = (mode == "India VIX") or (mode == "Auto" and is_nifty)
+
+    vix = vcfg.get("vix")
+    sigma, basis, caution = float("nan"), "", ""
+    if use_vix and vix is not None and np.isfinite(float(vix)):
+        sigma = vix_daily_sigma(float(vix), float(vcfg.get("vix_divisor", 1600.0)))
+        basis = f"India VIX {fmt(vix)} / {fmt(vcfg.get('vix_divisor', 1600.0), 0)}"
+        if not is_nifty:
+            caution = ("India VIX prices NIFTY options. Applied to this instrument it is a "
+                       "borrowed number, not a measurement of it.")
+    else:
+        sigma = realised_daily_sigma(daily, int(vcfg.get("rv_lookback", 20)))
+        basis = f"realised {int(vcfg.get('rv_lookback', 20))}-day volatility"
+        if use_vix:
+            caution = "India VIX was unavailable, so realised volatility was used instead."
+
+    levels = sd_levels(spot, sigma)
+
+    # --- ATR expansion on the intraday timeframe ----------------------------
+    interval = str(vcfg.get("interval", "5m"))
+    period, _ = lab_period_for(interval, 200)
+    intraday = load_market_data(ticker, period, interval,
+                                freshness_seconds=120, min_bars=40).frame
+    expansion = atr_expansion(intraday, int(vcfg.get("atr_len", 14)),
+                              int(vcfg.get("atr_avg_len", 20)))
+    squeeze_at = float(vcfg.get("squeeze_below", 1.0))
+    expand_at = float(vcfg.get("expand_above", 1.3))
+    if not np.isfinite(expansion):
+        vol_state = "unknown"
+    elif expansion < squeeze_at:
+        vol_state = "SQUEEZE"
+    elif expansion > expand_at:
+        vol_state = "EXPANSION"
+    else:
+        vol_state = "neutral"
+
+    # --- where spot sits inside its own bands -------------------------------
+    one_sd = levels.get("1SD points", float("nan"))
+    band = "--"
+    if np.isfinite(one_sd) and one_sd > 0:
+        distance = 0.0            # spot is the anchor, so measure the DAY's travel
+        open_px = float(daily["Open"].iloc[-1])
+        distance = (spot - open_px) / one_sd
+        band = f"{distance:+.2f} SD from today's open"
+
+    row = {
+        "Ticker": ticker, "Spot": round(spot, 2),
+        "Sigma basis": basis, "1 SD (points)": levels.get("1SD points"),
+        "1 SD (%)": round(sigma * 100.0, 3) if np.isfinite(sigma) else None,
+        "Travelled": band,
+        "ATR expansion": round(expansion, 3) if np.isfinite(expansion) else None,
+        "Volatility state": vol_state,
+        "Squeeze below": squeeze_at, "Expansion above": expand_at,
+        "Option buying": ("avoid - theta decays while spot drifts" if vol_state == "SQUEEZE"
+                          else "favourable" if vol_state == "EXPANSION" else "no edge either way"),
+        "Caution": caution or "-",
+        "Checked at": pd.Timestamp.now(),
+    }
+    row.update({k: v for k, v in levels.items() if k != "1SD points"})
+
+    # --- open-interest momentum --------------------------------------------
+    mr_note, mr_value, mr_signal = "not applicable to this instrument", None, "-"
+    if vcfg.get("use_oi") and has_option_chain(ticker):
+        if broker:
+            _chain, fetch_note = sample_chain_for(broker, ticker)
+        else:
+            fetch_note = "no Dhan credentials"
+        stats = oi_momentum_ratio(ticker, spot,
+                                  int(vcfg.get("strikes_each_side", 5)),
+                                  float(vcfg.get("mr_window", 15.0)))
+        mr_value = stats.get("MR")
+        row["CE OI change"] = stats.get("CE OI change")
+        row["PE OI change"] = stats.get("PE OI change")
+        row["OI window (min)"] = stats.get("minutes")
+        if mr_value is None:
+            mr_note = stats.get("note") or fetch_note
+        else:
+            bull_at = float(vcfg.get("mr_bull", 2.5))
+            bear_at = float(vcfg.get("mr_bear", 0.4))
+            if mr_value > bull_at:
+                mr_signal = "BULLISH - buy ITM call"
+            elif mr_value < bear_at:
+                mr_signal = "BEARISH - buy ITM put"
+            else:
+                mr_signal = "no trigger"
+            mr_note = (f"put OI change {fmt(stats.get('PE OI change'), 0)} over call OI change "
+                       f"{fmt(stats.get('CE OI change'), 0)} across "
+                       f"{stats.get('strikes compared', 0)} strikes in "
+                       f"{fmt(stats.get('minutes'), 0)} min")
+    elif vcfg.get("use_oi"):
+        mr_note = "no Indian option chain exists for this instrument"
+
+    row["OI momentum ratio"] = mr_value
+    row["OI trigger"] = mr_signal
+    row["OI state"] = mr_note
+    return row
+
+
+def tab_volatility_levels(cfg: dict) -> None:
+    st.subheader("Volatility Levels — standard-deviation bands, expansion and OI flow")
+    st.warning(
+        "**Three separate tests, and they do not all apply to every instrument.** The "
+        "standard-deviation bands need a volatility input, and India VIX only measures NIFTY. "
+        "The ATR expansion test works on anything with candles. The open-interest ratio needs "
+        "an options market, so it exists for the Indian indices and F&O stocks and nowhere "
+        "else. Each row says which inputs it actually used.")
+
+    c1, c2, c3 = st.columns(3)
+    universe = c1.selectbox("Universe", SCREENER_UNIVERSES, key="vol_universe")
+    intraday_choices = [i for i in INTERVALS if i in INTRADAY_INTERVALS]
+    interval = c2.selectbox("Timeframe for ATR expansion", intraday_choices,
+                            index=intraday_choices.index("5m"), key="vol_tf",
+                            help="The expansion test is specified on a 5-minute chart. The "
+                                 "standard-deviation levels are always computed on DAILY data, "
+                                 "whatever is picked here.")
+    sigma_mode = c3.selectbox(
+        "Volatility input", ["Auto", "India VIX", "Realised volatility"], key="vol_sigma_mode",
+        help="Auto uses India VIX for NIFTY and the instrument's own realised volatility for "
+             "everything else, which is the only defensible pairing. Forcing India VIX onto "
+             "Bank Nifty, a stock or Bitcoin borrows Nifty's number for something it does not "
+             "describe.")
+
+    custom_text = ""
+    if universe.startswith("Custom"):
+        custom_text = st.text_area("Tickers", "^NSEI\n^NSEBANK\n^BSESN\nBTC-USD",
+                                   key="vol_custom")
+    all_tickers, note = universe_tickers_ui(universe, custom_text, None, "vol")
+    chosen = st.multiselect(f"Tickers ({len(all_tickers)} in {universe})", all_tickers,
+                            default=all_tickers[:20], key=f"vol_tickers_{universe}")
+    if note:
+        st.caption(note)
+
+    with st.expander("Standard-deviation levels", expanded=True):
+        st.markdown(
+            "`1 SD move = spot x (India VIX / divisor)`. The divisor is **1600** by desk "
+            "convention, and the arithmetic behind it is "
+            "`VIX / 100 / sqrt(252) = VIX / 1587` — an annualised percentage turned into "
+            "one day's sigma. Set it to 1587 for the exact figure.")
+        s1, s2 = st.columns(2)
+        vix_divisor = s1.number_input("VIX divisor", 100.0, 5000.0, 1600.0, 1.0,
+                                      key="vol_divisor")
+        rv_lookback = s2.number_input("Realised volatility lookback (days)", 5, 250, 20, 5,
+                                      key="vol_rv")
+        live_vix = load_vix()
+        st.caption(f"India VIX now: **{fmt(live_vix)}**" if live_vix is not None
+                   else "India VIX could not be read; realised volatility will be used.")
+
+    with st.expander("ATR volatility expansion", expanded=True):
+        st.markdown("`expansion = ATR(14) / average(ATR, 20)` on the timeframe above. Below "
+                    "the squeeze level the market is consolidating and an option buyer pays "
+                    "theta for nothing; above the expansion level a move is underway.")
+        a1, a2, a3, a4 = st.columns(4)
+        atr_len = a1.number_input("ATR length", 2, 100, 14, 1, key="vol_atr_len")
+        atr_avg = a2.number_input("ATR average length", 2, 200, 20, 1, key="vol_atr_avg")
+        squeeze_below = a3.number_input("Squeeze below", 0.1, 3.0, 1.0, 0.05,
+                                        key="vol_squeeze")
+        expand_above = a4.number_input("Expansion above", 0.1, 5.0, 1.3, 0.05, key="vol_expand")
+
+    broker = cfg.get("broker") or {}
+    has_token = bool(str(broker.get("access_token", "")).strip()
+                     and str(broker.get("client_id", "")).strip())
+    use_oi = False
+    with st.expander("Open-interest momentum ratio (needs Dhan)", expanded=has_token):
+        st.markdown("`MR = change in PUT OI / change in CALL OI`, summed across the strikes "
+                    "either side of spot. Above the bullish level put writers are adding "
+                    "faster than call writers; below the bearish level the reverse.")
+        if not has_token:
+            st.info("No Dhan credentials, so this test is switched off. Open interest has no "
+                    "free source — the rest of the tab works without it.")
+        else:
+            use_oi = st.checkbox("Include the OI momentum ratio", value=True,
+                                 key=f"vol_use_oi_{'tok' if has_token else 'none'}")
+            o1, o2, o3, o4 = st.columns(4)
+            mr_bull = o1.number_input("Bullish above", 0.1, 20.0, 2.5, 0.1, key="vol_mr_bull")
+            mr_bear = o2.number_input("Bearish below", 0.01, 5.0, 0.4, 0.05, key="vol_mr_bear")
+            strikes_side = o3.number_input("Strikes either side of spot", 1, 25, 5, 1,
+                                           key="vol_strikes")
+            mr_window = o4.number_input("Target window (minutes)", 1.0, 120.0, 15.0, 1.0,
+                                        key="vol_mr_window",
+                                        help="The interval the change is meant to be measured "
+                                             "over. The actual gap between the two snapshots "
+                                             "is reported per row, because it is whatever the "
+                                             "scans happened to be.")
+            st.caption("The ratio needs TWO chain snapshots. The first scan takes one; run it "
+                       "again after your window and the ratio appears.")
+    if not has_token:
+        mr_bull, mr_bear, strikes_side, mr_window = 2.5, 0.4, 5, 15.0
+
+    vcfg = {"interval": interval, "sigma_mode": sigma_mode, "vix": live_vix,
+            "vix_divisor": vix_divisor, "rv_lookback": rv_lookback,
+            "atr_len": atr_len, "atr_avg_len": atr_avg,
+            "squeeze_below": squeeze_below, "expand_above": expand_above,
+            "use_oi": bool(use_oi and has_token), "mr_bull": mr_bull, "mr_bear": mr_bear,
+            "strikes_each_side": strikes_side, "mr_window": mr_window}
+
+    def _worker(ticker):
+        try:
+            return [volatility_scan_one(ticker, vcfg, broker if has_token else None)], []
+        except Exception as exc:                                    # noqa: BLE001
+            return [], [{"Ticker": ticker, "Problem": str(exc)[:140]}]
+
+    scan_cost_notice(len(chosen), per_job_hint=2.5, prefix="vol")
+    rows, errs, _done = chunked_sweep("vol", list(chosen), _worker,
+                                      _auto_slice_seconds(), "tickers")
+
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        st.info("Nothing scanned yet. Press **Run** above.")
+        if errs:
+            with st.expander(f"Tickers that could not be read ({len(errs)})"):
+                st.dataframe(pd.DataFrame(errs), width="stretch", hide_index=True)
+        return
+
+    a, b, c, d = st.columns(4)
+    a.metric("Scanned", len(frame))
+    b.metric("In expansion", int((frame["Volatility state"] == "EXPANSION").sum()),
+             "option buying favourable")
+    c.metric("In a squeeze", int((frame["Volatility state"] == "SQUEEZE").sum()),
+             "theta eats the premium")
+    triggers = frame[frame["OI trigger"].astype(str).str.startswith(("BULLISH", "BEARISH"))] \
+        if "OI trigger" in frame.columns else frame.iloc[0:0]
+    d.metric("OI triggers", len(triggers))
+
+    order = [c for c in ["Ticker", "Spot", "Volatility state", "ATR expansion",
+                         "Squeeze below", "Expansion above", "Option buying",
+                         "1 SD (points)", "1 SD (%)", "Travelled",
+                         "+1SD", "-1SD", "+2SD", "-2SD", "+3SD", "-3SD",
+                         "Sigma basis", "OI momentum ratio", "OI trigger",
+                         "CE OI change", "PE OI change", "OI window (min)", "OI state",
+                         "Caution", "Checked at"] if c in frame.columns]
+    st.dataframe(frame[order], width="stretch", hide_index=True)
+    st.download_button("Download the levels (CSV)", frame[order].to_csv(index=False).encode(),
+                       f"volatility_levels_{pd.Timestamp.now():%Y%m%d_%H%M}.csv", "text/csv",
+                       key="vol_dl")
+
+    st.markdown("#### Levels for one ticker")
+    p1, p2 = st.columns([2, 1])
+    pick = p1.selectbox("Ticker", frame["Ticker"].tolist(), key="vol_pick")
+    row = frame[frame["Ticker"] == pick].iloc[0].to_dict()
+
+    ladder = []
+    for n in (3, 2, 1):
+        ladder.append({"Level": f"+{n} SD", "Price": row.get(f"+{n}SD")})
+    ladder.append({"Level": "SPOT", "Price": row.get("Spot")})
+    for n in (1, 2, 3):
+        ladder.append({"Level": f"-{n} SD", "Price": row.get(f"-{n}SD")})
+    st.dataframe(pd.DataFrame(ladder), width="stretch", hide_index=True)
+    st.caption(f"One standard deviation is {fmt(row.get('1 SD (points)'))} points "
+               f"({fmt(row.get('1 SD (%)'))}% of spot), from {row.get('Sigma basis')}. "
+               f"About two days in three finish inside 1 SD and about 19 in 20 inside 2 SD "
+               f"IF returns were normally distributed — they are not, and real markets "
+               f"breach these bands more often than the maths says, especially on news.")
+    if str(row.get("Caution", "-")) != "-":
+        st.warning(row["Caution"])
+    if str(row.get("OI state", "")) not in ("", "-"):
+        st.caption(f"Open interest: {row['OI state']}")
+
+    if p2.button("Apply to the sidebar", width="stretch", key="vol_apply"):
+        st.session_state.pending_ticker = pick
+        st.session_state.pending_combo = {
+            "strategy": "25 · SuperTrend Flip",
+            "sl_type": "ATR Multiple", "sl_value": 1.5,
+            "tp_type": "Risk : Reward Multiple", "tp_value": 2.0,
+            "filter_key": "", "widgets": {"cfg_interval": interval}}
+        st.rerun()
+
+    if errs:
+        with st.expander(f"Tickers that could not be read ({len(errs)})"):
+            st.dataframe(pd.DataFrame(errs), width="stretch", hide_index=True)
+    render_analyst_panel("vol", "these volatility levels", _frame_context(frame))
+
+
 def main() -> None:
     st.set_page_config(page_title="Algo Trading Platform", layout="wide",
                        initial_sidebar_state="expanded")
@@ -11814,10 +12586,10 @@ def main() -> None:
     (status.success if st.session_state.live_running else status.info)(
         "LIVE CORE: RUNNING" if st.session_state.live_running else "LIVE CORE: IDLE")
 
-    t1, t2, t3, t4, t5, t6, t7, t8, t9 = st.tabs(
+    (t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11) = st.tabs(
         ["Backtesting Engine Studio", "Live Sandbox Operations", "Live Trade Log Ledger",
          "Signal Screener", "Auto Screener", "Strategy Optimiser", "Signal Lab",
-         "Chart Patterns", "Gamma Blast"])
+         "Chart Patterns", "Gamma Blast", "Momentum Pulse", "Volatility Levels"])
     panels = ((t1, tab_backtest, "Backtesting Engine Studio"),
               (t2, tab_live, "Live Sandbox Operations"),
               (t3, tab_ledger, "Live Trade Log Ledger"),
@@ -11826,7 +12598,9 @@ def main() -> None:
               (t6, tab_optimiser, "Strategy Optimiser"),
               (t7, tab_signal_lab, "Signal Lab"),
               (t8, tab_patterns, "Chart Patterns"),
-              (t9, tab_gamma_blast, "Gamma Blast"))
+              (t9, tab_gamma_blast, "Gamma Blast"),
+              (t10, tab_momentum_pulse, "Momentum Pulse"),
+              (t11, tab_volatility_levels, "Volatility Levels"))
     for holder, render, name in panels:
         with holder:
             try:
@@ -13892,6 +14666,192 @@ def _test_drawdown_and_reward_risk_objectives():
           "margin; drawdown minimised and capped  OK")
 
 
+def _test_momentum_pulse_checklist():
+    """
+    The four-and-four condition screener.
+
+    Every ticker must come back as a ROW even when nothing is true -- 0/4 is
+    information, and a screener that drops its quiet names cannot be told apart
+    from one that is broken. The conditions must also be genuinely independent:
+    a frame built to satisfy all four bullish tests must score 4/4 bullish and
+    0/4 bearish, and a mirrored frame the reverse.
+    """
+    real_st = globals()["st"]
+    fake = _FakeStreamlit()
+    globals()["st"] = fake
+    saved = {"load_market_data": globals()["load_market_data"]}
+    try:
+        def build(direction: int) -> pd.DataFrame:
+            """Two sessions of 5m candles; the second breaks out `direction`."""
+            rows, index = [], []
+            for day, base in ((pd.Timestamp("2026-10-15 09:15", tz="Asia/Kolkata"), 1000.0),
+                              (pd.Timestamp("2026-10-16 09:15", tz="Asia/Kolkata"), 1000.0)):
+                for i in range(40):
+                    stamp = day + pd.Timedelta(minutes=5 * i)
+                    if day.day == 15:               # a quiet previous session
+                        px = base + (i % 4) * 0.5
+                        vol = 1000.0
+                    else:
+                        # Flat through the opening range, then a strong move.
+                        px = base + (0.0 if i < 3 else direction * (i - 2) * 3.0)
+                        # The spike has to be recent: a surge that runs for the
+                        # whole session becomes its own 20-bar average and the
+                        # ratio collapses back to 1.0.
+                        vol = 9000.0 if i >= 37 else 1000.0
+                    index.append(stamp)
+                    rows.append({"Open": px, "High": px + 0.4, "Low": px - 0.4,
+                                 "Close": px, "Volume": vol})
+            frame = pd.DataFrame(rows, index=pd.DatetimeIndex(index))
+            frame["High"] = frame[["Open", "High", "Close"]].max(axis=1)
+            frame["Low"] = frame[["Open", "Low", "Close"]].min(axis=1)
+            return frame
+
+        pcfg = {"or_bars": 3, "vol_mult": 1.5, "range_mult": 1.0, "vol_len": 20,
+                "range_len": 10, "near_pct": 0.25}
+
+        up = build(+1)
+        globals()["load_market_data"] = lambda *a, **k: DataBundle(
+            frame=up.copy(), symbol="T.NS", interval="5m", period="5d")
+        row = momentum_pulse_scan_one("T.NS", "5m", pcfg)
+        assert row["Bull count"] == 4, f"a clean breakout day must score 4/4: {row}"
+        assert row["Bear count"] == 0, f"and nothing on the bear side: {row}"
+        assert row["Bias"] == "BULLISH"
+        # The previous session's high must be a REAL previous-day level, not
+        # today's own high, or the PDH test is trivially true for everything.
+        pdh, pdl, pdc = previous_session_levels(up)
+        assert pdh < row["Day High"], "PDH must come from the earlier session"
+        assert np.isfinite(pdl) and np.isfinite(pdc)
+
+        down = build(-1)
+        globals()["load_market_data"] = lambda *a, **k: DataBundle(
+            frame=down.copy(), symbol="T.NS", interval="5m", period="5d")
+        row2 = momentum_pulse_scan_one("T.NS", "5m", pcfg)
+        assert row2["Bear count"] == 4, f"a clean breakdown day must score 4/4 bearish: {row2}"
+        assert row2["Bias"] == "BEARISH"
+        # The DIRECTIONAL bullish conditions must all be false on a down day.
+        # Volume and Range are deliberately NOT asserted here: they are
+        # direction-neutral by construction -- a hard sell-off has heavy volume
+        # and an expanded range too -- so a falling stock legitimately scores on
+        # them. That is why the bull count can read 2/4 while the bear count
+        # reads 4/4, and why the tab says so rather than hiding it.
+        assert row2["B:Breakout"] == "NO" and row2["B:PDH"] == "NO", row2
+        assert row2["S:Breakout"] == "YES" and row2["S:PDL"] == "YES"
+        assert row2["S:VWAP"] == "YES" and row2["S:DL"] == "YES"
+
+        # A dead-flat day must come back as a ROW scoring zero, not vanish.
+        flat = up.copy()
+        flat[["Open", "High", "Low", "Close"]] = 1000.0
+        flat["Volume"] = 1000.0
+        globals()["load_market_data"] = lambda *a, **k: DataBundle(
+            frame=flat.copy(), symbol="T.NS", interval="5m", period="5d")
+        quiet = momentum_pulse_scan_one("T.NS", "5m", pcfg)
+        assert isinstance(quiet, dict) and quiet["Bull count"] == 0 and quiet["Bear count"] <= 1
+        for name in PULSE_BULL:
+            assert f"B:{name}" in quiet, f"the bull checklist must report {name}"
+        for name in PULSE_BEAR:
+            assert f"S:{name}" in quiet, f"the bear checklist must report {name}"
+        print("   momentum pulse: 4/4 up, 4/4 down, quiet names still reported  OK")
+    finally:
+        globals()["st"] = real_st
+        globals().update(saved)
+
+
+def _test_volatility_levels_and_oi_ratio():
+    """
+    Standard-deviation levels, ATR expansion, and the OI momentum ratio.
+
+    The operator's own formula is asserted literally, and so is the thing they
+    asked about: India VIX measures NIFTY, so it must not silently be borrowed
+    for Bitcoin or for a stock. The OI ratio is an options-market statement and
+    must be refused where no option chain exists.
+    """
+    # -- the formula exactly as given: (VIX / 1600) * spot
+    spot, vix = 24000.0, 12.0
+    sigma = vix_daily_sigma(vix, 1600.0)
+    assert abs(sigma * spot - (vix / 1600.0) * spot) < 1e-9
+    assert abs(sigma * spot - 180.0) < 1e-9, sigma * spot
+
+    levels = sd_levels(spot, sigma)
+    assert levels["1SD points"] == 180.0
+    assert levels["+1SD"] == 24180.0 and levels["-1SD"] == 23820.0
+    assert levels["+2SD"] == 24360.0 and levels["-2SD"] == 23640.0
+    assert levels["+3SD"] == 24540.0 and levels["-3SD"] == 23460.0
+
+    # The divisor is the annualisation, not a magic number: VIX/100/sqrt(252).
+    exact = vix / 100.0 / math.sqrt(252.0)
+    assert abs(vix_daily_sigma(vix, 1587.0) - exact) < 1e-4, \
+        "1587 must reproduce the textbook daily sigma"
+
+    # -- realised volatility replaces VIX on anything that is not Nifty
+    rng = np.random.default_rng(4)
+    closes = 100.0 * np.exp(np.cumsum(rng.normal(0, 0.02, 300)))
+    daily = pd.DataFrame({"Open": closes, "High": closes * 1.01, "Low": closes * 0.99,
+                          "Close": closes, "Volume": np.full(300, 1000.0)},
+                         index=pd.date_range("2025-01-01", periods=300, freq="D"))
+    rv = realised_daily_sigma(daily, 20)
+    assert np.isfinite(rv) and 0.005 < rv < 0.06, rv
+    assert np.isnan(realised_daily_sigma(daily.head(2), 20)), \
+        "too little history must be NaN, not a fabricated number"
+
+    # -- ATR expansion: instrument-agnostic, and it must detect both states
+    calm = daily.copy()
+    calm["High"] = calm["Close"] * 1.001
+    calm["Low"] = calm["Close"] * 0.999
+    wild = calm.copy()
+    # Widen FEWER bars than the averaging window: a regime that has run longer
+    # than the average is no longer expanding, it is the new normal, and the
+    # ratio correctly returns to 1.
+    wild.iloc[-5:, wild.columns.get_loc("High")] = wild["Close"].iloc[-5:] * 1.08
+    wild.iloc[-5:, wild.columns.get_loc("Low")] = wild["Close"].iloc[-5:] * 0.92
+    assert atr_expansion(wild, 14, 20) > atr_expansion(calm, 14, 20), \
+        "a volatile tail must read as more expanded than a calm one"
+
+    # -- the option chain only exists where it exists
+    assert has_option_chain("^NSEI") and has_option_chain("RELIANCE.NS")
+    assert not has_option_chain("BTC-USD"), "there is no NSE chain for Bitcoin"
+    assert not has_option_chain("EURUSD=X") and not has_option_chain("GC=F")
+
+    # -- the OI momentum ratio
+    real_st = globals()["st"]
+    fake = _FakeStreamlit()
+    globals()["st"] = fake
+    try:
+        def chain(ce, pe):
+            return {float(k): {"ce_oi": ce, "pe_oi": pe, "ce_prev_oi": ce,
+                               "pe_prev_oi": pe, "ce_volume": 1.0, "pe_volume": 1.0}
+                    for k in range(23800, 24300, 100)}
+
+        fake.session_state["oi_snapshots"] = {"^NSEI": [
+            {"at": pd.Timestamp("2026-10-16 10:00"), "chain": chain(100000.0, 100000.0)},
+            # Puts added 5x what calls did -> strongly bullish by this rule.
+            {"at": pd.Timestamp("2026-10-16 10:15"), "chain": chain(110000.0, 150000.0)},
+        ]}
+        stats = oi_momentum_ratio("^NSEI", 24000.0, strikes_each_side=5)
+        assert abs(stats["MR"] - 5.0) < 1e-6, stats
+        assert abs(stats["minutes"] - 15.0) < 1e-6
+        assert stats["CE OI change"] > 0 and stats["PE OI change"] > 0
+
+        # One snapshot cannot produce a CHANGE, and must say so instead of 0.
+        fake.session_state["oi_snapshots"]["^NSEI"] = \
+            fake.session_state["oi_snapshots"]["^NSEI"][:1]
+        thin = oi_momentum_ratio("^NSEI", 24000.0)
+        assert "MR" not in thin and "note" in thin, thin
+
+        # A FALLING call side makes the denominator non-positive. Dividing
+        # anyway would print a confident number pointing the wrong way.
+        fake.session_state["oi_snapshots"]["^NSEI"] = [
+            {"at": pd.Timestamp("2026-10-16 10:00"), "chain": chain(100000.0, 100000.0)},
+            {"at": pd.Timestamp("2026-10-16 10:15"), "chain": chain(80000.0, 150000.0)},
+        ]
+        awkward = oi_momentum_ratio("^NSEI", 24000.0)
+        assert "MR" not in awkward, "a non-positive denominator must not produce a ratio"
+        assert "undefined" in awkward["note"].lower(), awkward["note"]
+        print("   volatility levels: VIX/1600 bands exact, realised vol fallback, ATR "
+              "expansion, OI ratio refused where undefined  OK")
+    finally:
+        globals()["st"] = real_st
+
+
 def _test_combined_objective_ranking():
     """
     Ranking by several objectives at once.
@@ -14519,6 +15479,8 @@ def run_selftest() -> int:
         _test_live_entry_is_not_poll_dependent()
         _test_every_signal_gets_a_recorded_verdict()
         _test_drawdown_and_reward_risk_objectives()
+        _test_momentum_pulse_checklist()
+        _test_volatility_levels_and_oi_ratio()
         _test_combined_objective_ranking()
         _test_projected_cross_is_not_a_signal()
         _test_dhan_previous_oi_gives_a_day_change()
