@@ -638,6 +638,405 @@ def market_structure(df: pd.DataFrame, left=3, right=3):
     return raw.ffill().fillna(0).astype(int).rename("BOS"), sh, sl_
 
 
+
+# =============================================================================
+# SECTION 2b -- EXTENDED INDICATOR LIBRARY
+# =============================================================================
+# Everything here is written from the published definition in plain pandas and
+# numpy. No indicator package is imported anywhere in this application, so each
+# formula below is auditable against its own source rather than taken on trust.
+#
+# Smoothing conventions follow the originals: Wilder's smoothing (rma) where
+# the author specified it, a simple mean where they specified that. Getting
+# this wrong is the usual reason a "14-period RSI" disagrees with a chart.
+
+
+def wma(series: pd.Series, length: int) -> pd.Series:
+    """Linearly weighted moving average: the newest bar carries weight `length`."""
+    length = max(int(length), 1)
+    weights = np.arange(1, length + 1, dtype=float)
+    return series.rolling(length).apply(
+        lambda w: float(np.dot(w, weights) / weights.sum()), raw=True)
+
+
+def hma(series: pd.Series, length: int) -> pd.Series:
+    """Hull moving average: fast and smooth, at the cost of overshoot."""
+    length = max(int(length), 2)
+    half, root = max(length // 2, 1), max(int(round(math.sqrt(length))), 1)
+    return wma(2.0 * wma(series, half) - wma(series, length), root)
+
+
+def dema(series: pd.Series, length: int) -> pd.Series:
+    """Double EMA: 2*EMA - EMA(EMA), which removes much of the EMA's lag."""
+    first = ema(series, length)
+    return 2.0 * first - ema(first, length)
+
+
+def tema(series: pd.Series, length: int) -> pd.Series:
+    """Triple EMA."""
+    e1 = ema(series, length)
+    e2 = ema(e1, length)
+    return 3.0 * e1 - 3.0 * e2 + ema(e2, length)
+
+
+def kama(series: pd.Series, length: int = 10, fast: int = 2, slow: int = 30) -> pd.Series:
+    """
+    Kaufman's adaptive moving average.
+
+    Speeds up when price is trending and slows down when it is noisy, via an
+    efficiency ratio: net movement over total movement across the window.
+    """
+    length = max(int(length), 1)
+    values = series.astype(float).to_numpy()
+    change = np.abs(values - np.roll(values, length))
+    volatility = pd.Series(np.abs(np.diff(values, prepend=values[0]))).rolling(
+        length).sum().to_numpy()
+    with np.errstate(divide="ignore", invalid="ignore"):
+        er = np.where(volatility > 0, change / volatility, 0.0)
+    fast_sc, slow_sc = 2.0 / (fast + 1.0), 2.0 / (slow + 1.0)
+    sc = (er * (fast_sc - slow_sc) + slow_sc) ** 2
+    out = np.full(len(values), np.nan)
+    seed = length
+    if len(values) > seed:
+        out[seed] = values[:seed + 1].mean()
+        for i in range(seed + 1, len(values)):
+            previous = out[i - 1]
+            factor = sc[i] if np.isfinite(sc[i]) else 0.0
+            out[i] = previous + factor * (values[i] - previous)
+    return pd.Series(out, index=series.index)
+
+
+def vwma(close: pd.Series, volume: pd.Series, length: int) -> pd.Series:
+    """Volume-weighted moving average. Degrades to an SMA on a zero-volume feed."""
+    length = max(int(length), 1)
+    vol = volume.fillna(0.0)
+    numerator = (close * vol).rolling(length).sum()
+    denominator = vol.rolling(length).sum()
+    out = numerator / denominator.replace(0.0, np.nan)
+    return out.fillna(sma(close, length))
+
+
+def stochastic(high, low, close, k_len: int = 14, d_len: int = 3, smooth: int = 3):
+    """Stochastic oscillator. Returns (%K, %D), both 0-100."""
+    hh = high.rolling(int(k_len)).max()
+    ll = low.rolling(int(k_len)).min()
+    span = (hh - ll).replace(0.0, np.nan)
+    raw = 100.0 * (close - ll) / span
+    k = raw.rolling(max(int(smooth), 1)).mean()
+    return k, k.rolling(max(int(d_len), 1)).mean()
+
+
+def stoch_rsi(close: pd.Series, rsi_len: int = 14, stoch_len: int = 14,
+              k_len: int = 3, d_len: int = 3):
+    """The stochastic of the RSI, which reacts far sooner than either alone."""
+    r = rsi(close, rsi_len)
+    ll = r.rolling(int(stoch_len)).min()
+    hh = r.rolling(int(stoch_len)).max()
+    span = (hh - ll).replace(0.0, np.nan)
+    raw = 100.0 * (r - ll) / span
+    k = raw.rolling(max(int(k_len), 1)).mean()
+    return k, k.rolling(max(int(d_len), 1)).mean()
+
+
+def cci(high, low, close, length: int = 20) -> pd.Series:
+    """Commodity Channel Index, on the 0.015 scaling Lambert defined."""
+    tp = (high + low + close) / 3.0
+    mean = tp.rolling(int(length)).mean()
+    deviation = tp.rolling(int(length)).apply(
+        lambda w: float(np.mean(np.abs(w - w.mean()))), raw=True)
+    return (tp - mean) / (0.015 * deviation.replace(0.0, np.nan))
+
+
+def williams_r(high, low, close, length: int = 14) -> pd.Series:
+    """Williams %R: 0 at the top of the range, -100 at the bottom."""
+    hh = high.rolling(int(length)).max()
+    ll = low.rolling(int(length)).min()
+    return -100.0 * (hh - close) / (hh - ll).replace(0.0, np.nan)
+
+
+def roc(series: pd.Series, length: int = 12) -> pd.Series:
+    """Rate of change, in percent."""
+    return (series / series.shift(int(length)) - 1.0) * 100.0
+
+
+def momentum(series: pd.Series, length: int = 10) -> pd.Series:
+    return series - series.shift(int(length))
+
+
+def tsi(close: pd.Series, long_len: int = 25, short_len: int = 13) -> pd.Series:
+    """True Strength Index: doubly smoothed momentum over doubly smoothed range."""
+    diff = close.diff()
+    smoothed = ema(ema(diff, long_len), short_len)
+    absolute = ema(ema(diff.abs(), long_len), short_len)
+    return 100.0 * smoothed / absolute.replace(0.0, np.nan)
+
+
+def ultimate_oscillator(high, low, close, short=7, medium=14, long=28) -> pd.Series:
+    """Williams' Ultimate Oscillator, weighted 4:2:1 across three windows."""
+    prior = close.shift(1)
+    buying = close - pd.concat([low, prior], axis=1).min(axis=1)
+    tr = true_range(high, low, close)
+    def avg(n):
+        return buying.rolling(int(n)).sum() / tr.rolling(int(n)).sum().replace(0.0, np.nan)
+    return 100.0 * (4 * avg(short) + 2 * avg(medium) + avg(long)) / 7.0
+
+
+def awesome_oscillator(high, low, fast=5, slow=34) -> pd.Series:
+    median = (high + low) / 2.0
+    return sma(median, fast) - sma(median, slow)
+
+
+def cmo(close: pd.Series, length: int = 14) -> pd.Series:
+    """Chande Momentum Oscillator, -100 to +100."""
+    diff = close.diff()
+    up = diff.clip(lower=0.0).rolling(int(length)).sum()
+    down = (-diff.clip(upper=0.0)).rolling(int(length)).sum()
+    return 100.0 * (up - down) / (up + down).replace(0.0, np.nan)
+
+
+def aroon(high, low, length: int = 25):
+    """Aroon up and down: how recently the window's extreme was set."""
+    n = int(length)
+    up = high.rolling(n + 1).apply(lambda w: float(np.argmax(w)) / n * 100.0, raw=True)
+    down = low.rolling(n + 1).apply(lambda w: float(np.argmin(w)) / n * 100.0, raw=True)
+    return up, down
+
+
+def vortex(high, low, close, length: int = 14):
+    """Vortex indicator. Returns (VI+, VI-)."""
+    vm_plus = (high - low.shift(1)).abs()
+    vm_minus = (low - high.shift(1)).abs()
+    tr_sum = true_range(high, low, close).rolling(int(length)).sum().replace(0.0, np.nan)
+    return (vm_plus.rolling(int(length)).sum() / tr_sum,
+            vm_minus.rolling(int(length)).sum() / tr_sum)
+
+
+def psar(high, low, step: float = 0.02, cap: float = 0.2):
+    """
+    Parabolic SAR, iterated exactly as Wilder specified.
+
+    Returns (sar, is_long). Vectorising this is not possible: each bar's stop
+    depends on the extreme point and acceleration factor carried from the last.
+    """
+    h, l = high.to_numpy(float), low.to_numpy(float)
+    n = len(h)
+    sar = np.full(n, np.nan)
+    bull = np.zeros(n, dtype=bool)
+    if n < 2:
+        return pd.Series(sar, index=high.index), pd.Series(bull, index=high.index)
+    long_now = True
+    af = float(step)
+    ep = h[0]
+    sar[0] = l[0]
+    for i in range(1, n):
+        prior = sar[i - 1]
+        value = prior + af * (ep - prior)
+        if long_now:
+            value = min(value, l[i - 1], l[max(i - 2, 0)])
+            if l[i] < value:                       # flip to short
+                long_now, value, ep, af = False, ep, l[i], float(step)
+            elif h[i] > ep:
+                ep, af = h[i], min(af + step, cap)
+        else:
+            value = max(value, h[i - 1], h[max(i - 2, 0)])
+            if h[i] > value:                       # flip to long
+                long_now, value, ep, af = True, ep, h[i], float(step)
+            elif l[i] < ep:
+                ep, af = l[i], min(af + step, cap)
+        sar[i], bull[i] = value, long_now
+    return pd.Series(sar, index=high.index), pd.Series(bull, index=high.index)
+
+
+def trix(close: pd.Series, length: int = 15) -> pd.Series:
+    """Percent rate of change of a triple-smoothed EMA."""
+    smoothed = ema(ema(ema(close, length), length), length)
+    return smoothed.pct_change() * 100.0
+
+
+def keltner(high, low, close, length: int = 20, mult: float = 2.0):
+    """Keltner channels: an EMA basis with ATR-scaled bands."""
+    basis = ema(close, length)
+    width = atr(high, low, close, length) * float(mult)
+    return basis + width, basis, basis - width
+
+
+def donchian(high, low, length: int = 20):
+    """Donchian channel over the PRIOR `length` bars, excluding this one."""
+    return (rolling_high(high, int(length), True), rolling_low(low, int(length), True))
+
+
+def choppiness(high, low, close, length: int = 14) -> pd.Series:
+    """
+    Choppiness Index, 0-100. Above ~61 the market is ranging, below ~38 trending.
+    """
+    n = int(length)
+    tr_sum = true_range(high, low, close).rolling(n).sum()
+    span = (high.rolling(n).max() - low.rolling(n).min()).replace(0.0, np.nan)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return 100.0 * np.log10(tr_sum / span) / math.log10(max(n, 2))
+
+
+def obv(close: pd.Series, volume: pd.Series) -> pd.Series:
+    """On-balance volume."""
+    direction = np.sign(close.diff().fillna(0.0))
+    return (direction * volume.fillna(0.0)).cumsum()
+
+
+def money_flow_index(high, low, close, volume, length: int = 14) -> pd.Series:
+    """MFI: an RSI weighted by money flow rather than price alone."""
+    tp = (high + low + close) / 3.0
+    flow = tp * volume.fillna(0.0)
+    up = flow.where(tp > tp.shift(1), 0.0).rolling(int(length)).sum()
+    down = flow.where(tp < tp.shift(1), 0.0).rolling(int(length)).sum()
+    return 100.0 - 100.0 / (1.0 + up / down.replace(0.0, np.nan))
+
+
+def _money_flow_volume(high, low, close, volume) -> pd.Series:
+    span = (high - low).replace(0.0, np.nan)
+    return ((close - low) - (high - close)) / span * volume.fillna(0.0)
+
+
+def chaikin_money_flow(high, low, close, volume, length: int = 20) -> pd.Series:
+    mfv = _money_flow_volume(high, low, close, volume)
+    return mfv.rolling(int(length)).sum() / \
+        volume.fillna(0.0).rolling(int(length)).sum().replace(0.0, np.nan)
+
+
+def accumulation_distribution(high, low, close, volume) -> pd.Series:
+    return _money_flow_volume(high, low, close, volume).fillna(0.0).cumsum()
+
+
+def force_index(close: pd.Series, volume: pd.Series, length: int = 13) -> pd.Series:
+    return ema(close.diff() * volume.fillna(0.0), length)
+
+
+def ease_of_movement(high, low, volume, length: int = 14) -> pd.Series:
+    midpoint = ((high + low) / 2.0).diff()
+    box = volume.fillna(0.0).replace(0.0, np.nan) / (high - low).replace(0.0, np.nan)
+    return (midpoint / box).rolling(int(length)).mean()
+
+
+def price_volume_trend(close: pd.Series, volume: pd.Series) -> pd.Series:
+    return (close.pct_change().fillna(0.0) * volume.fillna(0.0)).cumsum()
+
+
+def volume_oscillator(volume: pd.Series, fast: int = 5, slow: int = 20) -> pd.Series:
+    quick, slow_mean = sma(volume, fast), sma(volume, slow)
+    return (quick - slow_mean) / slow_mean.replace(0.0, np.nan) * 100.0
+
+
+def ichimoku(high, low, close, conversion: int = 9, base: int = 26, span_b: int = 52):
+    """
+    Ichimoku. Returns (tenkan, kijun, senkou_a, senkou_b).
+
+    The spans are deliberately NOT shifted forward here. Plotting shifts them
+    into the future; a screener must compare today's price with values derived
+    from data that already exists, and shifting first then reading the last row
+    is how an Ichimoku screen quietly acquires look-ahead.
+    """
+    def mid(n):
+        return (high.rolling(int(n)).max() + low.rolling(int(n)).min()) / 2.0
+    tenkan, kijun = mid(conversion), mid(base)
+    return tenkan, kijun, (tenkan + kijun) / 2.0, mid(span_b)
+
+
+def heikin_ashi(df: pd.DataFrame) -> pd.DataFrame:
+    """Heikin Ashi candles, built recursively as the method requires."""
+    ha_close = (df["Open"] + df["High"] + df["Low"] + df["Close"]) / 4.0
+    opens = np.full(len(df), np.nan)
+    o, c = df["Open"].to_numpy(float), ha_close.to_numpy(float)
+    if len(df):
+        opens[0] = (o[0] + c[0]) / 2.0
+        for i in range(1, len(df)):
+            opens[i] = (opens[i - 1] + c[i - 1]) / 2.0
+    ha_open = pd.Series(opens, index=df.index)
+    return pd.DataFrame({
+        "ha_open": ha_open, "ha_close": ha_close,
+        "ha_high": pd.concat([df["High"], ha_open, ha_close], axis=1).max(axis=1),
+        "ha_low": pd.concat([df["Low"], ha_open, ha_close], axis=1).min(axis=1)})
+
+
+def dpo(close: pd.Series, length: int = 20) -> pd.Series:
+    """Detrended price oscillator."""
+    shift = int(length) // 2 + 1
+    return close.shift(shift) - sma(close, length)
+
+
+def coppock(close: pd.Series, long_roc: int = 14, short_roc: int = 11,
+            smooth: int = 10) -> pd.Series:
+    return wma(roc(close, long_roc) + roc(close, short_roc), smooth)
+
+
+def elder_ray(high, low, close, length: int = 13):
+    """Bull power and bear power around an EMA."""
+    basis = ema(close, length)
+    return high - basis, low - basis
+
+
+def kst(close: pd.Series) -> tuple:
+    """Pring's Know Sure Thing, on his published default periods."""
+    parts = [(10, 10), (15, 10), (20, 10), (30, 15)]
+    total = None
+    for i, (r, s) in enumerate(parts, start=1):
+        component = sma(roc(close, r), s) * i
+        total = component if total is None else total + component
+    return total, sma(total, 9)
+
+
+def mass_index(high, low, length: int = 9, total: int = 25) -> pd.Series:
+    span = high - low
+    ratio = ema(span, length) / ema(ema(span, length), length).replace(0.0, np.nan)
+    return ratio.rolling(int(total)).sum()
+
+
+def relative_vigor_index(df: pd.DataFrame, length: int = 10):
+    """RVI: where the close sits in the bar, smoothed. Returns (rvi, signal)."""
+    numerator = (df["Close"] - df["Open"]).rolling(int(length)).mean()
+    denominator = (df["High"] - df["Low"]).rolling(int(length)).mean()
+    value = numerator / denominator.replace(0.0, np.nan)
+    return value, value.rolling(4).mean()
+
+
+def balance_of_power(df: pd.DataFrame, length: int = 14) -> pd.Series:
+    raw = (df["Close"] - df["Open"]) / (df["High"] - df["Low"]).replace(0.0, np.nan)
+    return raw.rolling(int(length)).mean()
+
+
+def fisher_transform(high, low, length: int = 9):
+    """
+    Ehlers' Fisher transform. Returns (fisher, trigger).
+
+    The transform needs its input strictly inside -1 and 1, so the normalised
+    price is clipped just short of both: at exactly +/-1 the logarithm diverges.
+    """
+    median = (high + low) / 2.0
+    hh = median.rolling(int(length)).max()
+    ll = median.rolling(int(length)).min()
+    span = (hh - ll).replace(0.0, np.nan)
+    raw = (2.0 * (median - ll) / span - 1.0).clip(-0.999, 0.999)
+    smoothed = raw.ewm(alpha=0.33, adjust=False).mean().clip(-0.999, 0.999)
+    value = 0.5 * np.log((1.0 + smoothed) / (1.0 - smoothed))
+    value = value.ewm(alpha=0.5, adjust=False).mean()
+    return value, value.shift(1)
+
+
+def classic_pivots(df: pd.DataFrame) -> dict:
+    """Classic floor-trader pivots from the PREVIOUS session."""
+    sessions = session_key(df.index)
+    unique = list(dict.fromkeys(sessions.tolist()))
+    if len(unique) < 2:
+        return {}
+    prior = df[sessions == unique[-2]]
+    if prior.empty:
+        return {}
+    high, low = float(prior["High"].max()), float(prior["Low"].min())
+    close = float(prior["Close"].iloc[-1])
+    pivot = (high + low + close) / 3.0
+    return {"P": pivot, "R1": 2 * pivot - low, "S1": 2 * pivot - high,
+            "R2": pivot + (high - low), "S2": pivot - (high - low),
+            "R3": high + 2 * (pivot - low), "S3": low - 2 * (high - pivot)}
+
+
 # =============================================================================
 # SECTION 3 -- MARKET DATA  (the single rate-limit-guarded network choke-point)
 # =============================================================================
@@ -12574,6 +12973,1070 @@ def tab_volatility_levels(cfg: dict) -> None:
     render_analyst_panel("vol", "these volatility levels", _frame_context(frame))
 
 
+# =============================================================================
+# SECTION 19h -- INDICATOR CONDITION REGISTRY
+# =============================================================================
+# One entry per indicator: what it is called, which family it belongs to, the
+# parameters the operator may change, and a function that turns the indicator
+# into a BULLISH verdict, a BEARISH verdict and a readable current value.
+#
+# The contract every entry keeps:
+#   fn(df, p) -> (bull: bool, bear: bool, value: float, text: str)
+# evaluated on the LAST CLOSED candle, never the forming one.
+#
+# Bull and bear are deliberately allowed to be both False. "Neither" is the
+# commonest honest answer for an indicator sitting mid-range, and forcing a
+# verdict out of it is how a screener manufactures signals.
+
+def _last(series, offset: int = 0) -> float:
+    try:
+        value = float(pd.Series(series).iloc[-1 - offset])
+    except (IndexError, TypeError, ValueError):
+        return float("nan")
+    return value
+
+
+def _ok(*values) -> bool:
+    return all(np.isfinite(v) for v in values)
+
+
+# --- trend / moving averages ------------------------------------------------
+def _i_price_vs_ma(df, p, builder, name):
+    ma = builder(df, int(p["length"]))
+    price, basis = _last(df["Close"]), _last(ma)
+    if not _ok(price, basis):
+        return False, False, float("nan"), "not enough history"
+    return price > basis, price < basis, basis, f"price {fmt(price)} vs {name} {fmt(basis)}"
+
+
+def i_sma(df, p):
+    return _i_price_vs_ma(df, p, lambda d, n: sma(d["Close"], n), "SMA")
+
+
+def i_ema(df, p):
+    return _i_price_vs_ma(df, p, lambda d, n: ema(d["Close"], n), "EMA")
+
+
+def i_wma(df, p):
+    return _i_price_vs_ma(df, p, lambda d, n: wma(d["Close"], n), "WMA")
+
+
+def i_hma(df, p):
+    return _i_price_vs_ma(df, p, lambda d, n: hma(d["Close"], n), "HMA")
+
+
+def i_dema(df, p):
+    return _i_price_vs_ma(df, p, lambda d, n: dema(d["Close"], n), "DEMA")
+
+
+def i_tema(df, p):
+    return _i_price_vs_ma(df, p, lambda d, n: tema(d["Close"], n), "TEMA")
+
+
+def i_kama(df, p):
+    return _i_price_vs_ma(df, p, lambda d, n: kama(d["Close"], n), "KAMA")
+
+
+def i_vwma(df, p):
+    return _i_price_vs_ma(df, p, lambda d, n: vwma(d["Close"], d["Volume"], n), "VWMA")
+
+
+def i_ma_cross(df, p):
+    fast, slow = ema(df["Close"], int(p["fast"])), ema(df["Close"], int(p["slow"]))
+    f, s = _last(fast), _last(slow)
+    if not _ok(f, s):
+        return False, False, float("nan"), "not enough history"
+    gap = f - s
+    return f > s, f < s, gap, f"fast {fmt(f)} vs slow {fmt(s)}"
+
+
+def i_ma_cross_fresh(df, p):
+    """Only the bar the cross actually happened on, not every bar afterwards."""
+    fast, slow = ema(df["Close"], int(p["fast"])), ema(df["Close"], int(p["slow"]))
+    up = bool(cross_over(fast, slow).iloc[-1]) if len(fast) > 2 else False
+    down = bool(cross_under(fast, slow).iloc[-1]) if len(fast) > 2 else False
+    return up, down, _last(fast) - _last(slow), "crossover on this candle only"
+
+
+def i_triple_ma(df, p):
+    a = _last(ema(df["Close"], int(p["fast"])))
+    b = _last(ema(df["Close"], int(p["mid"])))
+    c = _last(ema(df["Close"], int(p["slow"])))
+    if not _ok(a, b, c):
+        return False, False, float("nan"), "not enough history"
+    return a > b > c, a < b < c, a - c, f"{fmt(a)} / {fmt(b)} / {fmt(c)}"
+
+
+def i_linreg_slope(df, p):
+    value = _last(slope(df["Close"], int(p["length"])))
+    threshold = float(p["threshold"])
+    if not _ok(value):
+        return False, False, float("nan"), "not enough history"
+    return value > threshold, value < -threshold, value, f"slope {fmt(value, 4)}"
+
+
+# --- momentum ---------------------------------------------------------------
+def i_rsi(df, p):
+    value = _last(rsi(df["Close"], int(p["length"])))
+    if not _ok(value):
+        return False, False, float("nan"), "not enough history"
+    return value < float(p["oversold"]), value > float(p["overbought"]), value, \
+        f"RSI {fmt(value)}"
+
+
+def i_rsi_trend(df, p):
+    """RSI as a TREND reading rather than a reversion one: above or below 50."""
+    value = _last(rsi(df["Close"], int(p["length"])))
+    if not _ok(value):
+        return False, False, float("nan"), "not enough history"
+    mid = float(p["midline"])
+    return value > mid, value < mid, value, f"RSI {fmt(value)} vs {fmt(mid)}"
+
+
+def i_stochastic(df, p):
+    k, d = stochastic(df["High"], df["Low"], df["Close"], int(p["k"]), int(p["d"]),
+                      int(p["smooth"]))
+    kv, dv = _last(k), _last(d)
+    if not _ok(kv, dv):
+        return False, False, float("nan"), "not enough history"
+    return (kv < float(p["oversold"]) and kv > dv), \
+           (kv > float(p["overbought"]) and kv < dv), kv, f"%K {fmt(kv)} %D {fmt(dv)}"
+
+
+def i_stoch_rsi(df, p):
+    k, _d = stoch_rsi(df["Close"], int(p["rsi_len"]), int(p["stoch_len"]))
+    value = _last(k)
+    if not _ok(value):
+        return False, False, float("nan"), "not enough history"
+    return value < float(p["oversold"]), value > float(p["overbought"]), value, \
+        f"StochRSI {fmt(value)}"
+
+
+def i_macd(df, p):
+    line, signal, hist = macd(df["Close"], int(p["fast"]), int(p["slow"]), int(p["signal"]))
+    m_, s_, h_ = _last(line), _last(signal), _last(hist)
+    if not _ok(m_, s_):
+        return False, False, float("nan"), "not enough history"
+    return m_ > s_, m_ < s_, h_, f"MACD {fmt(m_)} vs signal {fmt(s_)}"
+
+
+def i_macd_zero(df, p):
+    line, _s, _h = macd(df["Close"], int(p["fast"]), int(p["slow"]), int(p["signal"]))
+    value = _last(line)
+    return value > 0, value < 0, value, f"MACD line {fmt(value)} vs zero"
+
+
+def i_cci(df, p):
+    value = _last(cci(df["High"], df["Low"], df["Close"], int(p["length"])))
+    if not _ok(value):
+        return False, False, float("nan"), "not enough history"
+    return value > float(p["bull_above"]), value < float(p["bear_below"]), value, \
+        f"CCI {fmt(value)}"
+
+
+def i_williams(df, p):
+    value = _last(williams_r(df["High"], df["Low"], df["Close"], int(p["length"])))
+    if not _ok(value):
+        return False, False, float("nan"), "not enough history"
+    return value < float(p["oversold"]), value > float(p["overbought"]), value, \
+        f"%R {fmt(value)}"
+
+
+def i_roc(df, p):
+    value = _last(roc(df["Close"], int(p["length"])))
+    threshold = float(p["threshold"])
+    return value > threshold, value < -threshold, value, f"ROC {fmt(value)}%"
+
+
+def i_momentum(df, p):
+    value = _last(momentum(df["Close"], int(p["length"])))
+    return value > 0, value < 0, value, f"momentum {fmt(value)}"
+
+
+def i_tsi(df, p):
+    value = _last(tsi(df["Close"], int(p["long"]), int(p["short"])))
+    threshold = float(p["threshold"])
+    return value > threshold, value < -threshold, value, f"TSI {fmt(value)}"
+
+
+def i_ultimate(df, p):
+    value = _last(ultimate_oscillator(df["High"], df["Low"], df["Close"]))
+    if not _ok(value):
+        return False, False, float("nan"), "not enough history"
+    return value < float(p["oversold"]), value > float(p["overbought"]), value, \
+        f"UO {fmt(value)}"
+
+
+def i_awesome(df, p):
+    series = awesome_oscillator(df["High"], df["Low"], int(p["fast"]), int(p["slow"]))
+    now, before = _last(series), _last(series, 1)
+    if not _ok(now, before):
+        return False, False, float("nan"), "not enough history"
+    return now > 0 and now > before, now < 0 and now < before, now, f"AO {fmt(now)}"
+
+
+def i_cmo(df, p):
+    value = _last(cmo(df["Close"], int(p["length"])))
+    threshold = float(p["threshold"])
+    return value > threshold, value < -threshold, value, f"CMO {fmt(value)}"
+
+
+def i_trix(df, p):
+    value = _last(trix(df["Close"], int(p["length"])))
+    return value > 0, value < 0, value, f"TRIX {fmt(value, 4)}%"
+
+
+def i_coppock(df, p):
+    series = coppock(df["Close"])
+    now, before = _last(series), _last(series, 1)
+    if not _ok(now, before):
+        return False, False, float("nan"), "not enough history"
+    return now > before, now < before, now, f"Coppock {fmt(now)}"
+
+
+def i_kst(df, p):
+    line, signal = kst(df["Close"])
+    a, b = _last(line), _last(signal)
+    if not _ok(a, b):
+        return False, False, float("nan"), "not enough history"
+    return a > b, a < b, a, f"KST {fmt(a)} vs signal {fmt(b)}"
+
+
+def i_dpo(df, p):
+    value = _last(dpo(df["Close"], int(p["length"])))
+    return value > 0, value < 0, value, f"DPO {fmt(value)}"
+
+
+def i_fisher(df, p):
+    value, trigger = fisher_transform(df["High"], df["Low"], int(p["length"]))
+    a, b = _last(value), _last(trigger)
+    if not _ok(a, b):
+        return False, False, float("nan"), "not enough history"
+    return a > b, a < b, a, f"Fisher {fmt(a)} vs trigger {fmt(b)}"
+
+
+def i_rvi(df, p):
+    value, signal = relative_vigor_index(df, int(p["length"]))
+    a, b = _last(value), _last(signal)
+    if not _ok(a, b):
+        return False, False, float("nan"), "not enough history"
+    return a > b, a < b, a, f"RVI {fmt(a, 4)}"
+
+
+def i_bop(df, p):
+    value = _last(balance_of_power(df, int(p["length"])))
+    threshold = float(p["threshold"])
+    return value > threshold, value < -threshold, value, f"BOP {fmt(value, 4)}"
+
+
+# --- trend strength / direction --------------------------------------------
+def i_adx(df, p):
+    a, plus, minus = adx(df["High"], df["Low"], df["Close"], int(p["length"]))
+    av, pv, mv = _last(a), _last(plus), _last(minus)
+    if not _ok(av, pv, mv):
+        return False, False, float("nan"), "not enough history"
+    strong = av >= float(p["min_adx"])
+    return strong and pv > mv, strong and mv > pv, av, \
+        f"ADX {fmt(av)}  +DI {fmt(pv)}  -DI {fmt(mv)}"
+
+
+def i_aroon(df, p):
+    up, down = aroon(df["High"], df["Low"], int(p["length"]))
+    uv, dv = _last(up), _last(down)
+    if not _ok(uv, dv):
+        return False, False, float("nan"), "not enough history"
+    level = float(p["level"])
+    return uv > level and uv > dv, dv > level and dv > uv, uv - dv, \
+        f"Aroon up {fmt(uv)} down {fmt(dv)}"
+
+
+def i_vortex(df, p):
+    plus, minus = vortex(df["High"], df["Low"], df["Close"], int(p["length"]))
+    pv, mv = _last(plus), _last(minus)
+    if not _ok(pv, mv):
+        return False, False, float("nan"), "not enough history"
+    return pv > mv, mv > pv, pv - mv, f"VI+ {fmt(pv, 3)} VI- {fmt(mv, 3)}"
+
+
+def i_supertrend(df, p):
+    direction, _u, _l = supertrend(df["High"], df["Low"], df["Close"],
+                                   int(p["length"]), float(p["mult"]))
+    value = _last(direction)
+    return value > 0, value < 0, value, f"SuperTrend {'up' if value > 0 else 'down'}"
+
+
+def i_psar(df, p):
+    sar, bull = psar(df["High"], df["Low"], float(p["step"]), float(p["cap"]))
+    is_long = bool(pd.Series(bull).iloc[-1]) if len(bull) else False
+    return is_long, not is_long, _last(sar), f"SAR {fmt(_last(sar))}"
+
+
+def i_choppiness(df, p):
+    value = _last(choppiness(df["High"], df["Low"], df["Close"], int(p["length"])))
+    if not _ok(value):
+        return False, False, float("nan"), "not enough history"
+    trending = value < float(p["trending_below"])
+    rising = _last(df["Close"]) > _last(ema(df["Close"], 20))
+    return trending and rising, trending and not rising, value, \
+        f"Choppiness {fmt(value)} ({'trending' if trending else 'ranging'})"
+
+
+def i_ichimoku(df, p):
+    tenkan, kijun, span_a, span_b = ichimoku(df["High"], df["Low"], df["Close"],
+                                             int(p["conversion"]), int(p["base"]),
+                                             int(p["span_b"]))
+    price = _last(df["Close"])
+    a, b, t, k = _last(span_a), _last(span_b), _last(tenkan), _last(kijun)
+    if not _ok(price, a, b, t, k):
+        return False, False, float("nan"), "not enough history"
+    top, bottom = max(a, b), min(a, b)
+    return (price > top and t > k), (price < bottom and t < k), price - top, \
+        f"price {fmt(price)} vs cloud {fmt(bottom)}-{fmt(top)}"
+
+
+def i_heikin(df, p):
+    ha = heikin_ashi(df)
+    need = max(int(p["streak"]), 1)
+    if len(ha) < need:
+        return False, False, float("nan"), "not enough history"
+    tail = ha.tail(need)
+    up = bool((tail["ha_close"] > tail["ha_open"]).all())
+    down = bool((tail["ha_close"] < tail["ha_open"]).all())
+    body = _last(ha["ha_close"]) - _last(ha["ha_open"])
+    return up, down, body, f"{need} Heikin Ashi candle(s) one colour"
+
+
+def i_elder_ray(df, p):
+    bull_power, bear_power = elder_ray(df["High"], df["Low"], df["Close"], int(p["length"]))
+    bp, sp = _last(bull_power), _last(bear_power)
+    if not _ok(bp, sp):
+        return False, False, float("nan"), "not enough history"
+    return bp > 0 and sp > 0, bp < 0 and sp < 0, bp, \
+        f"bull {fmt(bp)} bear {fmt(sp)}"
+
+
+# --- volatility / channels --------------------------------------------------
+def i_bollinger(df, p):
+    upper, basis, lower = bollinger(df["Close"], int(p["length"]), float(p["mult"]))
+    price, u, lo = _last(df["Close"]), _last(upper), _last(lower)
+    if not _ok(price, u, lo):
+        return False, False, float("nan"), "not enough history"
+    if str(p["mode"]).startswith("Rever"):
+        return price < lo, price > u, price, f"price {fmt(price)} band {fmt(lo)}-{fmt(u)}"
+    return price > u, price < lo, price, f"price {fmt(price)} band {fmt(lo)}-{fmt(u)}"
+
+
+def i_keltner(df, p):
+    upper, _b, lower = keltner(df["High"], df["Low"], df["Close"],
+                               int(p["length"]), float(p["mult"]))
+    price, u, lo = _last(df["Close"]), _last(upper), _last(lower)
+    if not _ok(price, u, lo):
+        return False, False, float("nan"), "not enough history"
+    return price > u, price < lo, price, f"price {fmt(price)} channel {fmt(lo)}-{fmt(u)}"
+
+
+def i_donchian(df, p):
+    hi, lo = donchian(df["High"], df["Low"], int(p["length"]))
+    price, h, l_ = _last(df["Close"]), _last(hi), _last(lo)
+    if not _ok(price, h, l_):
+        return False, False, float("nan"), "not enough history"
+    return price > h, price < l_, price, f"channel {fmt(l_)}-{fmt(h)}"
+
+
+def i_squeeze(df, p):
+    """Bollinger bands inside Keltner channels: a classic coiled-spring test."""
+    bb_u, _bb_b, bb_l = bollinger(df["Close"], int(p["length"]), float(p["bb_mult"]))
+    kc_u, _kc_b, kc_l = keltner(df["High"], df["Low"], df["Close"],
+                                int(p["length"]), float(p["kc_mult"]))
+    inside = bool(_last(bb_u) < _last(kc_u) and _last(bb_l) > _last(kc_l))
+    rising = _last(df["Close"]) > _last(ema(df["Close"], int(p["length"])))
+    width = _last(bb_u) - _last(bb_l)
+    if inside:
+        return False, False, width, "in a squeeze: no direction yet"
+    return not inside and rising, not inside and not rising, width, \
+        "squeeze released" if not inside else "squeezed"
+
+
+def i_atr_expansion(df, p):
+    value = atr_expansion(df, int(p["length"]), int(p["avg_length"]))
+    if not _ok(value):
+        return False, False, float("nan"), "not enough history"
+    expanding = value > float(p["expand_above"])
+    rising = _last(df["Close"]) > _last(ema(df["Close"], 20))
+    return expanding and rising, expanding and not rising, value, \
+        f"ATR expansion {fmt(value, 3)}"
+
+
+# --- volume -----------------------------------------------------------------
+def _no_volume(df) -> bool:
+    return float(pd.Series(df["Volume"]).tail(200).abs().sum()) <= 0
+
+
+def i_obv(df, p):
+    if _no_volume(df):
+        return False, False, float("nan"), "feed reports no volume"
+    series = obv(df["Close"], df["Volume"])
+    trend = ema(series, int(p["length"]))
+    return _last(series) > _last(trend), _last(series) < _last(trend), _last(series), \
+        "OBV above its average" if _last(series) > _last(trend) else "OBV below its average"
+
+
+def i_mfi(df, p):
+    if _no_volume(df):
+        return False, False, float("nan"), "feed reports no volume"
+    value = _last(money_flow_index(df["High"], df["Low"], df["Close"], df["Volume"],
+                                   int(p["length"])))
+    if not _ok(value):
+        return False, False, float("nan"), "not enough history"
+    return value < float(p["oversold"]), value > float(p["overbought"]), value, \
+        f"MFI {fmt(value)}"
+
+
+def i_cmf(df, p):
+    if _no_volume(df):
+        return False, False, float("nan"), "feed reports no volume"
+    value = _last(chaikin_money_flow(df["High"], df["Low"], df["Close"], df["Volume"],
+                                     int(p["length"])))
+    threshold = float(p["threshold"])
+    return value > threshold, value < -threshold, value, f"CMF {fmt(value, 3)}"
+
+
+def i_force(df, p):
+    if _no_volume(df):
+        return False, False, float("nan"), "feed reports no volume"
+    value = _last(force_index(df["Close"], df["Volume"], int(p["length"])))
+    return value > 0, value < 0, value, f"Force {fmt(value, 0)}"
+
+
+def i_adline(df, p):
+    if _no_volume(df):
+        return False, False, float("nan"), "feed reports no volume"
+    line = accumulation_distribution(df["High"], df["Low"], df["Close"], df["Volume"])
+    trend = ema(line, int(p["length"]))
+    return _last(line) > _last(trend), _last(line) < _last(trend), _last(line), \
+        "A/D above its average" if _last(line) > _last(trend) else "A/D below"
+
+
+def i_eom(df, p):
+    if _no_volume(df):
+        return False, False, float("nan"), "feed reports no volume"
+    value = _last(ease_of_movement(df["High"], df["Low"], df["Volume"], int(p["length"])))
+    return value > 0, value < 0, value, f"EOM {fmt(value, 4)}"
+
+
+def i_pvt(df, p):
+    if _no_volume(df):
+        return False, False, float("nan"), "feed reports no volume"
+    line = price_volume_trend(df["Close"], df["Volume"])
+    trend = ema(line, int(p["length"]))
+    return _last(line) > _last(trend), _last(line) < _last(trend), _last(line), "PVT vs average"
+
+
+def i_volume_spike(df, p):
+    if _no_volume(df):
+        return False, False, float("nan"), "feed reports no volume"
+    now = _last(df["Volume"])
+    average = _last(sma(df["Volume"], int(p["length"])))
+    if not _ok(now, average) or average <= 0:
+        return False, False, float("nan"), "not enough history"
+    ratio = now / average
+    spiking = ratio >= float(p["multiple"])
+    rising = _last(df["Close"]) > _last(df["Open"])
+    return spiking and rising, spiking and not rising, ratio, f"volume {fmt(ratio)}x average"
+
+
+def i_volume_osc(df, p):
+    if _no_volume(df):
+        return False, False, float("nan"), "feed reports no volume"
+    value = _last(volume_oscillator(df["Volume"], int(p["fast"]), int(p["slow"])))
+    threshold = float(p["threshold"])
+    rising = _last(df["Close"]) > _last(df["Open"])
+    return value > threshold and rising, value > threshold and not rising, value, \
+        f"volume oscillator {fmt(value)}%"
+
+
+def i_vwap(df, p):
+    series, volume_backed = vwap(df, True)
+    price, basis = _last(df["Close"]), _last(series)
+    if not _ok(price, basis):
+        return False, False, float("nan"), "not enough history"
+    label = "VWAP" if volume_backed else "TWAP (no volume on this feed)"
+    return price > basis, price < basis, basis, f"price {fmt(price)} vs {label} {fmt(basis)}"
+
+
+# --- structure / levels -----------------------------------------------------
+def i_pivots(df, p):
+    levels = classic_pivots(df)
+    if not levels:
+        return False, False, float("nan"), "needs a previous session"
+    price = _last(df["Close"])
+    return price > levels["P"], price < levels["P"], levels["P"], \
+        f"price {fmt(price)} vs pivot {fmt(levels['P'])}"
+
+
+def i_prev_day(df, p):
+    high, low, _close = previous_session_levels(df)
+    price = _last(df["Close"])
+    if not _ok(price, high, low):
+        return False, False, float("nan"), "needs a previous session"
+    return price > high, price < low, price, f"PDH {fmt(high)} PDL {fmt(low)}"
+
+
+def i_breakout(df, p):
+    hi = _last(rolling_high(df["High"], int(p["length"]), True))
+    lo = _last(rolling_low(df["Low"], int(p["length"]), True))
+    price = _last(df["Close"])
+    if not _ok(price, hi, lo):
+        return False, False, float("nan"), "not enough history"
+    return price > hi, price < lo, price, f"{int(p['length'])}-bar range {fmt(lo)}-{fmt(hi)}"
+
+
+def i_market_structure(df, p):
+    """
+    Break of structure, from the confirmed-swing engine the SMC profiles use.
+
+    ``market_structure`` returns (direction, swing_high, swing_low) where the
+    direction is +1 after a bullish break and -1 after a bearish one, carried
+    forward until the opposite break.
+    """
+    direction, swing_high, swing_low = market_structure(df, int(p["left"]), int(p["right"]))
+    value = _last(direction)
+    if not _ok(value) or value == 0:
+        return False, False, 0.0, "no break of structure yet"
+    side = "bullish" if value > 0 else "bearish"
+    return value > 0, value < 0, value, \
+        (f"{side} break of structure; swing high {fmt(_last(swing_high))}, "
+         f"swing low {fmt(_last(swing_low))}")
+
+
+INDICATOR_SPECS = [
+    # key, label, group, params {name: (default, min, max)}, fn
+    ("sma", "SMA vs price", "Trend", {"length": (20, 2, 400)}, i_sma),
+    ("ema", "EMA vs price", "Trend", {"length": (20, 2, 400)}, i_ema),
+    ("wma", "WMA vs price", "Trend", {"length": (20, 2, 400)}, i_wma),
+    ("hma", "Hull MA vs price", "Trend", {"length": (21, 4, 400)}, i_hma),
+    ("dema", "DEMA vs price", "Trend", {"length": (20, 2, 400)}, i_dema),
+    ("tema", "TEMA vs price", "Trend", {"length": (20, 2, 400)}, i_tema),
+    ("kama", "KAMA vs price", "Trend", {"length": (10, 2, 200)}, i_kama),
+    ("vwma", "VWMA vs price", "Trend", {"length": (20, 2, 400)}, i_vwma),
+    ("ma_cross", "EMA pair (state)", "Trend",
+     {"fast": (9, 2, 200), "slow": (21, 3, 400)}, i_ma_cross),
+    ("ma_cross_fresh", "EMA crossover (this candle)", "Trend",
+     {"fast": (9, 2, 200), "slow": (21, 3, 400)}, i_ma_cross_fresh),
+    ("triple_ma", "Triple EMA alignment", "Trend",
+     {"fast": (9, 2, 100), "mid": (21, 3, 200), "slow": (50, 4, 400)}, i_triple_ma),
+    ("linreg", "Linear regression slope", "Trend",
+     {"length": (20, 3, 200), "threshold": (0.0, 0.0, 1e6)}, i_linreg_slope),
+
+    ("rsi", "RSI (reversion)", "Momentum",
+     {"length": (14, 2, 100), "oversold": (30.0, 0.0, 100.0),
+      "overbought": (70.0, 0.0, 100.0)}, i_rsi),
+    ("rsi_trend", "RSI (trend, vs midline)", "Momentum",
+     {"length": (14, 2, 100), "midline": (50.0, 0.0, 100.0)}, i_rsi_trend),
+    ("stoch", "Stochastic", "Momentum",
+     {"k": (14, 2, 100), "d": (3, 1, 50), "smooth": (3, 1, 50),
+      "oversold": (20.0, 0.0, 100.0), "overbought": (80.0, 0.0, 100.0)}, i_stochastic),
+    ("stochrsi", "Stochastic RSI", "Momentum",
+     {"rsi_len": (14, 2, 100), "stoch_len": (14, 2, 100),
+      "oversold": (20.0, 0.0, 100.0), "overbought": (80.0, 0.0, 100.0)}, i_stoch_rsi),
+    ("macd", "MACD vs signal", "Momentum",
+     {"fast": (12, 2, 100), "slow": (26, 3, 200), "signal": (9, 1, 100)}, i_macd),
+    ("macd_zero", "MACD vs zero", "Momentum",
+     {"fast": (12, 2, 100), "slow": (26, 3, 200), "signal": (9, 1, 100)}, i_macd_zero),
+    ("cci", "CCI", "Momentum",
+     {"length": (20, 2, 200), "bull_above": (100.0, -500.0, 500.0),
+      "bear_below": (-100.0, -500.0, 500.0)}, i_cci),
+    ("williams", "Williams %R", "Momentum",
+     {"length": (14, 2, 100), "oversold": (-80.0, -100.0, 0.0),
+      "overbought": (-20.0, -100.0, 0.0)}, i_williams),
+    ("roc", "Rate of change", "Momentum",
+     {"length": (12, 1, 200), "threshold": (0.0, 0.0, 100.0)}, i_roc),
+    ("momentum", "Momentum", "Momentum", {"length": (10, 1, 200)}, i_momentum),
+    ("tsi", "True Strength Index", "Momentum",
+     {"long": (25, 2, 100), "short": (13, 2, 100), "threshold": (0.0, 0.0, 100.0)}, i_tsi),
+    ("ultimate", "Ultimate Oscillator", "Momentum",
+     {"oversold": (30.0, 0.0, 100.0), "overbought": (70.0, 0.0, 100.0)}, i_ultimate),
+    ("awesome", "Awesome Oscillator", "Momentum",
+     {"fast": (5, 2, 100), "slow": (34, 3, 200)}, i_awesome),
+    ("cmo", "Chande Momentum", "Momentum",
+     {"length": (14, 2, 200), "threshold": (50.0, 0.0, 100.0)}, i_cmo),
+    ("trix", "TRIX", "Momentum", {"length": (15, 2, 100)}, i_trix),
+    ("coppock", "Coppock curve", "Momentum", {}, i_coppock),
+    ("kst", "Know Sure Thing", "Momentum", {}, i_kst),
+    ("dpo", "Detrended price oscillator", "Momentum", {"length": (20, 2, 200)}, i_dpo),
+    ("fisher", "Fisher transform", "Momentum", {"length": (9, 2, 100)}, i_fisher),
+    ("rvi", "Relative Vigor Index", "Momentum", {"length": (10, 2, 100)}, i_rvi),
+    ("bop", "Balance of Power", "Momentum",
+     {"length": (14, 1, 100), "threshold": (0.0, 0.0, 1.0)}, i_bop),
+
+    ("adx", "ADX / DI", "Trend strength",
+     {"length": (14, 2, 100), "min_adx": (20.0, 0.0, 100.0)}, i_adx),
+    ("aroon", "Aroon", "Trend strength",
+     {"length": (25, 2, 200), "level": (70.0, 0.0, 100.0)}, i_aroon),
+    ("vortex", "Vortex", "Trend strength", {"length": (14, 2, 100)}, i_vortex),
+    ("supertrend", "SuperTrend", "Trend strength",
+     {"length": (10, 2, 100), "mult": (3.0, 0.5, 10.0)}, i_supertrend),
+    ("psar", "Parabolic SAR", "Trend strength",
+     {"step": (0.02, 0.001, 0.5), "cap": (0.2, 0.01, 1.0)}, i_psar),
+    ("choppiness", "Choppiness Index", "Trend strength",
+     {"length": (14, 2, 100), "trending_below": (38.2, 0.0, 100.0)}, i_choppiness),
+    ("ichimoku", "Ichimoku cloud", "Trend strength",
+     {"conversion": (9, 2, 100), "base": (26, 3, 200), "span_b": (52, 4, 400)}, i_ichimoku),
+    ("heikin", "Heikin Ashi streak", "Trend strength", {"streak": (3, 1, 20)}, i_heikin),
+    ("elder", "Elder Ray", "Trend strength", {"length": (13, 2, 100)}, i_elder_ray),
+
+    ("bollinger", "Bollinger Bands", "Volatility",
+     {"length": (20, 2, 200), "mult": (2.0, 0.5, 5.0),
+      "mode": ("Breakout", ("Breakout", "Reversion"))}, i_bollinger),
+    ("keltner", "Keltner channel", "Volatility",
+     {"length": (20, 2, 200), "mult": (2.0, 0.5, 10.0)}, i_keltner),
+    ("donchian", "Donchian channel", "Volatility", {"length": (20, 2, 400)}, i_donchian),
+    ("squeeze", "Squeeze (BB inside KC)", "Volatility",
+     {"length": (20, 2, 200), "bb_mult": (2.0, 0.5, 5.0), "kc_mult": (1.5, 0.5, 10.0)},
+     i_squeeze),
+    ("atr_exp", "ATR expansion", "Volatility",
+     {"length": (14, 2, 100), "avg_length": (20, 2, 200),
+      "expand_above": (1.3, 0.1, 5.0)}, i_atr_expansion),
+
+    ("obv", "On-balance volume", "Volume", {"length": (20, 2, 200)}, i_obv),
+    ("mfi", "Money Flow Index", "Volume",
+     {"length": (14, 2, 100), "oversold": (20.0, 0.0, 100.0),
+      "overbought": (80.0, 0.0, 100.0)}, i_mfi),
+    ("cmf", "Chaikin Money Flow", "Volume",
+     {"length": (20, 2, 200), "threshold": (0.05, 0.0, 1.0)}, i_cmf),
+    ("force", "Force Index", "Volume", {"length": (13, 2, 100)}, i_force),
+    ("adline", "Accumulation / Distribution", "Volume", {"length": (20, 2, 200)}, i_adline),
+    ("eom", "Ease of Movement", "Volume", {"length": (14, 2, 100)}, i_eom),
+    ("pvt", "Price Volume Trend", "Volume", {"length": (20, 2, 200)}, i_pvt),
+    ("vol_spike", "Volume spike", "Volume",
+     {"length": (20, 2, 200), "multiple": (1.5, 1.0, 20.0)}, i_volume_spike),
+    ("vol_osc", "Volume oscillator", "Volume",
+     {"fast": (5, 2, 100), "slow": (20, 3, 200), "threshold": (0.0, -100.0, 500.0)},
+     i_volume_osc),
+    ("vwap", "VWAP vs price", "Volume", {}, i_vwap),
+
+    ("pivots", "Classic pivot point", "Structure", {}, i_pivots),
+    ("prev_day", "Previous day high / low", "Structure", {}, i_prev_day),
+    ("breakout", "N-bar range breakout", "Structure", {"length": (20, 2, 400)}, i_breakout),
+    ("structure", "Break of structure", "Structure",
+     {"left": (3, 1, 20), "right": (3, 1, 20)}, i_market_structure),
+]
+
+INDICATOR_BY_KEY = {spec[0]: spec for spec in INDICATOR_SPECS}
+INDICATOR_GROUPS: dict[str, list] = {}
+for _spec in INDICATOR_SPECS:
+    INDICATOR_GROUPS.setdefault(_spec[2], []).append(_spec)
+
+
+def evaluate_indicators(df: pd.DataFrame, selected: list[str],
+                        params: dict | None = None) -> list[dict]:
+    """
+    Run every selected indicator on one frame and collect its verdict.
+
+    The LAST row is dropped first: it is the forming candle, and reading an
+    indicator off a bar that has not finished is the single easiest way to
+    manufacture a signal that disappears by the close.
+    """
+    params = params or {}
+    closed = df.iloc[:-1] if len(df) > 2 else df
+    out = []
+    for key in selected:
+        spec = INDICATOR_BY_KEY.get(key)
+        if spec is None:
+            continue
+        _k, label, group, defaults, fn = spec
+        values = {name: params.get(f"{key}.{name}", default[0])
+                  for name, default in defaults.items()}
+        try:
+            bull, bear, value, text = fn(closed, values)
+        except Exception as exc:                                    # noqa: BLE001
+            out.append({"key": key, "label": label, "group": group, "bull": False,
+                        "bear": False, "value": float("nan"),
+                        "text": f"failed: {str(exc)[:70]}"})
+            continue
+        out.append({"key": key, "label": label, "group": group,
+                    "bull": bool(bull), "bear": bool(bear),
+                    "value": value, "text": text})
+    return out
+
+
+# =============================================================================
+# SECTION 19i -- CUSTOM INDICATOR SCREENER
+# =============================================================================
+# Tick any indicators, tick any timeframes, and every ticker is scored as a
+# count of bullish against bearish verdicts on each timeframe.
+#
+# SECTOR FLIP. Optionally, a ticker's verdict is INVERTED when its own sector
+# index is leaning the other way. That is a contrarian position -- it assumes a
+# stock running with an already-extended sector is the one to fade -- and it is
+# off by default because it is a real trading opinion, not a neutral setting.
+
+# NSE industry labels -> the sector index that represents them. Industries that
+# have no listed index of their own are left out, and a ticker in one of them
+# simply has no sector reading rather than being mapped to a near-enough index.
+INDUSTRY_TO_SECTOR_INDEX = {
+    "FINANCIAL SERVICES": "NIFTY_FIN_SERVICE.NS", "BANK": "^NSEBANK",
+    "PRIVATE BANK": "^NSEBANK", "PSU BANK": "^CNXPSUBANK",
+    "INFORMATION TECHNOLOGY": "^CNXIT", "IT": "^CNXIT",
+    "HEALTHCARE": "^CNXPHARMA", "PHARMA": "^CNXPHARMA",
+    "AUTOMOBILE AND AUTO COMPONENTS": "^CNXAUTO", "AUTOMOBILE": "^CNXAUTO",
+    "FAST MOVING CONSUMER GOODS": "^CNXFMCG", "FMCG": "^CNXFMCG",
+    "METALS & MINING": "^CNXMETAL", "METAL": "^CNXMETAL",
+    "REALTY": "^CNXREALTY", "OIL GAS & CONSUMABLE FUELS": "^CNXENERGY",
+    "POWER": "^CNXENERGY", "ENERGY": "^CNXENERGY",
+    "MEDIA ENTERTAINMENT & PUBLICATION": "^CNXMEDIA", "MEDIA": "^CNXMEDIA",
+    "CAPITAL GOODS": "^CNXINFRA", "CONSTRUCTION": "^CNXINFRA",
+    "SERVICES": "^CNXINFRA",
+}
+
+
+def sector_index_for(ticker: str) -> str | None:
+    """The sector index representing a ticker, or None when there is no match."""
+    industry = str(SECTOR_BY_TICKER.get(ticker, "")).strip().upper()
+    if not industry or industry == "INDEX":
+        return None
+    if industry in INDUSTRY_TO_SECTOR_INDEX:
+        return INDUSTRY_TO_SECTOR_INDEX[industry]
+    for key, symbol in INDUSTRY_TO_SECTOR_INDEX.items():
+        if key in industry or industry in key:
+            return symbol
+    return None
+
+
+def sector_bias(symbol: str, interval: str, fast: int = 20, slow: int = 50) -> str:
+    """
+    Which way a sector index is leaning, from its own moving averages.
+
+    Cached per scan through the ordinary market-data cache, so a 200-name
+    universe costs one download per SECTOR rather than one per ticker.
+    """
+    try:
+        period, _ = lab_period_for(interval, 200)
+        frame = load_market_data(symbol, period, interval,
+                                 freshness_seconds=300, min_bars=slow + 5).frame
+    except Exception:                                               # noqa: BLE001
+        return "unknown"
+    closed = frame.iloc[:-1] if len(frame) > 2 else frame
+    quick, steady = _last(ema(closed["Close"], fast)), _last(ema(closed["Close"], slow))
+    if not _ok(quick, steady):
+        return "unknown"
+    return "BULLISH" if quick > steady else "BEARISH"
+
+
+def custom_screen_one(ticker: str, interval: str, selected: list[str], params: dict,
+                      filter_cfg: dict | None, flip_on_sector: bool,
+                      cfg_params: dict) -> dict:
+    """Score one ticker on one timeframe across every selected indicator."""
+    period, _ = lab_period_for(interval, 250)
+    frame = load_market_data(ticker, period, interval,
+                             freshness_seconds=180, min_bars=60).frame
+
+    verdicts = evaluate_indicators(frame, selected, params)
+    bull = sum(1 for v in verdicts if v["bull"])
+    bear = sum(1 for v in verdicts if v["bear"])
+    usable = sum(1 for v in verdicts if not str(v["text"]).startswith(("failed", "not enough")))
+
+    # --- additional entry filters, the same ones the strategies use ----------
+    filters_pass_long = filters_pass_short = True
+    filter_note = "none enabled"
+    if filter_cfg and any(v.get("enabled") for v in filter_cfg.values()):
+        params_for_filters = dict(cfg_params)
+        params_for_filters["intraday"] = interval in INTRADAY_INTERVALS
+        attached = attach_filter_columns(frame.copy(), params_for_filters,
+                                         bool(params_for_filters["intraday"]))
+        ok_long, ok_short, reports = evaluate_filters(attached, filter_cfg, {})
+        # The LAST row is the forming candle, so the filters are read on the
+        # last CLOSED one -- the same bar the indicators were scored on.
+        closed_at = max(len(frame) - 2, 0)
+        filters_pass_long = bool(pd.Series(ok_long).iloc[closed_at])
+        filters_pass_short = bool(pd.Series(ok_short).iloc[closed_at])
+        # A report's long_ok / short_ok are scalars describing the newest bar,
+        # which is enough to name what is blocking.
+        blocked = [r.label for r in reports if not (r.long_ok or r.short_ok)]
+        filter_note = ("blocked by " + ", ".join(blocked)) if blocked \
+            else "all enabled filters pass"
+
+    raw_bias = ("BULLISH" if bull > bear else "BEARISH" if bear > bull else "MIXED")
+
+    # --- the sector flip -----------------------------------------------------
+    sector_symbol = sector_index_for(ticker)
+    sector_view = sector_bias(sector_symbol, interval) if (flip_on_sector and sector_symbol) \
+        else "not used"
+    flipped = False
+    bias = raw_bias
+    if flip_on_sector and sector_view in ("BULLISH", "BEARISH") and raw_bias != "MIXED":
+        if sector_view == raw_bias:
+            # The ticker agrees with an already-extended sector, so fade it.
+            bias = "BEARISH" if raw_bias == "BULLISH" else "BULLISH"
+            bull, bear = bear, bull
+            flipped = True
+
+    # Filters gate the FINAL direction, after any flip -- otherwise a filter
+    # would be vetting a direction the screener is no longer proposing.
+    gated = bias
+    if bias == "BULLISH" and not filters_pass_long:
+        gated = "FILTERED OUT"
+    elif bias == "BEARISH" and not filters_pass_short:
+        gated = "FILTERED OUT"
+
+    row = {
+        "Ticker": ticker, "Timeframe": interval,
+        "Sector": SECTOR_BY_TICKER.get(ticker, "--"),
+        "Price": round(float(frame["Close"].iloc[-1]), 2),
+        "Bias": gated, "Bias before filters": bias,
+        "Bullish": bull, "Bearish": bear,
+        "Agreement %": round(max(bull, bear) / usable * 100.0, 1) if usable else None,
+        "Indicators scored": usable, "Indicators selected": len(selected),
+        "Sector index": sector_symbol or "--", "Sector bias": sector_view,
+        "Flipped": "yes" if flipped else "no",
+        "Filters": filter_note,
+        "Checked at": pd.Timestamp.now(),
+    }
+    for v in verdicts:
+        row[v["label"]] = "BULL" if v["bull"] else ("BEAR" if v["bear"] else "-")
+    row["_detail"] = verdicts
+    return row
+
+
+def _multi_picker(label: str, options: list, prefix: str, defaults: list,
+                  formatter=None) -> list:
+    """
+    A checkbox grid with select-all and clear-all.
+
+    A multiselect would need every entry removing by hand; with sixty-odd
+    indicators that is the difference between a usable control and a chore.
+    """
+    head, c_all, c_none = st.columns([3, 1, 1])
+    head.markdown(f"**{label}**")
+    if c_all.button("Select all", key=f"{prefix}_all", width="stretch"):
+        for option in options:
+            st.session_state[f"{prefix}_cb_{option}"] = True
+        st.rerun()
+    if c_none.button("Clear all", key=f"{prefix}_none", width="stretch"):
+        for option in options:
+            st.session_state[f"{prefix}_cb_{option}"] = False
+        st.rerun()
+    picked = []
+    columns = st.columns(4)
+    for i, option in enumerate(options):
+        text = formatter(option) if formatter else str(option)
+        if columns[i % 4].checkbox(text, value=option in defaults,
+                                   key=f"{prefix}_cb_{option}"):
+            picked.append(option)
+    return picked
+
+
+def tab_custom_screener(cfg: dict) -> None:
+    st.subheader("Custom Indicator Screener")
+    st.warning(
+        "**A count of agreeing indicators is not an edge.** Most of these measure the same "
+        "few things -- trend, momentum, volatility, participation -- so twenty of them "
+        "agreeing is often one fact counted twenty times, not twenty independent "
+        "confirmations. Use it to shortlist, then test a specific rule in the Backtesting "
+        "tab or the Signal Lab, which is where the question of whether it MAKES MONEY is "
+        "actually answered.")
+
+    c1, c2 = st.columns([1, 1])
+    universe = c1.selectbox("Universe", SCREENER_UNIVERSES, key="cust_universe")
+    min_agree = c2.slider("Minimum agreement to list (%)", 0, 100, 60, 5,
+                          key="cust_agree",
+                          help="How large a majority of the scored indicators must lean one "
+                               "way before the ticker is treated as having a bias.")
+
+    custom_text = ""
+    if universe.startswith("Custom"):
+        custom_text = st.text_area("Tickers", "RELIANCE\nTCS\nINFY", key="cust_custom")
+    all_tickers, note = universe_tickers_ui(universe, custom_text, None, "cust")
+    chosen = st.multiselect(f"Tickers ({len(all_tickers)} in {universe})", all_tickers,
+                            default=all_tickers[:25], key=f"cust_tickers_{universe}")
+    if note:
+        st.caption(note)
+
+    # ---- timeframes --------------------------------------------------------
+    with st.container(border=True):
+        timeframes = _multi_picker("Timeframes", list(INTERVALS), "cust_tf", ["15m"])
+    if not timeframes:
+        st.error("Pick at least one timeframe.")
+        return
+
+    # ---- indicators --------------------------------------------------------
+    with st.container(border=True):
+        st.markdown(f"**Indicators** — {len(INDICATOR_SPECS)} available")
+        every_key = [spec[0] for spec in INDICATOR_SPECS]
+        ga, gb = st.columns(2)
+        if ga.button("Select ALL indicators", key="cust_ind_all", width="stretch"):
+            for key in every_key:
+                st.session_state[f"cust_ind_cb_{key}"] = True
+            st.rerun()
+        if gb.button("Clear ALL indicators", key="cust_ind_none", width="stretch"):
+            for key in every_key:
+                st.session_state[f"cust_ind_cb_{key}"] = False
+            st.rerun()
+
+        selected: list[str] = []
+        default_on = {"ema", "ma_cross", "rsi_trend", "macd", "adx", "supertrend",
+                      "bollinger", "vwap"}
+        for group, specs in INDICATOR_GROUPS.items():
+            with st.expander(f"{group} ({len(specs)})", expanded=group == "Trend"):
+                ha, hb = st.columns(2)
+                if ha.button(f"All {group.lower()}", key=f"cust_g_all_{group}",
+                             width="stretch"):
+                    for spec in specs:
+                        st.session_state[f"cust_ind_cb_{spec[0]}"] = True
+                    st.rerun()
+                if hb.button(f"None {group.lower()}", key=f"cust_g_none_{group}",
+                             width="stretch"):
+                    for spec in specs:
+                        st.session_state[f"cust_ind_cb_{spec[0]}"] = False
+                    st.rerun()
+                columns = st.columns(3)
+                for i, spec in enumerate(specs):
+                    key, label = spec[0], spec[1]
+                    if columns[i % 3].checkbox(label, value=key in default_on,
+                                               key=f"cust_ind_cb_{key}"):
+                        selected.append(key)
+
+    if not selected:
+        st.error("Pick at least one indicator.")
+        return
+
+    # ---- per-indicator parameters -----------------------------------------
+    params: dict = {}
+    with st.expander(f"Indicator settings ({len(selected)} selected)", expanded=False):
+        st.caption("Every selected indicator's own inputs. Defaults are the published ones.")
+        for key in selected:
+            _k, label, _g, defaults, _fn = INDICATOR_BY_KEY[key]
+            if not defaults:
+                continue
+            st.markdown(f"**{label}**")
+            columns = st.columns(max(len(defaults), 1))
+            for i, (name, spec) in enumerate(defaults.items()):
+                default = spec[0]
+                if isinstance(default, str):            # a choice, not a number
+                    params[f"{key}.{name}"] = columns[i].selectbox(
+                        name, list(spec[1]), index=list(spec[1]).index(default),
+                        key=f"cust_p_{key}_{name}")
+                elif isinstance(default, int):
+                    params[f"{key}.{name}"] = columns[i].number_input(
+                        name, int(spec[1]), int(spec[2]), int(default), 1,
+                        key=f"cust_p_{key}_{name}")
+                else:
+                    params[f"{key}.{name}"] = columns[i].number_input(
+                        name, float(spec[1]), float(spec[2]), float(default),
+                        key=f"cust_p_{key}_{name}")
+
+    # ---- additional entry filters -----------------------------------------
+    with st.expander("Additional entry filters (all off by default)", expanded=False):
+        st.caption("The same filters the strategies use. An enabled filter must pass in the "
+                   "direction the screener is proposing, or the ticker is marked filtered out "
+                   "rather than silently dropped.")
+        filter_cfg = default_filter_config()
+        columns = st.columns(3)
+        for i, spec in enumerate(FILTER_SPECS):
+            key = spec["key"]
+            if columns[i % 3].checkbox(FILTER_LABELS.get(key, key), value=False,
+                                       key=f"cust_flt_{key}"):
+                filter_cfg[key]["enabled"] = True
+
+    flip_on_sector = st.checkbox(
+        "Flip the signal when the ticker agrees with its own sector", value=False,
+        key="cust_flip",
+        help="A contrarian setting, off by default. When the sector index is already leaning "
+             "the same way as the ticker, the verdict is INVERTED on the view that a name "
+             "running with an extended sector is the one to fade. This is a trading opinion, "
+             "not a neutral filter, and it has not been backtested here — test it in the "
+             "Signal Lab before trusting it.")
+
+    jobs = [(t, tf) for t in chosen for tf in timeframes]
+    scan_cost_notice(len(jobs), per_job_hint=1.6 + 0.01 * len(selected), prefix="cust")
+
+    def _worker(job):
+        ticker, interval = job
+        try:
+            return [custom_screen_one(ticker, interval, selected, params, filter_cfg,
+                                      flip_on_sector, cfg.get("params") or {})], []
+        except Exception as exc:                                    # noqa: BLE001
+            return [], [{"Ticker": ticker, "Timeframe": interval,
+                         "Problem": str(exc)[:140]}]
+
+    rows, errs, _done = chunked_sweep("cust", jobs, _worker, _auto_slice_seconds(),
+                                      "ticker/timeframe jobs",
+                                      describe=lambda job: f"{job[0]} · {job[1]}")
+
+    frame = pd.DataFrame([{k: v for k, v in r.items() if k != "_detail"} for r in rows])
+    if frame.empty:
+        st.info("Nothing scanned yet. Press **Run** above.")
+        if errs:
+            with st.expander(f"Jobs that failed ({len(errs)})"):
+                st.dataframe(pd.DataFrame(errs), width="stretch", hide_index=True)
+        return
+
+    strong = frame[pd.to_numeric(frame["Agreement %"], errors="coerce") >= float(min_agree)]
+    a, b, c, d = st.columns(4)
+    a.metric("Rows scanned", len(frame))
+    b.metric("Bullish", int((strong["Bias"] == "BULLISH").sum()),
+             f"at or above {min_agree}% agreement")
+    c.metric("Bearish", int((strong["Bias"] == "BEARISH").sum()),
+             f"at or above {min_agree}% agreement")
+    d.metric("Flipped by sector", int((frame["Flipped"] == "yes").sum()))
+
+    show = st.radio("Show", ["Everything", "Bullish only", "Bearish only",
+                             "Above the agreement bar"], horizontal=True, key="cust_show")
+    view = frame
+    if show == "Bullish only":
+        view = frame[frame["Bias"] == "BULLISH"]
+    elif show == "Bearish only":
+        view = frame[frame["Bias"] == "BEARISH"]
+    elif show == "Above the agreement bar":
+        view = strong
+    if view.empty:
+        st.info("Nothing matches that filter. Switch back to Everything to see the full scan.")
+        return
+
+    front = ["Ticker", "Timeframe", "Sector", "Price", "Bias", "Bullish", "Bearish",
+             "Agreement %", "Indicators scored", "Flipped", "Sector bias", "Sector index",
+             "Filters", "Bias before filters"]
+    order = [c for c in front if c in view.columns] + \
+            [c for c in view.columns if c not in front and c != "Checked at"] + \
+            (["Checked at"] if "Checked at" in view.columns else [])
+    st.dataframe(view.sort_values(["Agreement %", "Bullish"], ascending=[False, False])[order],
+                 width="stretch", hide_index=True)
+    st.download_button("Download the scan (CSV)", view[order].to_csv(index=False).encode(),
+                       f"custom_screen_{pd.Timestamp.now():%Y%m%d_%H%M}.csv", "text/csv",
+                       key="cust_dl")
+
+    st.markdown("#### Inspect one row")
+    i1, i2 = st.columns([2, 1])
+    labels = [f"{r['Ticker']} · {r['Timeframe']}" for r in rows]
+    picked_label = i1.selectbox("Row", labels, key="cust_pick")
+    picked = rows[labels.index(picked_label)]
+    detail = pd.DataFrame([
+        {"Indicator": v["label"], "Group": v["group"],
+         "Verdict": "BULL" if v["bull"] else ("BEAR" if v["bear"] else "neutral"),
+         "Reading": v["text"]}
+        for v in picked.get("_detail", [])])
+    if not detail.empty:
+        st.dataframe(detail, width="stretch", hide_index=True)
+    st.caption(f"{picked['Bullish']} bullish against {picked['Bearish']} bearish across "
+               f"{picked['Indicators scored']} indicators that had enough history. "
+               f"Sector {picked['Sector index']} is {picked['Sector bias']}; "
+               f"flipped: {picked['Flipped']}.")
+
+    if i2.button("Apply to the sidebar", width="stretch", key="cust_apply"):
+        st.session_state.pending_ticker = picked["Ticker"]
+        st.session_state.pending_combo = {
+            "strategy": "01 · Dual EMA Crossover",
+            "sl_type": "ATR Multiple", "sl_value": 1.5,
+            "tp_type": "Risk : Reward Multiple", "tp_value": 2.0,
+            "filter_key": "", "widgets": {"cfg_interval": picked["Timeframe"]}}
+        st.rerun()
+
+    if errs:
+        with st.expander(f"Jobs that failed ({len(errs)})"):
+            st.dataframe(pd.DataFrame(errs), width="stretch", hide_index=True)
+    render_analyst_panel("cust", "these custom indicator results", _frame_context(frame))
+
+
 def main() -> None:
     st.set_page_config(page_title="Algo Trading Platform", layout="wide",
                        initial_sidebar_state="expanded")
@@ -12586,10 +14049,11 @@ def main() -> None:
     (status.success if st.session_state.live_running else status.info)(
         "LIVE CORE: RUNNING" if st.session_state.live_running else "LIVE CORE: IDLE")
 
-    (t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11) = st.tabs(
+    (t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12) = st.tabs(
         ["Backtesting Engine Studio", "Live Sandbox Operations", "Live Trade Log Ledger",
          "Signal Screener", "Auto Screener", "Strategy Optimiser", "Signal Lab",
-         "Chart Patterns", "Gamma Blast", "Momentum Pulse", "Volatility Levels"])
+         "Chart Patterns", "Gamma Blast", "Momentum Pulse", "Volatility Levels",
+         "Custom Indicators"])
     panels = ((t1, tab_backtest, "Backtesting Engine Studio"),
               (t2, tab_live, "Live Sandbox Operations"),
               (t3, tab_ledger, "Live Trade Log Ledger"),
@@ -12600,7 +14064,8 @@ def main() -> None:
               (t8, tab_patterns, "Chart Patterns"),
               (t9, tab_gamma_blast, "Gamma Blast"),
               (t10, tab_momentum_pulse, "Momentum Pulse"),
-              (t11, tab_volatility_levels, "Volatility Levels"))
+              (t11, tab_volatility_levels, "Volatility Levels"),
+              (t12, tab_custom_screener, "Custom Indicators"))
     for holder, render, name in panels:
         with holder:
             try:
@@ -14666,6 +16131,155 @@ def _test_drawdown_and_reward_risk_objectives():
           "margin; drawdown minimised and capped  OK")
 
 
+def _test_indicator_library():
+    """
+    Every indicator in the registry must compute, stay inside its own published
+    bounds, and never claim to be bullish and bearish at the same time.
+
+    The bounds matter more than they look: an oscillator that strays outside
+    its range is a formula error, and a formula error that still returns a
+    plausible-looking number is the kind of bug a screener hides for months.
+    """
+    df = _synthetic(600, seed=11)
+    high, low, close, volume = df["High"], df["Low"], df["Close"], df["Volume"]
+
+    # -- hand-checkable values on a ramp
+    ramp = pd.Series([1.0, 2.0, 3.0, 4.0, 5.0])
+    assert abs(float(wma(ramp, 3).iloc[-1]) - 26.0 / 6.0) < 1e-9, "WMA weights are wrong"
+    assert abs(float(roc(ramp, 2).iloc[-1]) - (5.0 / 3.0 - 1.0) * 100.0) < 1e-9
+    assert float(momentum(ramp, 2).iloc[-1]) == 2.0
+
+    # -- bounded oscillators must respect their bounds
+    bounded = {
+        "Stochastic %K": (stochastic(high, low, close)[0], 0.0, 100.0),
+        "Stochastic RSI": (stoch_rsi(close)[0], 0.0, 100.0),
+        "Williams %R": (williams_r(high, low, close), -100.0, 0.0),
+        "CMO": (cmo(close), -100.0, 100.0),
+        "MFI": (money_flow_index(high, low, close, volume), 0.0, 100.0),
+        "Ultimate": (ultimate_oscillator(high, low, close), 0.0, 100.0),
+        "Aroon up": (aroon(high, low)[0], 0.0, 100.0),
+        "Choppiness": (choppiness(high, low, close), 0.0, 100.0),
+        "CMF": (chaikin_money_flow(high, low, close, volume), -1.0, 1.0),
+        "Balance of Power": (balance_of_power(df), -1.0, 1.0),
+    }
+    for name, (series, lo, hi) in bounded.items():
+        values = pd.to_numeric(series, errors="coerce").dropna()
+        assert len(values), f"{name} produced nothing"
+        assert values.min() >= lo - 1e-6 and values.max() <= hi + 1e-6, \
+            f"{name} left [{lo}, {hi}]: {values.min():.3f}..{values.max():.3f}"
+
+    # -- Heikin Ashi's close IS the four-price average, by definition
+    ha = heikin_ashi(df)
+    expected = float((df["Open"].iloc[-1] + df["High"].iloc[-1]
+                      + df["Low"].iloc[-1] + df["Close"].iloc[-1]) / 4.0)
+    assert abs(float(ha["ha_close"].iloc[-1]) - expected) < 1e-9
+
+    # -- Parabolic SAR has to actually flip on a random walk
+    _sar, is_long = psar(high, low)
+    assert int((is_long != is_long.shift(1)).sum()) > 3, "PSAR never flipped"
+
+    # -- Ichimoku must have a reading on the last bar. If the spans were
+    #    shifted forward for plotting, the newest rows would be empty and a
+    #    screener reading the last row would silently see nothing -- or worse,
+    #    read a value derived from candles that have not happened.
+    tenkan, _kijun, _a, span_b = ichimoku(high, low, close)
+    assert pd.notna(tenkan.iloc[-1]) and pd.notna(span_b.iloc[-1]), \
+        "Ichimoku must be readable on the newest bar, not shifted into the future"
+
+    # -- the whole registry runs, and no entry is both bullish and bearish
+    frame = df.copy()
+    frame.index = pd.date_range(end=pd.Timestamp("2026-10-16 15:15", tz="Asia/Kolkata"),
+                                periods=len(frame), freq="5min", tz="Asia/Kolkata")
+    keys = [spec[0] for spec in INDICATOR_SPECS]
+    assert len(keys) == len(set(keys)), "duplicate indicator keys"
+    verdicts = evaluate_indicators(frame, keys)
+    assert len(verdicts) == len(keys)
+    broken = [v["key"] for v in verdicts if str(v["text"]).startswith("failed")]
+    assert not broken, f"indicators raised: {broken}"
+    contradictory = [v["key"] for v in verdicts if v["bull"] and v["bear"]]
+    assert not contradictory, f"both bullish and bearish at once: {contradictory}"
+
+    # -- a zero-volume feed (every index) must degrade, never raise
+    silent = frame.copy()
+    silent["Volume"] = 0.0
+    quiet = evaluate_indicators(silent, keys)
+    assert not [v["key"] for v in quiet if str(v["text"]).startswith("failed")]
+    reported = [v["key"] for v in quiet if "no volume" in str(v["text"])]
+    assert len(reported) >= 8, \
+        f"volume indicators must SAY the feed has no volume, got {len(reported)}"
+
+    # -- the forming candle is excluded from every reading
+    assert len(frame) > 3
+    trimmed = evaluate_indicators(frame.iloc[:-1], keys)
+    same = sum(1 for a, b in zip(verdicts, trimmed) if a["bull"] == b["bull"])
+    assert same >= len(keys) - 6, \
+        "dropping the forming candle should barely change the verdicts, since it is " \
+        "already excluded; a large change means it was being read"
+    print(f"   indicator library: {len(keys)} indicators, bounds held, none contradictory, "
+          f"zero-volume feeds degrade cleanly  OK")
+
+
+def _test_custom_screener_and_sector_flip():
+    """
+    The custom screener's three moving parts: the count, the sector flip, and
+    the entry filters.
+
+    The flip is a contrarian rule, so it must fire only when the ticker AGREES
+    with its sector, and when it fires the bullish and bearish counts swap
+    rather than merely being relabelled.
+    """
+    real_st = globals()["st"]
+    fake = _FakeStreamlit()
+    globals()["st"] = fake
+    saved = {"load_market_data": globals()["load_market_data"]}
+    try:
+        n = 400
+        idx = pd.date_range(end=pd.Timestamp("2026-10-16 15:15", tz="Asia/Kolkata"),
+                            periods=n, freq="15min", tz="Asia/Kolkata")
+        rising = 1000.0 + np.linspace(0, 120, n) + \
+            np.random.default_rng(1).normal(0, 1.5, n)
+        frame = pd.DataFrame({"Open": rising, "High": rising + 2, "Low": rising - 2,
+                              "Close": rising, "Volume": np.full(n, 5000.0)}, index=idx)
+        globals()["load_market_data"] = lambda *a, **k: DataBundle(
+            frame=frame.copy(), symbol="X.NS", interval="15m", period="60d")
+        SECTOR_BY_TICKER["X.NS"] = "INFORMATION TECHNOLOGY"
+        keys = [spec[0] for spec in INDICATOR_SPECS]
+        base_params = dict(DEFAULT_PARAMS)
+
+        plain = custom_screen_one("X.NS", "15m", keys, {}, None, False, base_params)
+        assert plain["Bias"] == "BULLISH", f"a clean uptrend must read bullish: {plain['Bias']}"
+        assert plain["Bullish"] > plain["Bearish"]
+        assert plain["Flipped"] == "no"
+
+        # The industry label must resolve to a real sector index, not a guess.
+        assert sector_index_for("X.NS") == "^CNXIT"
+        assert sector_index_for("^NSEI") is None, "an index has no sector of its own"
+
+        flipped = custom_screen_one("X.NS", "15m", keys, {}, None, True, base_params)
+        assert flipped["Sector bias"] == "BULLISH"
+        assert flipped["Flipped"] == "yes", "agreeing with the sector must trigger the flip"
+        assert flipped["Bias"] == "BEARISH"
+        assert flipped["Bullish"] == plain["Bearish"], "the counts must SWAP, not be relabelled"
+        assert flipped["Bearish"] == plain["Bullish"]
+
+        # An unsatisfiable filter must veto the row and name itself.
+        impossible = default_filter_config()
+        impossible["adx"]["enabled"] = True
+        impossible["adx"]["min"] = 99.0
+        impossible["adx"]["max"] = 100.0
+        vetoed = custom_screen_one("X.NS", "15m", keys, {}, impossible, False, base_params)
+        assert vetoed["Bias"] == "FILTERED OUT", vetoed["Bias"]
+        assert "ADX" in vetoed["Filters"], vetoed["Filters"]
+        assert vetoed["Bias before filters"] == "BULLISH", \
+            "the pre-filter verdict must stay visible, so a veto can be told from an absence"
+        print("   custom screener: counts, sector flip swaps the counts, filters veto and "
+              "name themselves  OK")
+    finally:
+        globals()["st"] = real_st
+        globals().update(saved)
+        SECTOR_BY_TICKER.pop("X.NS", None)
+
+
 def _test_momentum_pulse_checklist():
     """
     The four-and-four condition screener.
@@ -15479,6 +17093,8 @@ def run_selftest() -> int:
         _test_live_entry_is_not_poll_dependent()
         _test_every_signal_gets_a_recorded_verdict()
         _test_drawdown_and_reward_risk_objectives()
+        _test_indicator_library()
+        _test_custom_screener_and_sector_flip()
         _test_momentum_pulse_checklist()
         _test_volatility_levels_and_oi_ratio()
         _test_combined_objective_ranking()
