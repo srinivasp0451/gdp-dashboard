@@ -6011,7 +6011,8 @@ def render_sidebar() -> dict:
                                                 disabled=live, key="cfg_vp_look")
         params["vp_bins"] = sb.number_input("Price buckets", 6, 100, 24, 1, disabled=live,
                                             key="cfg_vp_bins")
-        params["vp_value_area"] = sb.slider("Value area", 0.5, 0.95, 0.70, 0.05, disabled=live,
+        params["vp_value_area"] = sb.number_input("Value area", 0.5, 0.95, 0.70, 0.05,
+                                                  disabled=live,
                                             key="cfg_vp_va")
         sb.caption("On a zero-volume feed (indices, spot FX) this becomes a TPO profile "
                    "counting time at price, which is a different statistic.")
@@ -10039,8 +10040,9 @@ def _pattern_dialog_chart(frame, hit):
 def _pattern_dialog_levels(frame, hit, hits_same_pattern, symbol, tf):
     st.markdown("#### Recommended levels")
     c1, c2 = st.columns(2)
-    rr = c1.slider("Reward : risk", 0.5, 6.0, 2.0, 0.25, key="pl_rr")
-    atr_mult = c2.slider("ATR multiple for the fallback stop", 0.5, 5.0, 1.5, 0.25, key="pl_atr")
+    rr = c1.number_input("Reward : risk", 0.5, 6.0, 2.0, 0.25, key="pl_rr")
+    atr_mult = c2.number_input("ATR multiple for the fallback stop", 0.5, 5.0, 1.5, 0.25,
+                               key="pl_atr")
 
     plan = pattern_levels(frame, hit, rr, atr_mult)
     side = "long" if plan["direction"] > 0 else "short"
@@ -12829,7 +12831,7 @@ def tab_volatility_levels(cfg: dict) -> None:
                                    key="vol_custom")
     all_tickers, note = universe_tickers_ui(universe, custom_text, None, "vol")
     chosen = st.multiselect(f"Tickers ({len(all_tickers)} in {universe})", all_tickers,
-                            default=all_tickers[:20], key=f"vol_tickers_{universe}")
+                            default=all_tickers, key=f"vol_tickers_{universe}")
     if note:
         st.caption(note)
 
@@ -13686,14 +13688,69 @@ INDUSTRY_TO_SECTOR_INDEX = {
     "POWER": "^CNXENERGY", "ENERGY": "^CNXENERGY",
     "MEDIA ENTERTAINMENT & PUBLICATION": "^CNXMEDIA", "MEDIA": "^CNXMEDIA",
     "CAPITAL GOODS": "^CNXINFRA", "CONSTRUCTION": "^CNXINFRA",
-    "SERVICES": "^CNXINFRA",
+    "SERVICES": "^CNXINFRA", "CONSTRUCTION MATERIALS": "^CNXINFRA",
+    "CONSUMER DURABLES": "^CNXFMCG", "TELECOMMUNICATION": "^CNXINFRA",
 }
+
+
+#: Last-resort sector labels for the large caps, used only when NSE refuses
+#: the constituent CSV that normally supplies the industry column. A blank
+#: sector is worse than a slightly stale one, and this is flagged as a
+#: fallback wherever it is used rather than passed off as live data.
+_FALLBACK_SECTORS = {
+    "RELIANCE": "Oil Gas & Consumable Fuels", "TCS": "Information Technology",
+    "HDFCBANK": "Private Bank", "ICICIBANK": "Private Bank", "INFY": "Information Technology",
+    "HINDUNILVR": "Fast Moving Consumer Goods", "ITC": "Fast Moving Consumer Goods",
+    "SBIN": "PSU Bank", "BHARTIARTL": "Telecommunication", "KOTAKBANK": "Private Bank",
+    "LT": "Construction", "AXISBANK": "Private Bank", "BAJFINANCE": "Financial Services",
+    "ASIANPAINT": "Consumer Durables", "MARUTI": "Automobile and Auto Components",
+    "HCLTECH": "Information Technology", "WIPRO": "Information Technology",
+    "TECHM": "Information Technology", "SUNPHARMA": "Healthcare", "CIPLA": "Healthcare",
+    "DRREDDY": "Healthcare", "DIVISLAB": "Healthcare", "APOLLOHOSP": "Healthcare",
+    "TATASTEEL": "Metals & Mining", "JSWSTEEL": "Metals & Mining",
+    "HINDALCO": "Metals & Mining", "VEDL": "Metals & Mining", "COALINDIA": "Metals & Mining",
+    "ONGC": "Oil Gas & Consumable Fuels", "BPCL": "Oil Gas & Consumable Fuels",
+    "IOC": "Oil Gas & Consumable Fuels", "NTPC": "Power", "POWERGRID": "Power",
+    "TATAMOTORS": "Automobile and Auto Components",
+    "M&M": "Automobile and Auto Components", "EICHERMOT": "Automobile and Auto Components",
+    "BAJAJ-AUTO": "Automobile and Auto Components", "HEROMOTOCO":
+        "Automobile and Auto Components", "TITAN": "Consumer Durables",
+    "NESTLEIND": "Fast Moving Consumer Goods", "BRITANNIA": "Fast Moving Consumer Goods",
+    "TATACONSUM": "Fast Moving Consumer Goods", "ULTRACEMCO": "Construction Materials",
+    "GRASIM": "Construction Materials", "SHREECEM": "Construction Materials",
+    "ADANIENT": "Metals & Mining", "ADANIPORTS": "Services", "BHEL": "Capital Goods",
+    "SIEMENS": "Capital Goods", "ABB": "Capital Goods", "DLF": "Realty",
+    "INDUSINDBK": "Private Bank", "SBILIFE": "Financial Services",
+    "HDFCLIFE": "Financial Services", "BAJAJFINSV": "Financial Services",
+    "LAURUSLABS": "Healthcare", "POLICYBZR": "Financial Services",
+}
+
+
+def sector_label_for(ticker: str) -> str:
+    """
+    A readable sector for a ticker, from live index data where possible.
+
+    The industry comes from the NSE constituent CSV, which is the authority and
+    stays right through a rebalance. NSE frequently refuses datacentre traffic
+    though, and when it does that map is empty -- which is why this column kept
+    coming back blank. The bundled list covers the large caps so the column
+    says something useful either way.
+    """
+    live = str(SECTOR_BY_TICKER.get(ticker, "")).strip()
+    if live and live != "--":
+        return live
+    base = (ticker or "").upper().replace(".NS", "").replace(".BO", "")
+    if (ticker or "").startswith("^") or base in {"NIFTY_FIN_SERVICE"}:
+        return "Index"
+    return _FALLBACK_SECTORS.get(base, "--")
 
 
 def sector_index_for(ticker: str) -> str | None:
     """The sector index representing a ticker, or None when there is no match."""
-    industry = str(SECTOR_BY_TICKER.get(ticker, "")).strip().upper()
-    if not industry or industry == "INDEX":
+    # Uses the same resolution as the label, so a ticker that shows a sector
+    # always has one to be compared against -- they cannot disagree.
+    industry = sector_label_for(ticker).strip().upper()
+    if not industry or industry in ("--", "INDEX"):
         return None
     if industry in INDUSTRY_TO_SECTOR_INDEX:
         return INDUSTRY_TO_SECTOR_INDEX[industry]
@@ -13703,24 +13760,40 @@ def sector_index_for(ticker: str) -> str | None:
     return None
 
 
-def sector_bias(symbol: str, interval: str, fast: int = 20, slow: int = 50) -> str:
+def sector_bias(symbol: str, interval: str, selected: list[str] | None = None,
+                params: dict | None = None) -> tuple[str, float, int, int]:
     """
-    Which way a sector index is leaning, from its own moving averages.
+    Which way a sector index is leaning, and by how much.
 
-    Cached per scan through the ordinary market-data cache, so a 200-name
-    universe costs one download per SECTOR rather than one per ticker.
+    Scored with the SAME indicator set the tickers are scored with, so "sector
+    bullish" means the same thing as "ticker bullish" rather than being a
+    different measurement wearing the same word. Returns
+    ``(bias, percent, bull, bear)``.
+
+    One download per SECTOR per timeframe, not per ticker: the market-data
+    cache sees the identical arguments from every member of that sector.
     """
+    if not symbol:
+        return "unknown", float("nan"), 0, 0
     try:
-        period, _ = lab_period_for(interval, 200)
+        period, _ = lab_period_for(interval, 250)
         frame = load_market_data(symbol, period, interval,
-                                 freshness_seconds=300, min_bars=slow + 5).frame
+                                 freshness_seconds=300, min_bars=60).frame
     except Exception:                                               # noqa: BLE001
-        return "unknown"
-    closed = frame.iloc[:-1] if len(frame) > 2 else frame
-    quick, steady = _last(ema(closed["Close"], fast)), _last(ema(closed["Close"], slow))
-    if not _ok(quick, steady):
-        return "unknown"
-    return "BULLISH" if quick > steady else "BEARISH"
+        return "unknown", float("nan"), 0, 0
+
+    keys = list(selected or ["ema", "ma_cross", "rsi_trend", "macd", "adx", "supertrend"])
+    verdicts = evaluate_indicators(frame, keys, params or {})
+    bull = sum(1 for v in verdicts if v["bull"])
+    bear = sum(1 for v in verdicts if v["bear"])
+    scored = sum(1 for v in verdicts
+                 if not str(v["text"]).startswith(("failed", "not enough")))
+    if not scored:
+        return "unknown", float("nan"), bull, bear
+    if bull == bear:
+        return "MIXED", round(max(bull, bear) / scored * 100.0, 1), bull, bear
+    leaning = "BULLISH" if bull > bear else "BEARISH"
+    return leaning, round(max(bull, bear) / scored * 100.0, 1), bull, bear
 
 
 def custom_screen_one(ticker: str, interval: str, selected: list[str], params: dict,
@@ -13758,16 +13831,27 @@ def custom_screen_one(ticker: str, interval: str, selected: list[str], params: d
 
     raw_bias = ("BULLISH" if bull > bear else "BEARISH" if bear > bull else "MIXED")
 
-    # --- the sector flip -----------------------------------------------------
+    # --- the sector ---------------------------------------------------------
+    #
+    # Read on EVERY scan, not only when the flip is enabled: the sector a name
+    # belongs to and which way that sector is leaning are worth knowing whether
+    # or not they are being acted on.
     sector_symbol = sector_index_for(ticker)
-    sector_view = sector_bias(sector_symbol, interval) if (flip_on_sector and sector_symbol) \
-        else "not used"
+    sector_view, sector_pct, sector_bull, sector_bear = \
+        sector_bias(sector_symbol, interval, selected, params) if sector_symbol \
+        else ("no sector index", float("nan"), 0, 0)
+
+    # --- the flip, on DISAGREEMENT -------------------------------------------
+    #
+    # The rule is sector alignment: when a ticker is leaning one way and its
+    # own sector the other, the sector wins and the ticker's verdict is
+    # inverted to match it. A ticker already agreeing with its sector is left
+    # alone -- there is nothing to reconcile.
     flipped = False
     bias = raw_bias
     if flip_on_sector and sector_view in ("BULLISH", "BEARISH") and raw_bias != "MIXED":
-        if sector_view == raw_bias:
-            # The ticker agrees with an already-extended sector, so fade it.
-            bias = "BEARISH" if raw_bias == "BULLISH" else "BULLISH"
+        if sector_view != raw_bias:
+            bias = sector_view
             bull, bear = bear, bull
             flipped = True
 
@@ -13779,15 +13863,25 @@ def custom_screen_one(ticker: str, interval: str, selected: list[str], params: d
     elif bias == "BEARISH" and not filters_pass_short:
         gated = "FILTERED OUT"
 
+    sector_name = sector_label_for(ticker)
+    if sector_view in ("BULLISH", "BEARISH", "MIXED") and np.isfinite(sector_pct):
+        sector_column = f"{sector_name} · {sector_pct:.0f}% {sector_view.lower()}"
+    else:
+        sector_column = sector_name
+
     row = {
         "Ticker": ticker, "Timeframe": interval,
-        "Sector": SECTOR_BY_TICKER.get(ticker, "--"),
+        "Sector": sector_column,
         "Price": round(float(frame["Close"].iloc[-1]), 2),
-        "Bias": gated, "Bias before filters": bias,
+        # The full chain, so a verdict can always be traced:
+        #   indicators -> raw  ->  sector flip  ->  entry filters  -> Bias
+        "Bias": gated, "Bias before filters": bias, "Bias before flip": raw_bias,
         "Bullish": bull, "Bearish": bear,
         "Agreement %": round(max(bull, bear) / usable * 100.0, 1) if usable else None,
         "Indicators scored": usable, "Indicators selected": len(selected),
         "Sector index": sector_symbol or "--", "Sector bias": sector_view,
+        "Sector agreement %": sector_pct if np.isfinite(sector_pct) else None,
+        "Sector bullish": sector_bull, "Sector bearish": sector_bear,
         "Flipped": "yes" if flipped else "no",
         "Filters": filter_note,
         "Checked at": pd.Timestamp.now(),
@@ -13826,6 +13920,371 @@ def _multi_picker(label: str, options: list, prefix: str, defaults: list,
     return picked
 
 
+# =============================================================================
+# SECTION 19j -- SMART MONEY CONCEPTS
+# =============================================================================
+# Every SMC idea the data can actually support, computed from confirmed swings
+# so nothing here reads a pivot that has not finished forming.
+#
+# The honest framing: SMC is a VOCABULARY for describing price structure, not a
+# tested edge. An order block is "the last opposite candle before the move that
+# broke structure" -- a definition, not a prediction. The verdict below counts
+# how many concepts currently lean each way; whether that count makes money is
+# a question for the Backtesting tab, and this panel says so.
+
+# Overlay colours. Direction uses the app's own semantic pair, so a bullish
+# order block is the same green as a bullish candle. Liquidity sweeps get the
+# one extra hue, validated against both chart surfaces for colour-vision
+# separation; everything else is distinguished by shape and a direct label, so
+# identity never rests on colour alone.
+_SMC_SWEEP = "#3d87e8"
+_SMC_INK = "#8d99ae"
+
+
+def smc_analyse(df: pd.DataFrame, left: int = 3, right: int = 3,
+                lookback: int = 150, equal_tol_pct: float = 0.05) -> dict:
+    """
+    Every SMC concept this data can support, on ONE frame.
+
+    Returns a dict of concepts, each with a verdict ("bull", "bear" or
+    "neutral"), a readable reading, and whatever levels the chart needs.
+    """
+    closed = df.iloc[:-1] if len(df) > 2 else df
+    if len(closed) < max(30, left + right + 10):
+        return {"error": "not enough candles for a structural read"}
+
+    price = float(closed["Close"].iloc[-1])
+    out: dict = {"price": price, "concepts": {}, "shapes": {}}
+
+    def add(name: str, verdict: str, reading: str) -> None:
+        out["concepts"][name] = {"verdict": verdict, "reading": reading}
+
+    # --- 1. swing structure --------------------------------------------------
+    swing_high, swing_low, prev_high, prev_low = swing_levels(
+        closed["High"], closed["Low"], left, right)
+    sh, sl_ = _last(swing_high), _last(swing_low)
+    out["shapes"]["swing_high"] = sh
+    out["shapes"]["swing_low"] = sl_
+    out["shapes"]["prev_swing_high"] = _last(prev_high)
+    out["shapes"]["prev_swing_low"] = _last(prev_low)
+    if _ok(sh, sl_):
+        add("Swing structure", "neutral",
+            f"last confirmed swing high {fmt(sh)}, swing low {fmt(sl_)} "
+            f"(confirmed {right} candles after the fact, so neither is live)")
+
+    # --- 2. break of structure ----------------------------------------------
+    direction, _sh, _sl = market_structure(closed, left, right)
+    bos = _last(direction)
+    if _ok(bos) and bos != 0:
+        add("Break of structure (BOS)", "bull" if bos > 0 else "bear",
+            f"price has broken the last swing {'high' if bos > 0 else 'low'}")
+    else:
+        add("Break of structure (BOS)", "neutral", "no break of structure yet")
+
+    # --- 3. change of character ---------------------------------------------
+    # CHoCH is the FIRST break against the prevailing direction: the bar where
+    # the structural trend changes sign, not every subsequent break.
+    flips = direction[direction != 0]
+    choch_dir, choch_at = 0, None
+    if len(flips) > 1:
+        changed = flips[flips != flips.shift(1)]
+        if len(changed) > 1:
+            choch_dir = int(changed.iloc[-1])
+            choch_at = changed.index[-1]
+    if choch_dir:
+        add("Change of character (CHoCH)", "bull" if choch_dir > 0 else "bear",
+            f"structure last flipped {'bullish' if choch_dir > 0 else 'bearish'} "
+            f"on {fmt_time(choch_at)}")
+    else:
+        add("Change of character (CHoCH)", "neutral", "no structural flip in this window")
+
+    # --- 4. order blocks -----------------------------------------------------
+    # The last down candle before an up-move that broke structure, and mirror.
+    recent = closed.tail(int(lookback))
+    bull_ob = bear_ob = None
+    body_down = recent["Close"] < recent["Open"]
+    body_up = recent["Close"] > recent["Open"]
+    structure_tail = direction.tail(len(recent))
+    for i in range(len(recent) - 2, 1, -1):
+        if bull_ob is None and bool(body_down.iloc[i]) and \
+                float(structure_tail.iloc[min(i + 2, len(structure_tail) - 1)]) > 0:
+            bull_ob = (float(recent["Low"].iloc[i]), float(recent["High"].iloc[i]),
+                       recent.index[i])
+        if bear_ob is None and bool(body_up.iloc[i]) and \
+                float(structure_tail.iloc[min(i + 2, len(structure_tail) - 1)]) < 0:
+            bear_ob = (float(recent["Low"].iloc[i]), float(recent["High"].iloc[i]),
+                       recent.index[i])
+        if bull_ob and bear_ob:
+            break
+    out["shapes"]["bull_ob"], out["shapes"]["bear_ob"] = bull_ob, bear_ob
+    if bull_ob:
+        inside = bull_ob[0] <= price <= bull_ob[1]
+        add("Bullish order block", "bull" if inside else "neutral",
+            f"{fmt(bull_ob[0])}-{fmt(bull_ob[1])} from {fmt_time(bull_ob[2])}"
+            + (" — price is inside it (mitigating)" if inside else " — not yet revisited"))
+    if bear_ob:
+        inside = bear_ob[0] <= price <= bear_ob[1]
+        add("Bearish order block", "bear" if inside else "neutral",
+            f"{fmt(bear_ob[0])}-{fmt(bear_ob[1])} from {fmt_time(bear_ob[2])}"
+            + (" — price is inside it (mitigating)" if inside else " — not yet revisited"))
+
+    # --- 5. fair value gaps --------------------------------------------------
+    fb, fs, fb_lo, fb_hi, fs_lo, fs_hi = fair_value_gaps(closed)
+    recent_bull_fvg = bool(fb.tail(int(lookback)).any())
+    recent_bear_fvg = bool(fs.tail(int(lookback)).any())
+    bull_gap = (_last(fb_lo), _last(fb_hi)) if recent_bull_fvg else None
+    bear_gap = (_last(fs_lo), _last(fs_hi)) if recent_bear_fvg else None
+    out["shapes"]["bull_fvg"], out["shapes"]["bear_fvg"] = bull_gap, bear_gap
+    if bull_gap and _ok(*bull_gap):
+        unfilled = price > bull_gap[1]
+        add("Bullish fair value gap", "bull" if unfilled else "neutral",
+            f"{fmt(bull_gap[0])}-{fmt(bull_gap[1])}"
+            + (" — still unfilled below price" if unfilled else " — price has traded back into it"))
+    if bear_gap and _ok(*bear_gap):
+        unfilled = price < bear_gap[0]
+        add("Bearish fair value gap", "bear" if unfilled else "neutral",
+            f"{fmt(bear_gap[0])}-{fmt(bear_gap[1])}"
+            + (" — still unfilled above price" if unfilled else " — price has traded back into it"))
+
+    # --- 6. liquidity sweeps -------------------------------------------------
+    # A wick through a prior swing that CLOSES back inside: stops taken, then
+    # rejection. The close is what separates a sweep from a genuine break.
+    sweep_up = sweep_down = None
+    tail = closed.tail(int(lookback))
+    for i in range(len(tail) - 1, max(len(tail) - 40, 0), -1):
+        stamp = tail.index[i]
+        level_high, level_low = float(prev_high.loc[stamp]) if stamp in prev_high.index else np.nan, \
+            float(prev_low.loc[stamp]) if stamp in prev_low.index else np.nan
+        if sweep_up is None and _ok(level_high) and \
+                float(tail["High"].iloc[i]) > level_high > float(tail["Close"].iloc[i]):
+            sweep_up = (level_high, stamp)
+        if sweep_down is None and _ok(level_low) and \
+                float(tail["Low"].iloc[i]) < level_low < float(tail["Close"].iloc[i]):
+            sweep_down = (level_low, stamp)
+        if sweep_up and sweep_down:
+            break
+    out["shapes"]["sweep_up"], out["shapes"]["sweep_down"] = sweep_up, sweep_down
+    if sweep_down:
+        add("Sell-side liquidity sweep", "bull",
+            f"wick took out {fmt(sweep_down[0])} on {fmt_time(sweep_down[1])} and closed back "
+            f"above — stops taken below, then rejected")
+    if sweep_up:
+        add("Buy-side liquidity sweep", "bear",
+            f"wick took out {fmt(sweep_up[0])} on {fmt_time(sweep_up[1])} and closed back "
+            f"below — stops taken above, then rejected")
+    if not sweep_up and not sweep_down:
+        add("Liquidity sweep", "neutral", "no sweep-and-reject in the recent window")
+
+    # --- 7. premium / discount ----------------------------------------------
+    window = closed.tail(int(lookback))
+    top, bottom = float(window["High"].max()), float(window["Low"].min())
+    equilibrium = (top + bottom) / 2.0
+    out["shapes"].update({"range_high": top, "range_low": bottom,
+                          "equilibrium": equilibrium})
+    if top > bottom:
+        position = (price - bottom) / (top - bottom) * 100.0
+        zone = "premium" if price > equilibrium else "discount"
+        # Discount is where a buyer wants to be, premium where a seller does.
+        add("Premium / discount", "bull" if zone == "discount" else "bear",
+            f"price sits at {position:.0f}% of the {int(lookback)}-candle range "
+            f"({fmt(bottom)}-{fmt(top)}), i.e. in {zone}; equilibrium {fmt(equilibrium)}")
+
+    # --- 8. equal highs and lows (liquidity pools) ---------------------------
+    tolerance = price * float(equal_tol_pct) / 100.0
+    highs = window["High"].tail(60)
+    lows = window["Low"].tail(60)
+    equal_high = bool(((highs.max() - highs.nlargest(3)) <= tolerance).sum() >= 3) \
+        if len(highs) >= 3 else False
+    equal_low = bool(((lows.nsmallest(3) - lows.min()) <= tolerance).sum() >= 3) \
+        if len(lows) >= 3 else False
+    if equal_high or equal_low:
+        parts = []
+        if equal_high:
+            parts.append(f"equal highs near {fmt(float(highs.max()))} (buy-side liquidity)")
+        if equal_low:
+            parts.append(f"equal lows near {fmt(float(lows.min()))} (sell-side liquidity)")
+        add("Equal highs / lows", "bear" if equal_high and not equal_low
+            else ("bull" if equal_low and not equal_high else "neutral"),
+            "; ".join(parts))
+    else:
+        add("Equal highs / lows", "neutral", "no obvious liquidity pool in this window")
+
+    # --- the verdict ---------------------------------------------------------
+    bull_n = sum(1 for c in out["concepts"].values() if c["verdict"] == "bull")
+    bear_n = sum(1 for c in out["concepts"].values() if c["verdict"] == "bear")
+    if bull_n > bear_n + 1:
+        signal = "BUY"
+    elif bear_n > bull_n + 1:
+        signal = "SELL"
+    else:
+        signal = "HOLD"
+    out.update({"bull": bull_n, "bear": bear_n, "signal": signal,
+                "scored": len(out["concepts"])})
+    return out
+
+
+def smc_chart(df: pd.DataFrame, analysis: dict, title: str, light: bool = False,
+              bars: int = 160):
+    """
+    The structural read, drawn on the candles it came from.
+
+    Direction keeps the app's own semantic colours, so a bullish order block is
+    the same green as a bullish candle. Every zone carries a direct label, so
+    the chart is readable without matching colours to a legend -- and remains
+    readable to someone who cannot separate red from green.
+    """
+    import plotly.graph_objects as go
+
+    tail = df.tail(int(bars))
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(
+        x=tail.index, open=tail["Open"], high=tail["High"], low=tail["Low"],
+        close=tail["Close"], name="Price",
+        increasing_line_color=_UP, decreasing_line_color=_DOWN,
+        increasing_fillcolor=_UP, decreasing_fillcolor=_DOWN,
+        line=dict(width=1), showlegend=False))
+
+    shapes = analysis.get("shapes", {})
+    lo, hi = float(tail["Low"].min()), float(tail["High"].max())
+    pad = max((hi - lo) * 0.06, hi * 0.001)
+    y_lo, y_hi = lo - pad, hi + pad
+    left_edge, right_edge = tail.index[0], tail.index[-1]
+
+    def band(low, high, colour, label, opacity=0.14, side="left"):
+        """
+        A price zone with its name written INSIDE it.
+
+        Labelling at the band edge stacked every zone against the right margin,
+        where four of them overlapped each other and the sweep markers. Writing
+        the name at the band's own midpoint spreads the labels down the chart
+        by construction, because the bands are at different prices.
+        """
+        if low is None or high is None or not (np.isfinite(low) and np.isfinite(high)):
+            return
+        if high < y_lo or low > y_hi:
+            return
+        fig.add_shape(type="rect", xref="x", yref="y", x0=left_edge, x1=right_edge,
+                      y0=low, y1=high, fillcolor=colour, opacity=opacity,
+                      line=dict(width=1, color=colour, dash="dot"), layer="below")
+        at_right = side in ("right", "top", "bottom")
+        if side == "top":
+            at_y, anchor_y = high, "top"
+        elif side == "bottom":
+            at_y, anchor_y = low, "bottom"
+        else:
+            at_y, anchor_y = (low + high) / 2.0, "middle"
+        fig.add_annotation(
+            x=1.0 if at_right else 0.0, xref="x domain",
+            y=at_y, text=(f"{label} " if at_right else f" {label}"),
+            showarrow=False, xanchor="right" if at_right else "left", yanchor=anchor_y,
+            font=dict(size=10, color=colour))
+
+    def level(value, colour, label, dash="dash", position="top right"):
+        if value is None or not np.isfinite(value) or not (y_lo <= value <= y_hi):
+            return
+        fig.add_hline(y=value, line=dict(width=1.2, dash=dash, color=colour),
+                      annotation_text=label, annotation_position=position,
+                      annotation_font=dict(size=10, color=colour))
+
+    # premium / discount, drawn first so everything else sits on top
+    eq = shapes.get("equilibrium")
+    if eq is not None and np.isfinite(eq):
+        band(eq, shapes.get("range_high"), _DOWN, "PREMIUM (sellers)", 0.06, side="top")
+        band(shapes.get("range_low"), eq, _UP, "DISCOUNT (buyers)", 0.06, side="bottom")
+        level(eq, _SMC_INK, "Equilibrium 50%", "dot", "bottom left")
+
+    if shapes.get("bull_ob"):
+        band(shapes["bull_ob"][0], shapes["bull_ob"][1], _UP, "Bullish order block", 0.22)
+    if shapes.get("bear_ob"):
+        band(shapes["bear_ob"][0], shapes["bear_ob"][1], _DOWN, "Bearish order block", 0.22)
+    if shapes.get("bull_fvg"):
+        band(shapes["bull_fvg"][0], shapes["bull_fvg"][1], _UP, "Bullish FVG", 0.12)
+    if shapes.get("bear_fvg"):
+        band(shapes["bear_fvg"][0], shapes["bear_fvg"][1], _DOWN, "Bearish FVG", 0.12)
+
+    level(shapes.get("swing_high"), _SMC_INK, "Swing high")
+    level(shapes.get("swing_low"), _SMC_INK, "Swing low")
+
+    # Liquidity sweeps: the one extra hue, and a marker shape of their own.
+    for key, symbol, label, place in (
+            ("sweep_up", "triangle-down", "Buy-side sweep", "top center"),
+            ("sweep_down", "triangle-up", "Sell-side sweep", "bottom center")):
+        sweep = shapes.get(key)
+        if not sweep:
+            continue
+        fig.add_trace(go.Scatter(
+            x=[sweep[1]], y=[sweep[0]], mode="markers+text", name=label,
+            marker=dict(symbol=symbol, size=14, color=_SMC_SWEEP,
+                        line=dict(width=1.5, color=_SMC_SWEEP)),
+            text=[label], textposition=place, textfont=dict(size=10),
+            hovertemplate=f"{label}<br>%{{x}}<br>%{{y:,.2f}}<extra></extra>"))
+
+    fig.update_layout(
+        height=560, margin=dict(l=62, r=74, t=52, b=44),
+        title=dict(text=title, x=0.01, xanchor="left", font=dict(size=15)),
+        hovermode="x unified", dragmode="pan",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        template="plotly_white" if light else None,
+        xaxis_rangeslider_visible=False)
+    fig.update_yaxes(range=[y_lo, y_hi], showgrid=True,
+                     gridcolor="rgba(128,128,128,0.15)")
+    fig.update_xaxes(showgrid=False)
+    return fig
+
+
+def _smc_panel(picked: dict, cfg: dict) -> None:
+    """Smart Money Concepts for the inspected ticker, with its own verdict."""
+    ticker, interval = picked["Ticker"], picked["Timeframe"]
+    st.markdown("#### Smart Money Concepts")
+    st.caption(f"Structural read of `{ticker}` on `{interval}`, computed from CONFIRMED "
+               "swings only — nothing here uses a pivot that has not finished forming.")
+
+    c1, c2, c3 = st.columns(3)
+    pivot = c1.number_input("Swing strength (candles either side)", 1, 20, 3, 1,
+                            key="smc_pivot",
+                            help="How many candles either side a high must dominate before it "
+                                 "counts as a swing. Larger means fewer, more significant "
+                                 "swings — and a longer wait before one is confirmed.")
+    lookback = c2.number_input("Structure lookback (candles)", 30, 600, 150, 10,
+                               key="smc_look")
+    bars = c3.number_input("Candles to plot", 40, 600, 160, 20, key="smc_bars")
+
+    try:
+        period, _ = lab_period_for(interval, int(lookback) + 100)
+        frame = load_market_data(ticker, period, interval,
+                                 freshness_seconds=180, min_bars=60).frame
+        analysis = smc_analyse(frame, int(pivot), int(pivot), int(lookback))
+    except Exception as exc:                                        # noqa: BLE001
+        st.error(f"Could not analyse `{ticker}`: {exc}")
+        return
+
+    if analysis.get("error"):
+        st.info(analysis["error"])
+        return
+
+    signal = analysis["signal"]
+    tone = {"BUY": st.success, "SELL": st.error}.get(signal, st.info)
+    tone(f"**SMC verdict: {signal}** — {analysis['bull']} concept(s) leaning bullish against "
+         f"{analysis['bear']} bearish, out of {analysis['scored']} scored. "
+         "A verdict needs a margin of two, so a one-concept lead reads HOLD.")
+
+    rows = [{"Concept": name,
+             "Verdict": {"bull": "BULLISH", "bear": "BEARISH"}.get(c["verdict"], "neutral"),
+             "Reading": c["reading"]}
+            for name, c in analysis["concepts"].items()]
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
+    st.plotly_chart(
+        smc_chart(frame, analysis, f"{ticker} · {interval} · smart money concepts",
+                  light=bool(cfg.get("light_charts")), bars=int(bars)),
+        width="stretch", config={"scrollZoom": True})
+    st.caption("Zones carry their own labels, so the chart reads without matching colours to "
+               "a legend. **SMC is a vocabulary for describing structure, not a tested edge** "
+               "— an order block is 'the last opposite candle before the move that broke "
+               "structure', which is a definition, not a prediction. Whether this verdict "
+               "makes money is a question for the Backtesting tab.")
+
+
 def tab_custom_screener(cfg: dict) -> None:
     st.subheader("Custom Indicator Screener")
     st.warning(
@@ -13838,8 +14297,8 @@ def tab_custom_screener(cfg: dict) -> None:
 
     c1, c2 = st.columns([1, 1])
     universe = c1.selectbox("Universe", SCREENER_UNIVERSES, key="cust_universe")
-    min_agree = c2.slider("Minimum agreement to list (%)", 0, 100, 60, 5,
-                          key="cust_agree",
+    min_agree = c2.number_input("Minimum agreement to list (%)", 0, 100, 60, 5,
+                                key="cust_agree",
                           help="How large a majority of the scored indicators must lean one "
                                "way before the ticker is treated as having a bias.")
 
@@ -13848,7 +14307,7 @@ def tab_custom_screener(cfg: dict) -> None:
         custom_text = st.text_area("Tickers", "RELIANCE\nTCS\nINFY", key="cust_custom")
     all_tickers, note = universe_tickers_ui(universe, custom_text, None, "cust")
     chosen = st.multiselect(f"Tickers ({len(all_tickers)} in {universe})", all_tickers,
-                            default=all_tickers[:25], key=f"cust_tickers_{universe}")
+                            default=all_tickers, key=f"cust_tickers_{universe}")
     if note:
         st.caption(note)
 
@@ -13939,13 +14398,15 @@ def tab_custom_screener(cfg: dict) -> None:
                 filter_cfg[key]["enabled"] = True
 
     flip_on_sector = st.checkbox(
-        "Flip the signal when the ticker agrees with its own sector", value=False,
+        "Flip the signal when the ticker DISAGREES with its own sector", value=False,
         key="cust_flip",
-        help="A contrarian setting, off by default. When the sector index is already leaning "
-             "the same way as the ticker, the verdict is INVERTED on the view that a name "
-             "running with an extended sector is the one to fade. This is a trading opinion, "
-             "not a neutral filter, and it has not been backtested here — test it in the "
-             "Signal Lab before trusting it.")
+        help="Sector alignment, off by default. When a ticker leans one way and its own sector "
+             "index leans the other, the sector wins and the ticker's verdict is inverted to "
+             "match it. A ticker already agreeing with its sector is left alone — there is "
+             "nothing to reconcile. The sector is scored with the SAME indicators you ticked, "
+             "so the two readings mean the same thing. This is a trading opinion, not a "
+             "neutral filter, and it has not been backtested here — test it in the Signal Lab "
+             "before trusting it.")
 
     jobs = [(t, tf) for t in chosen for tf in timeframes]
     scan_cost_notice(len(jobs), per_job_hint=1.6 + 0.01 * len(selected), prefix="cust")
@@ -13994,8 +14455,9 @@ def tab_custom_screener(cfg: dict) -> None:
         return
 
     front = ["Ticker", "Timeframe", "Sector", "Price", "Bias", "Bullish", "Bearish",
-             "Agreement %", "Indicators scored", "Flipped", "Sector bias", "Sector index",
-             "Filters", "Bias before filters"]
+             "Agreement %", "Indicators scored", "Flipped", "Sector bias",
+             "Sector agreement %", "Sector bullish", "Sector bearish", "Sector index",
+             "Filters", "Bias before flip", "Bias before filters"]
     order = [c for c in front if c in view.columns] + \
             [c for c in view.columns if c not in front and c != "Checked at"] + \
             (["Checked at"] if "Checked at" in view.columns else [])
@@ -14030,6 +14492,8 @@ def tab_custom_screener(cfg: dict) -> None:
             "tp_type": "Risk : Reward Multiple", "tp_value": 2.0,
             "filter_key": "", "widgets": {"cfg_interval": picked["Timeframe"]}}
         st.rerun()
+
+    _smc_panel(picked, cfg)
 
     if errs:
         with st.expander(f"Jobs that failed ({len(errs)})"):
@@ -16255,12 +16719,15 @@ def _test_custom_screener_and_sector_flip():
         assert sector_index_for("X.NS") == "^CNXIT"
         assert sector_index_for("^NSEI") is None, "an index has no sector of its own"
 
-        flipped = custom_screen_one("X.NS", "15m", keys, {}, None, True, base_params)
-        assert flipped["Sector bias"] == "BULLISH"
-        assert flipped["Flipped"] == "yes", "agreeing with the sector must trigger the flip"
-        assert flipped["Bias"] == "BEARISH"
-        assert flipped["Bullish"] == plain["Bearish"], "the counts must SWAP, not be relabelled"
-        assert flipped["Bearish"] == plain["Bullish"]
+        # Here the sector is fed the SAME rising series, so ticker and sector
+        # AGREE -- and agreement must leave the verdict alone. The flip fires
+        # only on disagreement; see _test_smc_concepts_and_sector_flip_direction
+        # for the case where it does fire.
+        aligned = custom_screen_one("X.NS", "15m", keys, {}, None, True, base_params)
+        assert aligned["Sector bias"] == "BULLISH"
+        assert aligned["Flipped"] == "no", "agreement must NOT flip"
+        assert aligned["Bias"] == "BULLISH"
+        assert aligned["Bullish"] == plain["Bullish"], "an unflipped row keeps its counts"
 
         # An unsatisfiable filter must veto the row and name itself.
         impossible = default_filter_config()
@@ -16278,6 +16745,103 @@ def _test_custom_screener_and_sector_flip():
         globals()["st"] = real_st
         globals().update(saved)
         SECTOR_BY_TICKER.pop("X.NS", None)
+
+
+def _test_smc_concepts_and_sector_flip_direction():
+    """
+    The SMC engine, and the direction of the sector flip.
+
+    The flip rule is sector ALIGNMENT: it fires when the ticker and its sector
+    disagree, and leaves a ticker that already agrees alone. It previously ran
+    the other way round -- fading agreement -- which is the opposite trade.
+
+    The SMC half asserts that every concept is reported, that confirmed swings
+    are used, and that the verdict needs a real margin rather than flipping on
+    a single concept.
+    """
+    real_st = globals()["st"]
+    fake = _FakeStreamlit()
+    globals()["st"] = fake
+    saved = {"load_market_data": globals()["load_market_data"]}
+    try:
+        # ---------------- SMC ----------------
+        df = _synthetic(500, seed=21)
+        df.index = pd.date_range(end=pd.Timestamp("2026-10-16 15:15", tz="Asia/Kolkata"),
+                                 periods=len(df), freq="15min", tz="Asia/Kolkata")
+        analysis = smc_analyse(df, 3, 3, 150)
+        assert not analysis.get("error"), analysis
+        names = set(analysis["concepts"])
+        for required in ("Swing structure", "Break of structure (BOS)",
+                         "Change of character (CHoCH)", "Premium / discount",
+                         "Equal highs / lows"):
+            assert required in names, f"{required} missing from the SMC read"
+        assert analysis["signal"] in ("BUY", "SELL", "HOLD")
+        assert analysis["scored"] == len(analysis["concepts"])
+        # A verdict needs a margin of two, so a one-concept lead must read HOLD.
+        for bull, bear, expected in ((5, 4, "HOLD"), (4, 5, "HOLD"),
+                                     (6, 3, "BUY"), (3, 6, "SELL")):
+            verdict = ("BUY" if bull > bear + 1 else "SELL" if bear > bull + 1 else "HOLD")
+            assert verdict == expected, f"{bull}/{bear} should be {expected}"
+
+        # Too little history must say so rather than inventing structure.
+        assert smc_analyse(df.head(12), 3, 3, 150).get("error")
+
+        # The chart must draw its zones and never use a second y-axis.
+        figure = smc_chart(df, analysis, "test", bars=160)
+        assert len(figure.layout.shapes) >= 2, "SMC zones were not drawn"
+        axes = {getattr(trace, "yaxis", "y") or "y" for trace in figure.data}
+        assert len(axes) == 1, f"the SMC chart must use ONE price axis, got {axes}"
+
+        # ---------------- the sector flip ----------------
+        n = 400
+        idx = pd.date_range(end=pd.Timestamp("2026-10-16 15:15", tz="Asia/Kolkata"),
+                            periods=n, freq="15min", tz="Asia/Kolkata")
+        rng = np.random.default_rng(1)
+        rising = 1000.0 + np.linspace(0, 120, n) + rng.normal(0, 1.5, n)
+        falling = 1000.0 - np.linspace(0, 120, n) + rng.normal(0, 1.5, n)
+
+        def framed(values):
+            return pd.DataFrame({"Open": values, "High": values + 2, "Low": values - 2,
+                                 "Close": values, "Volume": np.full(n, 5000.0)}, index=idx)
+
+        # The sector index falls while the ticker rises: they DISAGREE.
+        globals()["load_market_data"] = lambda symbol, *a, **k: DataBundle(
+            frame=framed(falling if str(symbol).startswith("^") else rising).copy(),
+            symbol=str(symbol), interval="15m", period="60d")
+        keys = [spec[0] for spec in INDICATOR_SPECS]
+        disagreeing = custom_screen_one("TCS.NS", "15m", keys, {}, None, True,
+                                        dict(DEFAULT_PARAMS))
+        assert disagreeing["Bias before flip"] == "BULLISH", disagreeing["Bias before flip"]
+        assert disagreeing["Sector bias"] == "BEARISH", disagreeing["Sector bias"]
+        assert disagreeing["Flipped"] == "yes", "disagreement MUST trigger the flip"
+        assert disagreeing["Bias"] == "BEARISH", "the sector's direction must win"
+
+        # Both rising: they AGREE, so nothing is flipped.
+        globals()["load_market_data"] = lambda *a, **k: DataBundle(
+            frame=framed(rising).copy(), symbol="x", interval="15m", period="60d")
+        agreeing = custom_screen_one("TCS.NS", "15m", keys, {}, None, True,
+                                     dict(DEFAULT_PARAMS))
+        assert agreeing["Sector bias"] == "BULLISH"
+        assert agreeing["Flipped"] == "no", "agreement must NOT flip -- that was the old bug"
+        assert agreeing["Bias"] == "BULLISH"
+
+        # The sector column has to carry a name AND its strength.
+        assert "Information Technology" in str(agreeing["Sector"]), agreeing["Sector"]
+        assert "%" in str(agreeing["Sector"]), agreeing["Sector"]
+        assert agreeing["Sector agreement %"] is not None
+
+        # And a sector label must survive NSE refusing the constituent data.
+        SECTOR_BY_TICKER.pop("RELIANCE.NS", None)
+        assert sector_label_for("RELIANCE.NS") != "--", \
+            "the bundled fallback must fill the sector column when NSE is unreachable"
+        assert sector_index_for("RELIANCE.NS") == "^CNXENERGY"
+        assert sector_label_for("^NSEI") == "Index"
+        assert sector_index_for("^NSEI") is None, "an index has no sector of its own"
+        print("   SMC concepts and sector flip: disagreement flips, agreement does not, "
+              "sector label survives an NSE outage  OK")
+    finally:
+        globals()["st"] = real_st
+        globals().update(saved)
 
 
 def _test_momentum_pulse_checklist():
@@ -17095,6 +17659,7 @@ def run_selftest() -> int:
         _test_drawdown_and_reward_risk_objectives()
         _test_indicator_library()
         _test_custom_screener_and_sector_flip()
+        _test_smc_concepts_and_sector_flip_direction()
         _test_momentum_pulse_checklist()
         _test_volatility_levels_and_oi_ratio()
         _test_combined_objective_ranking()
@@ -17412,7 +17977,7 @@ def render_objective_picker(prefix: str, label: str = "Optimise for"):
             weights[objective] = wcols[i % len(wcols)].number_input(
                 _OBJECTIVE_SHORT.get(objective, objective), 0.0, 10.0, 1.0, 0.5,
                 key=f"{prefix}_w_{objective}")
-        floor = st.slider(
+        floor = st.number_input(
             "Minimum percentile on EVERY selected objective", 0, 90, 0, 5,
             key=f"{prefix}_combo_floor",
             help="The averaging alone lets a combination that is superb on three measures and "
