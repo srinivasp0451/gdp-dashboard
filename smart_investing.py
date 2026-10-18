@@ -12589,12 +12589,97 @@ def sd_levels(spot: float, sigma_fraction: float,
     return out
 
 
-def vix_daily_sigma(vix: float, divisor: float = 1600.0) -> float:
-    """India VIX -> one day's sigma as a fraction of spot."""
+#: Annualisation divisors for turning a volatility INDEX into one day's sigma.
+#:
+#: An index quotes annualised implied volatility in percent, so one day's sigma
+#: is  index / 100 / sqrt(periods in a year)  and the divisor is
+#: 100 * sqrt(periods). The two markets differ because their years differ:
+#:
+#:   Indian equities   252 TRADING days    100*sqrt(252) = 1587.45   (1600 rounded)
+#:   Crypto            365 CALENDAR days   100*sqrt(365) = 1910.50
+#:
+#: Crypto never closes, so every calendar day is a trading day and its divisor
+#: is the larger of the two. Using the equity constant on Bitcoin would
+#: overstate the expected move by about 20%.
+VIX_DIVISOR_EQUITY = 1600.0
+DVOL_DIVISOR_CRYPTO = 1910.5
+
+#: Deribit publishes a DVOL index for these currencies and no others.
+DVOL_CURRENCIES = {"BTC": "BTC", "ETH": "ETH"}
+
+
+def vix_daily_sigma(vix: float, divisor: float = VIX_DIVISOR_EQUITY) -> float:
+    """A volatility index -> one day's sigma as a fraction of spot."""
     try:
-        return float(vix) / float(divisor)
+        value = float(vix) / float(divisor)
     except (TypeError, ValueError, ZeroDivisionError):
         return float("nan")
+    return value if np.isfinite(value) else float("nan")
+
+
+def dvol_currency_for(ticker: str) -> str | None:
+    """
+    The Deribit DVOL currency for a ticker, or None when there is not one.
+
+    DVOL exists for BTC and ETH. Every other coin has no published volatility
+    index, so it falls back to its own realised volatility rather than
+    borrowing Bitcoin's -- an altcoin is materially more volatile than BTC and
+    using BTC's number would understate its range.
+    """
+    symbol = (ticker or "").strip().upper()
+    if not symbol.endswith("-USD"):
+        return None
+    base = symbol[:-4]
+    return DVOL_CURRENCIES.get(base)
+
+
+def load_dvol(currency: str, freshness_seconds: float = 300.0) -> float | None:
+    """
+    Latest DVOL reading from Deribit's public volatility-index endpoint.
+
+    Never raises and never blocks the scan: a refusal returns None and the
+    caller falls back to realised volatility, saying so in the row. The
+    endpoint needs no key, but it is a third-party service that can be
+    unreachable from a hosted runtime, which is why the tab also accepts the
+    number typed by hand.
+    """
+    currency = str(currency or "").upper()
+    if currency not in DVOL_CURRENCIES:
+        return None
+
+    def _fetch(cur: str, _bucket: int):
+        import requests
+        now_ms = int(time.time() * 1000)
+        try:
+            _space_quote_requests()
+            resp = requests.get(
+                "https://www.deribit.com/api/v2/public/get_volatility_index_data",
+                params={"currency": cur, "start_timestamp": now_ms - 6 * 3600 * 1000,
+                        "end_timestamp": now_ms, "resolution": "3600"}, timeout=8)
+            body = resp.json()
+        except Exception:                                           # noqa: BLE001
+            return None
+        # The payload is a list of [timestamp, open, high, low, close] candles.
+        rows = ((body.get("result") or {}).get("data")) or []
+        if not rows:
+            return None
+        try:
+            return float(rows[-1][4])
+        except (IndexError, TypeError, ValueError):
+            return None
+
+    bucket = int(time.time() // max(1.0, float(freshness_seconds)))
+    if st is None:
+        return _fetch(currency, bucket)
+    if not hasattr(load_dvol, "_impl"):
+        @st.cache_data(show_spinner=False, max_entries=8)
+        def _impl(cur: str, b: int):
+            return _fetch(cur, b)
+        load_dvol._impl = _impl
+    try:
+        return load_dvol._impl(currency, bucket)
+    except Exception:                                               # noqa: BLE001
+        return _fetch(currency, bucket)
 
 
 def atr_expansion(frame: pd.DataFrame, atr_len: int = 14, avg_len: int = 20) -> float:
@@ -12701,15 +12786,51 @@ def volatility_scan_one(ticker: str, vcfg: dict, broker: dict | None = None) -> 
     daily = load_market_data(ticker, "1y", "1d", freshness_seconds=300, min_bars=30).frame
     spot = float(daily["Close"].iloc[-1])
 
+    # --- which volatility input belongs to this instrument ------------------
+    #
+    # Three sources, each valid for exactly one kind of instrument:
+    #   India VIX  prices NIFTY options          -> Nifty
+    #   DVOL       prices BTC / ETH options      -> Bitcoin and Ether
+    #   realised   the instrument's own returns  -> everything else
+    #
+    # Auto picks the right one. Forcing a source is allowed, and when the
+    # forced source does not describe the instrument the row says so rather
+    # than quietly presenting a borrowed number as a measurement.
     mode = str(vcfg.get("sigma_mode", "Auto"))
-    is_nifty = (ticker or "").upper() in {"^NSEI"}
+    symbol = (ticker or "").upper()
+    is_nifty = symbol in {"^NSEI"}
+    dvol_ccy = dvol_currency_for(ticker)
+
     use_vix = (mode == "India VIX") or (mode == "Auto" and is_nifty)
+    use_dvol = (mode == "DVOL (crypto)") or (mode == "Auto" and bool(dvol_ccy))
 
     vix = vcfg.get("vix")
     sigma, basis, caution = float("nan"), "", ""
-    if use_vix and vix is not None and np.isfinite(float(vix)):
-        sigma = vix_daily_sigma(float(vix), float(vcfg.get("vix_divisor", 1600.0)))
-        basis = f"India VIX {fmt(vix)} / {fmt(vcfg.get('vix_divisor', 1600.0), 0)}"
+
+    if use_dvol:
+        manual = vcfg.get("dvol_manual")
+        dvol = float(manual) if (manual not in (None, 0, 0.0)) else None
+        source = "typed by hand"
+        if dvol is None and dvol_ccy:
+            fetched = load_dvol(dvol_ccy)
+            if fetched is not None:
+                dvol, source = float(fetched), "Deribit"
+        divisor = float(vcfg.get("dvol_divisor", DVOL_DIVISOR_CRYPTO))
+        if dvol is not None and np.isfinite(dvol) and dvol > 0:
+            sigma = vix_daily_sigma(dvol, divisor)
+            basis = f"DVOL {fmt(dvol)} ({source}) / {fmt(divisor, 1)}"
+            if not dvol_ccy:
+                caution = ("DVOL is published for BTC and ETH only. Applied here it is a "
+                           "borrowed number, not a measurement of this instrument.")
+        else:
+            sigma = realised_daily_sigma(daily, int(vcfg.get("rv_lookback", 20)))
+            basis = f"realised {int(vcfg.get('rv_lookback', 20))}-day volatility"
+            caution = ("DVOL could not be read and none was typed in, so the instrument's own "
+                       "realised volatility was used instead.")
+    elif use_vix and vix is not None and np.isfinite(float(vix)):
+        divisor = float(vcfg.get("vix_divisor", VIX_DIVISOR_EQUITY))
+        sigma = vix_daily_sigma(float(vix), divisor)
+        basis = f"India VIX {fmt(vix)} / {fmt(divisor, 0)}"
         if not is_nifty:
             caution = ("India VIX prices NIFTY options. Applied to this instrument it is a "
                        "borrowed number, not a measurement of it.")
@@ -12718,6 +12839,9 @@ def volatility_scan_one(ticker: str, vcfg: dict, broker: dict | None = None) -> 
         basis = f"realised {int(vcfg.get('rv_lookback', 20))}-day volatility"
         if use_vix:
             caution = "India VIX was unavailable, so realised volatility was used instead."
+        elif dvol_ccy:
+            caution = (f"{dvol_ccy} has a published DVOL index. Switch the volatility input to "
+                       f"DVOL for a forward-looking number instead of a backward-looking one.")
 
     levels = sd_levels(spot, sigma)
 
@@ -12819,11 +12943,12 @@ def tab_volatility_levels(cfg: dict) -> None:
                                  "standard-deviation levels are always computed on DAILY data, "
                                  "whatever is picked here.")
     sigma_mode = c3.selectbox(
-        "Volatility input", ["Auto", "India VIX", "Realised volatility"], key="vol_sigma_mode",
-        help="Auto uses India VIX for NIFTY and the instrument's own realised volatility for "
-             "everything else, which is the only defensible pairing. Forcing India VIX onto "
-             "Bank Nifty, a stock or Bitcoin borrows Nifty's number for something it does not "
-             "describe.")
+        "Volatility input", ["Auto", "India VIX", "DVOL (crypto)", "Realised volatility"],
+        key="vol_sigma_mode",
+        help="Auto picks the index that actually prices the instrument: India VIX for NIFTY, "
+             "Deribit's DVOL for BTC and ETH, and the instrument's own realised volatility "
+             "for everything else. Forcing one onto an instrument it does not describe "
+             "borrows another market's number, and the row says so when that happens.")
 
     custom_text = ""
     if universe.startswith("Custom"):
@@ -12837,18 +12962,47 @@ def tab_volatility_levels(cfg: dict) -> None:
 
     with st.expander("Standard-deviation levels", expanded=True):
         st.markdown(
-            "`1 SD move = spot x (India VIX / divisor)`. The divisor is **1600** by desk "
-            "convention, and the arithmetic behind it is "
-            "`VIX / 100 / sqrt(252) = VIX / 1587` — an annualised percentage turned into "
-            "one day's sigma. Set it to 1587 for the exact figure.")
-        s1, s2 = st.columns(2)
-        vix_divisor = s1.number_input("VIX divisor", 100.0, 5000.0, 1600.0, 1.0,
-                                      key="vol_divisor")
-        rv_lookback = s2.number_input("Realised volatility lookback (days)", 5, 250, 20, 5,
+            "`1 SD move = spot x (volatility index / divisor)`. A volatility index quotes an "
+            "ANNUALISED percentage, so the divisor is `100 x sqrt(periods in a year)` and it "
+            "differs by market because the years differ:\n\n"
+            "| Market | Year | Divisor |\n|---|---|---|\n"
+            "| Indian equities (India VIX) | 252 **trading** days | "
+            "`100*sqrt(252)` = **1587** (1600 by desk convention) |\n"
+            "| Crypto (DVOL) | 365 **calendar** days | `100*sqrt(365)` = **1910.5** |\n\n"
+            "Crypto never closes, so every calendar day counts and its divisor is the larger "
+            "of the two.")
+        s1, s2, s3 = st.columns(3)
+        vix_divisor = s1.number_input("India VIX divisor", 100.0, 5000.0, VIX_DIVISOR_EQUITY,
+                                      1.0, key="vol_divisor")
+        dvol_divisor = s2.number_input("DVOL divisor", 100.0, 5000.0, DVOL_DIVISOR_CRYPTO, 0.5,
+                                       key="vol_dvol_divisor",
+                                       help="100*sqrt(365) = 1910.5. A value of 1901 is a "
+                                            "common typo for it and overstates the move "
+                                            "slightly.")
+        rv_lookback = s3.number_input("Realised volatility lookback (days)", 5, 250, 20, 5,
                                       key="vol_rv")
         live_vix = load_vix()
         st.caption(f"India VIX now: **{fmt(live_vix)}**" if live_vix is not None
                    else "India VIX could not be read; realised volatility will be used.")
+
+        crypto_names = [t for t in chosen if dvol_currency_for(t)]
+        dvol_manual = 0.0
+        if crypto_names or sigma_mode == "DVOL (crypto)":
+            st.markdown("**DVOL** — Deribit's volatility index, published for BTC and ETH "
+                        "only. Every other coin falls back to its own realised volatility "
+                        "rather than borrowing Bitcoin's, which would understate an altcoin.")
+            d1, d2 = st.columns(2)
+            live_dvol = {c: load_dvol(c) for c in
+                         sorted({dvol_currency_for(t) for t in crypto_names} - {None})}
+            if live_dvol:
+                d1.caption(" · ".join(f"**{cur} DVOL: {fmt(val)}**" if val is not None
+                                      else f"{cur} DVOL unavailable"
+                                      for cur, val in live_dvol.items()))
+            dvol_manual = d2.number_input(
+                "Override DVOL (0 = use the live reading)", 0.0, 500.0, 0.0, 0.01,
+                key="vol_dvol_manual",
+                help="Deribit is a third party and can be unreachable from a hosted runtime. "
+                     "Type today's DVOL here and it is used instead of the fetched value.")
 
     with st.expander("ATR volatility expansion", expanded=True):
         st.markdown("`expansion = ATR(14) / average(ATR, 20)` on the timeframe above. Below "
@@ -12893,6 +13047,7 @@ def tab_volatility_levels(cfg: dict) -> None:
 
     vcfg = {"interval": interval, "sigma_mode": sigma_mode, "vix": live_vix,
             "vix_divisor": vix_divisor, "rv_lookback": rv_lookback,
+            "dvol_divisor": dvol_divisor, "dvol_manual": dvol_manual,
             "atr_len": atr_len, "atr_avg_len": atr_avg,
             "squeeze_below": squeeze_below, "expand_above": expand_above,
             "use_oi": bool(use_oi and has_token), "mr_bull": mr_bull, "mr_bear": mr_bear,
@@ -14232,12 +14387,267 @@ def smc_chart(df: pd.DataFrame, analysis: dict, title: str, light: bool = False,
     return fig
 
 
+# -----------------------------------------------------------------------------
+# SMC across timeframes
+# -----------------------------------------------------------------------------
+# Higher timeframes carry more weight in the overall read, which is the one
+# piece of SMC orthodoxy that is also just arithmetic: a monthly structure took
+# months to build and a 1-minute structure took minutes, so they should not
+# count equally.
+SMC_TIMEFRAMES = ["1m", "5m", "15m", "60m", "4h", "1d", "1wk", "1mo"]
+SMC_TF_WEIGHT = {"1m": 0.4, "5m": 0.7, "15m": 1.0, "60m": 1.6,
+                 "4h": 2.2, "1d": 3.0, "1wk": 4.0, "1mo": 5.0}
+
+
+def smc_trade_levels(analysis: dict, atr_value: float | None = None) -> dict:
+    """
+    Entry, stop and target implied by the structural read.
+
+    These come from LEVELS the analysis already found, not from a fresh
+    calculation: a long is stopped below the structure that would invalidate
+    it, and aims at the liquidity resting above. When no such level exists the
+    field is left empty rather than filled with an ATR multiple pretending to
+    be structure -- the whole point of an SMC level is that it is a place other
+    people's orders sit.
+    """
+    signal = analysis.get("signal", "HOLD")
+    shapes = analysis.get("shapes", {})
+    price = float(analysis.get("price", float("nan")))
+    out = {"signal": signal, "entry": None, "stop": None, "target": None,
+           "rr": None, "basis": ""}
+    if signal == "HOLD" or not np.isfinite(price):
+        out["basis"] = "no directional read, so no levels are proposed"
+        return out
+
+    def pick(*values):
+        for value in values:
+            if value is None:
+                continue
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(number):
+                return number
+        return None
+
+    pad = float(atr_value) if (atr_value and np.isfinite(atr_value)) else price * 0.002
+
+    if signal == "BUY":
+        block = shapes.get("bull_ob")
+        entry = pick(block[1] if block else None, price)
+        stop = pick(block[0] - pad if block else None,
+                    shapes.get("swing_low"), shapes.get("range_low"))
+        target = pick(shapes.get("swing_high"), shapes.get("range_high"))
+        basis = ("entry at the bullish order block, stop below it, target at the liquidity "
+                 "resting above the last swing high")
+        if stop is not None and stop >= price:
+            stop = pick(shapes.get("range_low"), price - 2 * pad)
+        if target is not None and target <= price:
+            target = pick(shapes.get("range_high"), price + 4 * pad)
+    else:
+        block = shapes.get("bear_ob")
+        entry = pick(block[0] if block else None, price)
+        stop = pick(block[1] + pad if block else None,
+                    shapes.get("swing_high"), shapes.get("range_high"))
+        target = pick(shapes.get("swing_low"), shapes.get("range_low"))
+        basis = ("entry at the bearish order block, stop above it, target at the liquidity "
+                 "resting below the last swing low")
+        if stop is not None and stop <= price:
+            stop = pick(shapes.get("range_high"), price + 2 * pad)
+        if target is not None and target >= price:
+            target = pick(shapes.get("range_low"), price - 4 * pad)
+
+    out.update({"entry": entry, "stop": stop, "target": target, "basis": basis})
+    if entry is not None and stop is not None and target is not None:
+        risk, reward = abs(entry - stop), abs(target - entry)
+        out["rr"] = round(reward / risk, 2) if risk > 0 else None
+    return out
+
+
+def smc_narrative(ticker: str, interval: str, analysis: dict, levels: dict) -> str:
+    """
+    The structural read in about fifty words, with liquidity named explicitly.
+
+    Written from the concepts rather than templated per signal, so a HOLD
+    explains what is unresolved instead of saying nothing.
+    """
+    concepts = analysis.get("concepts", {})
+
+    def verdict(name: str) -> str:
+        return str((concepts.get(name) or {}).get("verdict", "neutral"))
+
+    bits = []
+    bos = verdict("Break of structure (BOS)")
+    choch = verdict("Change of character (CHoCH)")
+    if bos != "neutral":
+        bits.append(f"Structure is {'bullish' if bos == 'bull' else 'bearish'} after a break "
+                    f"of the last swing {'high' if bos == 'bull' else 'low'}")
+    else:
+        bits.append("Structure is unresolved, with no swing broken either way")
+    if choch != "neutral" and choch != bos:
+        bits.append(f"though character last flipped {'up' if choch == 'bull' else 'down'}, "
+                    f"so the trend is in transition")
+
+    zone = concepts.get("Premium / discount")
+    if zone:
+        where = "discount" if zone["verdict"] == "bull" else "premium"
+        bits.append(f"price sits in {where}, which favours "
+                    f"{'buyers' if where == 'discount' else 'sellers'}")
+
+    for side in ("Bullish order block", "Bearish order block"):
+        block = concepts.get(side)
+        if block and "mitigating" in str(block.get("reading", "")):
+            bits.append(f"and is mitigating the {side.split()[0].lower()} order block")
+            break
+    else:
+        for side in ("Bullish fair value gap", "Bearish fair value gap"):
+            gap = concepts.get(side)
+            if gap and "unfilled" in str(gap.get("reading", "")):
+                bits.append(f"with an unfilled {side.split()[0].lower()} imbalance left behind")
+                break
+
+    # Liquidity, said plainly -- this is the part the operator asked to see.
+    liquidity = []
+    if verdict("Sell-side liquidity sweep") == "bull":
+        liquidity.append("Sell-side liquidity was swept and rejected, so the stops below have "
+                         "already been taken")
+    if verdict("Buy-side liquidity sweep") == "bear":
+        liquidity.append("Buy-side liquidity was swept and rejected, so the stops above have "
+                         "already been taken")
+    equal = concepts.get("Equal highs / lows")
+    if equal and equal.get("verdict") != "neutral":
+        liquidity.append("equal " + ("highs rest above as the next draw"
+                                     if equal["verdict"] == "bear" else
+                                     "lows rest below as the next draw"))
+    if not liquidity:
+        liquidity.append("No liquidity has been taken recently, so there is no obvious pool "
+                         "being hunted")
+
+    head = "; ".join(bits) + "."
+    middle = " " + ", ".join(liquidity) + "."
+    if levels.get("entry") is not None and levels.get("stop") is not None:
+        tail = (f" {levels['signal']} from {fmt(levels['entry'])}, stop {fmt(levels['stop'])}, "
+                f"target {fmt(levels['target'])}"
+                + (f", {fmt(levels['rr'])}:1." if levels.get("rr") else "."))
+        if levels.get("rr") and float(levels["rr"]) < 1.0:
+            tail += " The structure is not offering a trade worth taking at that ratio."
+    else:
+        tail = " No level worth acting on until structure resolves."
+    return f"**{interval}** — " + head + middle + tail
+
+
+def smc_multi_timeframe(ticker: str, timeframes: list[str], pivot: int = 3,
+                        lookback: int = 150) -> list[dict]:
+    """
+    Run the structural read on each timeframe, newest data each time.
+
+    A timeframe whose history Yahoo cannot serve is reported as such rather
+    than silently skipped: "1m has only 7 days" is information, and a missing
+    row looks like a bug.
+    """
+    out = []
+    for interval in timeframes:
+        entry: dict = {"Timeframe": interval}
+        try:
+            period, note = lab_period_for(interval, int(lookback) + 100)
+            frame = load_market_data(ticker, period, interval,
+                                     freshness_seconds=180, min_bars=50).frame
+            analysis = smc_analyse(frame, int(pivot), int(pivot), int(lookback))
+            if analysis.get("error"):
+                entry.update({"error": analysis["error"], "frame": None})
+                out.append(entry)
+                continue
+            atr_now = _last(atr(frame["High"], frame["Low"], frame["Close"], 14))
+            levels = smc_trade_levels(analysis, atr_now)
+            entry.update({
+                "frame": frame, "analysis": analysis, "levels": levels,
+                "signal": analysis["signal"], "bull": analysis["bull"],
+                "bear": analysis["bear"], "scored": analysis["scored"],
+                "period": period, "note": note,
+                "summary": smc_narrative(ticker, interval, analysis, levels),
+                "weight": SMC_TF_WEIGHT.get(interval, 1.0),
+            })
+        except Exception as exc:                                    # noqa: BLE001
+            entry.update({"error": str(exc)[:160], "frame": None})
+        out.append(entry)
+    return out
+
+
+def smc_overall(reads: list[dict]) -> dict:
+    """
+    One verdict across every timeframe, weighted by how long each took to form.
+
+    A monthly structure represents months of positioning and a one-minute
+    structure represents a minute of it, so they are not averaged equally. The
+    rationale names which timeframes carried the decision and which dissented,
+    because a split read is worth knowing about rather than hiding inside an
+    average.
+    """
+    usable = [r for r in reads if r.get("signal")]
+    if not usable:
+        return {"signal": "NO DATA", "score": 0.0, "rationale":
+                "No timeframe returned enough history to read structure."}
+
+    score = 0.0
+    total = 0.0
+    for read in usable:
+        weight = float(read.get("weight", 1.0))
+        total += weight
+        if read["signal"] == "BUY":
+            score += weight
+        elif read["signal"] == "SELL":
+            score -= weight
+    normalised = (score / total * 100.0) if total else 0.0
+
+    buys = [r["Timeframe"] for r in usable if r["signal"] == "BUY"]
+    sells = [r["Timeframe"] for r in usable if r["signal"] == "SELL"]
+    holds = [r["Timeframe"] for r in usable if r["signal"] == "HOLD"]
+
+    if normalised >= 25:
+        verdict = "BUY"
+    elif normalised <= -25:
+        verdict = "SELL"
+    else:
+        verdict = "HOLD"
+
+    # The highest timeframe that actually has a direction sets the context.
+    ranked = sorted(usable, key=lambda r: float(r.get("weight", 1.0)), reverse=True)
+    anchor = next((r for r in ranked if r["signal"] != "HOLD"), None)
+
+    parts = []
+    if anchor:
+        parts.append(f"The highest timeframe with a direction is **{anchor['Timeframe']}**, "
+                     f"and it reads **{anchor['signal']}**")
+    if buys:
+        parts.append("bullish on " + ", ".join(buys))
+    if sells:
+        parts.append("bearish on " + ", ".join(sells))
+    if holds:
+        parts.append(f"undecided on {', '.join(holds)}")
+
+    conflict = ""
+    if buys and sells:
+        conflict = (" Timeframes disagree, which is the normal state of a market in "
+                    "transition — the lower ones usually turn first, and acting on them "
+                    "against a higher-timeframe structure is counter-trend trading whether "
+                    "or not it is called that.")
+    elif verdict == "HOLD":
+        conflict = (" Nothing carries enough weight to call, so the honest answer is to wait "
+                    "for a higher timeframe to resolve.")
+
+    return {"signal": verdict, "score": round(normalised, 1),
+            "rationale": "; ".join(parts) + "." + conflict,
+            "buys": buys, "sells": sells, "holds": holds}
+
+
 def _smc_panel(picked: dict, cfg: dict) -> None:
-    """Smart Money Concepts for the inspected ticker, with its own verdict."""
-    ticker, interval = picked["Ticker"], picked["Timeframe"]
-    st.markdown("#### Smart Money Concepts")
-    st.caption(f"Structural read of `{ticker}` on `{interval}`, computed from CONFIRMED "
-               "swings only — nothing here uses a pivot that has not finished forming.")
+    """Smart Money Concepts for the inspected ticker, across every timeframe."""
+    ticker = picked["Ticker"]
+    st.markdown("#### Smart Money Concepts — multi-timeframe")
+    st.caption(f"Structural read of `{ticker}` on each timeframe you tick, computed from "
+               "CONFIRMED swings only — nothing here uses a pivot that has not finished "
+               "forming.")
 
     c1, c2, c3 = st.columns(3)
     pivot = c1.number_input("Swing strength (candles either side)", 1, 20, 3, 1,
@@ -14249,40 +14659,99 @@ def _smc_panel(picked: dict, cfg: dict) -> None:
                                key="smc_look")
     bars = c3.number_input("Candles to plot", 40, 600, 160, 20, key="smc_bars")
 
-    try:
-        period, _ = lab_period_for(interval, int(lookback) + 100)
-        frame = load_market_data(ticker, period, interval,
-                                 freshness_seconds=180, min_bars=60).frame
-        analysis = smc_analyse(frame, int(pivot), int(pivot), int(lookback))
-    except Exception as exc:                                        # noqa: BLE001
-        st.error(f"Could not analyse `{ticker}`: {exc}")
+    chosen_tfs = _multi_picker("Timeframes to analyse", SMC_TIMEFRAMES, "smc_tf",
+                               ["15m", "60m", "1d"])
+    if not chosen_tfs:
+        st.info("Tick at least one timeframe above.")
+        return
+    st.caption("Each timeframe is a separate download, so eight of them cost eight fetches "
+               "with the mandatory 0.3s guard on each. Yahoo also limits history by "
+               "timeframe — 1m goes back about 7 days and 5m/15m about 60 — so the shortest "
+               "ones see less structure than the long ones.")
+
+    if not st.button(f"Analyse {len(chosen_tfs)} timeframe(s)", type="primary",
+                     key="smc_run", width="stretch"):
+        st.caption("Press the button to run the structural read.")
         return
 
-    if analysis.get("error"):
-        st.info(analysis["error"])
-        return
+    with st.spinner(f"Reading structure on {len(chosen_tfs)} timeframe(s)…"):
+        reads = smc_multi_timeframe(ticker, chosen_tfs, int(pivot), int(lookback))
 
-    signal = analysis["signal"]
-    tone = {"BUY": st.success, "SELL": st.error}.get(signal, st.info)
-    tone(f"**SMC verdict: {signal}** — {analysis['bull']} concept(s) leaning bullish against "
-         f"{analysis['bear']} bearish, out of {analysis['scored']} scored. "
-         "A verdict needs a margin of two, so a one-concept lead reads HOLD.")
+    # ---- per-timeframe: chart, signal, summary, levels ----------------------
+    for read in reads:
+        interval = read["Timeframe"]
+        st.divider()
+        if read.get("error"):
+            st.warning(f"**{interval}** — {read['error']}")
+            continue
 
-    rows = [{"Concept": name,
-             "Verdict": {"bull": "BULLISH", "bear": "BEARISH"}.get(c["verdict"], "neutral"),
-             "Reading": c["reading"]}
-            for name, c in analysis["concepts"].items()]
-    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+        analysis, levels = read["analysis"], read["levels"]
+        head, badge = st.columns([3, 1])
+        head.markdown(f"**{ticker} · {interval}** — {read['bull']} bullish / "
+                      f"{read['bear']} bearish of {read['scored']} concepts "
+                      f"(history: {read['period']})")
+        tone = {"BUY": badge.success, "SELL": badge.error}.get(read["signal"], badge.info)
+        tone(f"**{read['signal']}**")
+        if read.get("note"):
+            st.caption(read["note"])
 
-    st.plotly_chart(
-        smc_chart(frame, analysis, f"{ticker} · {interval} · smart money concepts",
-                  light=bool(cfg.get("light_charts")), bars=int(bars)),
-        width="stretch", config={"scrollZoom": True})
-    st.caption("Zones carry their own labels, so the chart reads without matching colours to "
-               "a legend. **SMC is a vocabulary for describing structure, not a tested edge** "
-               "— an order block is 'the last opposite candle before the move that broke "
-               "structure', which is a definition, not a prediction. Whether this verdict "
-               "makes money is a question for the Backtesting tab.")
+        st.plotly_chart(
+            smc_chart(read["frame"], analysis, f"{ticker} · {interval}",
+                      light=bool(cfg.get("light_charts")), bars=int(bars)),
+            width="stretch", config={"scrollZoom": True},
+            key=f"smc_chart_{ticker}_{interval}")
+
+        st.markdown(read["summary"])
+        if levels.get("entry") is not None:
+            l1, l2, l3, l4 = st.columns(4)
+            l1.metric("Entry", fmt(levels["entry"]))
+            l2.metric("Stop", fmt(levels["stop"]),
+                      f"{fmt(abs(levels['entry'] - levels['stop']))} risk"
+                      if levels.get("stop") is not None else None)
+            l3.metric("Target", fmt(levels["target"]),
+                      f"{fmt(abs(levels['target'] - levels['entry']))} reward"
+                      if levels.get("target") is not None else None)
+            l4.metric("Reward : risk",
+                      f"{fmt(levels['rr'])} : 1" if levels.get("rr") else "--")
+            st.caption("Levels come from the structure itself — " + levels["basis"] +
+                       ". They are where orders rest, not a prediction, and nothing here "
+                       "has been backtested.")
+        with st.expander(f"Every concept on {interval}"):
+            st.dataframe(pd.DataFrame([
+                {"Concept": name,
+                 "Verdict": {"bull": "BULLISH", "bear": "BEARISH"}.get(c["verdict"],
+                                                                       "neutral"),
+                 "Reading": c["reading"]}
+                for name, c in analysis["concepts"].items()]),
+                width="stretch", hide_index=True)
+
+    # ---- the overall read ---------------------------------------------------
+    st.divider()
+    overall = smc_overall(reads)
+    st.markdown("### Overall structural verdict")
+    tone = {"BUY": st.success, "SELL": st.error}.get(overall["signal"], st.info)
+    tone(f"**{overall['signal']}** — weighted score {fmt(overall['score'])} out of ±100")
+    st.markdown(overall["rationale"])
+
+    table = pd.DataFrame([
+        {"Timeframe": r["Timeframe"],
+         "Signal": r.get("signal", "—"),
+         "Weight": SMC_TF_WEIGHT.get(r["Timeframe"], 1.0),
+         "Bullish": r.get("bull"), "Bearish": r.get("bear"),
+         "Entry": (r.get("levels") or {}).get("entry"),
+         "Stop": (r.get("levels") or {}).get("stop"),
+         "Target": (r.get("levels") or {}).get("target"),
+         "R:R": (r.get("levels") or {}).get("rr")}
+        for r in reads if not r.get("error")])
+    if not table.empty:
+        st.dataframe(table, width="stretch", hide_index=True)
+    st.caption("Timeframes are weighted by how long their structure took to build — a monthly "
+               "break represents months of positioning and a one-minute break represents a "
+               "minute of it, so they do not count equally. **SMC is a vocabulary for "
+               "describing structure, not a tested edge**: an order block is 'the last "
+               "opposite candle before the move that broke structure', which is a definition, "
+               "not a prediction. Whether this verdict makes money is a question for the "
+               "Backtesting tab.")
 
 
 def tab_custom_screener(cfg: dict) -> None:
@@ -16747,6 +17216,138 @@ def _test_custom_screener_and_sector_flip():
         SECTOR_BY_TICKER.pop("X.NS", None)
 
 
+def _test_dvol_and_multi_timeframe_smc():
+    """
+    Crypto volatility from DVOL, and the structural read across timeframes.
+
+    THE ARITHMETIC THIS PINS. A volatility index quotes ANNUALISED implied
+    volatility, so one day's sigma is index / (100 * sqrt(periods in a year)).
+    The two markets have different years -- 252 trading days for Indian
+    equities, 365 calendar days for crypto, which never closes -- so the
+    divisors are 1587 and 1910.5 and are NOT interchangeable. Using the equity
+    constant on Bitcoin overstates the expected move by about twenty percent.
+
+    The operator's worked example is asserted literally: DVOL 37.34 on a spot
+    of 81,732 gives a 1,597-point day, and bounds of 83,329 / 80,135.
+    """
+    # -- the worked example, to the point
+    dvol, spot = 37.34, 81732.0
+    sigma = vix_daily_sigma(dvol, DVOL_DIVISOR_CRYPTO)
+    assert abs(sigma * spot - 1597.0) < 1.0, sigma * spot
+    levels = sd_levels(spot, sigma)
+    assert abs(levels["+1SD"] - 83329.0) < 1.5, levels["+1SD"]
+    assert abs(levels["-1SD"] - 80135.0) < 1.5, levels["-1SD"]
+
+    # -- the divisors ARE the annualisation, not magic numbers
+    assert abs(DVOL_DIVISOR_CRYPTO - 100.0 * math.sqrt(365.0)) < 0.1
+    assert abs(1587.45 - 100.0 * math.sqrt(252.0)) < 0.1
+    # ... and swapping them is a ~20% error, which is why they are separate.
+    wrong = vix_daily_sigma(dvol, 1587.45) * spot
+    assert wrong / (sigma * spot) > 1.17, "the equity divisor must overstate a crypto move"
+
+    # -- DVOL exists for BTC and ETH, and for nothing else
+    assert dvol_currency_for("BTC-USD") == "BTC"
+    assert dvol_currency_for("ETH-USD") == "ETH"
+    assert dvol_currency_for("SOL-USD") is None, \
+        "an altcoin must fall back to its own volatility, not borrow Bitcoin's"
+    assert dvol_currency_for("^NSEI") is None and dvol_currency_for("RELIANCE.NS") is None
+
+    # -- routing: crypto uses DVOL, Nifty uses India VIX, the rest realised
+    real_st = globals()["st"]
+    fake = _FakeStreamlit()
+    globals()["st"] = fake
+    saved = {"load_market_data": globals()["load_market_data"],
+             "load_dvol": globals()["load_dvol"]}
+    try:
+        n = 300
+        idx = pd.date_range(end=pd.Timestamp("2026-10-17"), periods=n, freq="D")
+        closes = np.full(n, spot) + np.random.default_rng(2).normal(0, 300, n)
+        closes[-1] = spot
+        daily = pd.DataFrame({"Open": closes, "High": closes * 1.01, "Low": closes * 0.99,
+                              "Close": closes, "Volume": np.full(n, 1e6)}, index=idx)
+        globals()["load_market_data"] = lambda *a, **k: DataBundle(
+            frame=daily.copy(), symbol="BTC-USD", interval="1d", period="1y")
+        globals()["load_dvol"] = lambda *a, **k: None       # Deribit unreachable
+
+        base = {"interval": "5m", "sigma_mode": "Auto", "vix": 14.0,
+                "vix_divisor": VIX_DIVISOR_EQUITY, "rv_lookback": 20,
+                "dvol_divisor": DVOL_DIVISOR_CRYPTO, "dvol_manual": dvol,
+                "atr_len": 14, "atr_avg_len": 20, "squeeze_below": 1.0,
+                "expand_above": 1.3, "use_oi": False}
+        row = volatility_scan_one("BTC-USD", base)
+        assert "DVOL" in row["Sigma basis"], row["Sigma basis"]
+        assert abs(row["1 SD (points)"] - 1597.0) < 1.5, row["1 SD (points)"]
+
+        # With no DVOL anywhere it must fall back and SAY it fell back, rather
+        # than borrowing India VIX for Bitcoin.
+        fallback = volatility_scan_one("BTC-USD", dict(base, dvol_manual=0.0))
+        assert "realised" in fallback["Sigma basis"], fallback["Sigma basis"]
+        assert "DVOL" in fallback["Caution"], fallback["Caution"]
+
+        # ---------------- multi-timeframe SMC ----------------
+        def made(drift, seed):
+            rng = np.random.default_rng(seed)
+            px = 20000 + np.cumsum(rng.normal(drift, 6, 400))
+            stamps = pd.date_range(end=pd.Timestamp("2026-10-16 15:15", tz="Asia/Kolkata"),
+                                   periods=400, freq="15min", tz="Asia/Kolkata")
+            out = pd.DataFrame({"Open": px, "High": px + np.abs(rng.normal(8, 3, 400)),
+                                "Low": px - np.abs(rng.normal(8, 3, 400)), "Close": px,
+                                "Volume": rng.integers(1000, 5000, 400).astype(float)},
+                               index=stamps)
+            out["High"] = out[["Open", "High", "Close"]].max(axis=1)
+            out["Low"] = out[["Open", "Low", "Close"]].min(axis=1)
+            return out
+
+        drifts = {"1m": -0.4, "5m": -0.2, "15m": 0.1, "60m": 0.5,
+                  "4h": 0.6, "1d": 0.8, "1wk": 0.9, "1mo": 1.0}
+        globals()["load_market_data"] = lambda sym, per, itv, *a, **k: DataBundle(
+            frame=made(drifts.get(itv, 0.3), hash(itv) % 1000),
+            symbol=sym, interval=itv, period=per)
+
+        reads = smc_multi_timeframe("RELIANCE.NS", SMC_TIMEFRAMES, 3, 150)
+        assert len(reads) == len(SMC_TIMEFRAMES), "every requested timeframe must be reported"
+        words = []
+        for read in reads:
+            assert not read.get("error"), read.get("error")
+            assert read["signal"] in ("BUY", "SELL", "HOLD")
+            summary = read["summary"]
+            words.append(len(summary.split()))
+            # Liquidity must be named in EVERY summary -- it was asked for by name.
+            assert "liquidity" in summary.lower(), summary
+            levels = read["levels"]
+            if read["signal"] != "HOLD":
+                assert levels["entry"] is not None and levels["stop"] is not None
+                # A long's stop sits BELOW its entry, a short's above it.
+                if read["signal"] == "BUY":
+                    assert levels["stop"] < levels["entry"], read["Timeframe"]
+                    assert levels["target"] > levels["entry"], read["Timeframe"]
+                else:
+                    assert levels["stop"] > levels["entry"], read["Timeframe"]
+                    assert levels["target"] < levels["entry"], read["Timeframe"]
+        assert 35 <= min(words) and max(words) <= 80, f"summary lengths: {words}"
+
+        # Higher timeframes must outweigh lower ones.
+        assert SMC_TF_WEIGHT["1mo"] > SMC_TF_WEIGHT["1d"] > SMC_TF_WEIGHT["15m"] \
+            > SMC_TF_WEIGHT["1m"]
+
+        overall = smc_overall(reads)
+        assert overall["signal"] in ("BUY", "SELL", "HOLD")
+        assert overall["rationale"], "an overall verdict must explain itself"
+        assert -100.0 <= overall["score"] <= 100.0
+
+        # A unanimous bullish set must produce BUY, and the mirror SELL.
+        for forced, expected in (("BUY", "BUY"), ("SELL", "SELL")):
+            fake_reads = [{"Timeframe": tf, "signal": forced,
+                           "weight": SMC_TF_WEIGHT[tf]} for tf in SMC_TIMEFRAMES]
+            assert smc_overall(fake_reads)["signal"] == expected
+        assert smc_overall([])["signal"] == "NO DATA"
+        print("   DVOL and multi-timeframe SMC: 37.34/1910.5 reproduces the worked example, "
+              f"8 timeframes, summaries average {sum(words) // len(words)} words  OK")
+    finally:
+        globals()["st"] = real_st
+        globals().update(saved)
+
+
 def _test_smc_concepts_and_sector_flip_direction():
     """
     The SMC engine, and the direction of the sector flip.
@@ -17659,6 +18260,7 @@ def run_selftest() -> int:
         _test_drawdown_and_reward_risk_objectives()
         _test_indicator_library()
         _test_custom_screener_and_sector_flip()
+        _test_dvol_and_multi_timeframe_smc()
         _test_smc_concepts_and_sector_flip_direction()
         _test_momentum_pulse_checklist()
         _test_volatility_levels_and_oi_ratio()
