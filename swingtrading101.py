@@ -11391,7 +11391,13 @@ def dhan_option_chain(broker: dict, underlying_scrip: int, underlying_seg: str,
                   "ce_prev_oi": _num(ce, "previous_oi"),
                   "pe_prev_oi": _num(pe, "previous_oi"),
                   "ce_volume": _num(ce, "volume"), "pe_volume": _num(pe, "volume"),
-                  "ce_ltp": _num(ce, "last_price"), "pe_ltp": _num(pe, "last_price")}
+                  "ce_ltp": _num(ce, "last_price"), "pe_ltp": _num(pe, "last_price"),
+                  # Per-leg implied volatility. This is what makes an expected
+                  # move computable for a SINGLE STOCK: India VIX prices Nifty
+                  # options and says nothing about one company, but a stock's
+                  # own chain prices that company directly.
+                  "ce_iv": _num(ce, "implied_volatility"),
+                  "pe_iv": _num(pe, "implied_volatility")}
     return out
 
 
@@ -11414,6 +11420,46 @@ def _num(leg: dict, key: str) -> float:
             except (TypeError, ValueError):
                 return float("nan")
     return float("nan")
+
+
+def atm_implied_vol(broker: dict, ticker: str, spot: float) -> tuple[float | None, str]:
+    """
+    At-the-money implied volatility from the instrument's OWN option chain.
+
+    This is the right volatility input for a single stock, and the reason the
+    question "should India VIX be used for Indian stocks?" has a clear answer:
+    no. India VIX is computed from NIFTY option prices. It describes the index
+    and nothing else, so applying it to one company borrows a number that was
+    never about that company. The stock's own chain prices the stock.
+
+    The call and put IV at the nearest strike are averaged, because the two
+    differ by skew and neither alone is "the" implied volatility. Returns
+    ``(iv_percent, note)`` and never raises.
+    """
+    if not (str(broker.get("access_token", "")).strip()
+            and str(broker.get("client_id", "")).strip()):
+        return None, "no Dhan credentials"
+    resolved = option_chain_underlying(ticker)
+    if resolved is None:
+        return None, "no option series in the Dhan master for this name"
+    scrip, segment, expiry = resolved
+    chain = dhan_option_chain(broker, scrip, segment, expiry)
+    if not chain:
+        return None, f"chain request returned nothing for {expiry}"
+
+    try:
+        strike = min(chain, key=lambda k: abs(float(k) - float(spot)))
+    except (TypeError, ValueError):
+        return None, "no usable strikes in the chain"
+    leg = chain.get(strike) or {}
+    values = [leg.get("ce_iv"), leg.get("pe_iv")]
+    usable = [float(v) for v in values
+              if v is not None and np.isfinite(v) and 0 < float(v) < 500]
+    if not usable:
+        return None, f"the chain carried no implied volatility at strike {fmt(strike, 0)}"
+    return (sum(usable) / len(usable),
+            f"ATM strike {fmt(strike, 0)}, expiry {expiry}, "
+            f"{'CE+PE averaged' if len(usable) > 1 else 'one leg only'}")
 
 
 def record_oi_snapshot(ticker: str, chain: dict) -> None:
@@ -12801,14 +12847,47 @@ def volatility_scan_one(ticker: str, vcfg: dict, broker: dict | None = None) -> 
     is_nifty = symbol in {"^NSEI"}
     dvol_ccy = dvol_currency_for(ticker)
 
+    looks_indian = symbol.endswith(".NS") or symbol.endswith(".BO") or symbol.startswith("^")
     use_vix = (mode == "India VIX") or (mode == "Auto" and is_nifty)
     use_dvol = (mode == "DVOL (crypto)") or (mode == "Auto" and bool(dvol_ccy))
+    # A typed figure needs no broker: the operator has supplied the implied
+    # volatility themselves, which is the whole point of the override.
+    typed = bool(vcfg.get("index_manual"))
+    use_stock_iv = (mode == "Stock IV (Dhan chain)") or (
+        mode == "Auto" and looks_indian and not is_nifty and not dvol_ccy
+        and (bool(broker) or typed))
 
     vix = vcfg.get("vix")
     sigma, basis, caution = float("nan"), "", ""
 
-    if use_dvol:
-        manual = vcfg.get("dvol_manual")
+    # A typed value always wins, whichever source it is standing in for. The
+    # operator can read today's number off a terminal and have the levels built
+    # from it rather than from whatever this app could reach.
+    manual_index = vcfg.get("index_manual")
+    try:
+        manual_index = float(manual_index) if manual_index else None
+    except (TypeError, ValueError):
+        manual_index = None
+
+    if use_stock_iv:
+        divisor = float(vcfg.get("vix_divisor", VIX_DIVISOR_EQUITY))
+        if manual_index:
+            sigma = vix_daily_sigma(manual_index, divisor)
+            basis = f"implied volatility {fmt(manual_index)} (typed) / {fmt(divisor, 0)}"
+        else:
+            iv, note = atm_implied_vol(broker or {}, ticker, spot)
+            if iv is not None:
+                sigma = vix_daily_sigma(iv, divisor)
+                basis = f"own ATM implied volatility {fmt(iv)} / {fmt(divisor, 0)} ({note})"
+            else:
+                sigma = realised_daily_sigma(daily, int(vcfg.get("rv_lookback", 20)))
+                basis = f"realised {int(vcfg.get('rv_lookback', 20))}-day volatility"
+                caution = (f"This instrument's own implied volatility could not be read "
+                           f"({note}), so its realised volatility was used. India VIX was NOT "
+                           f"substituted: it prices NIFTY options and says nothing about a "
+                           f"single stock.")
+    elif use_dvol:
+        manual = vcfg.get("dvol_manual") or manual_index
         dvol = float(manual) if (manual not in (None, 0, 0.0)) else None
         source = "typed by hand"
         if dvol is None and dvol_ccy:
@@ -12827,10 +12906,12 @@ def volatility_scan_one(ticker: str, vcfg: dict, broker: dict | None = None) -> 
             basis = f"realised {int(vcfg.get('rv_lookback', 20))}-day volatility"
             caution = ("DVOL could not be read and none was typed in, so the instrument's own "
                        "realised volatility was used instead.")
-    elif use_vix and vix is not None and np.isfinite(float(vix)):
+    elif use_vix and (manual_index or (vix is not None and np.isfinite(float(vix)))):
         divisor = float(vcfg.get("vix_divisor", VIX_DIVISOR_EQUITY))
-        sigma = vix_daily_sigma(float(vix), divisor)
-        basis = f"India VIX {fmt(vix)} / {fmt(divisor, 0)}"
+        reading = manual_index if manual_index else float(vix)
+        sigma = vix_daily_sigma(reading, divisor)
+        basis = (f"India VIX {fmt(reading)}"
+                 + (" (typed)" if manual_index else "") + f" / {fmt(divisor, 0)}")
         if not is_nifty:
             caution = ("India VIX prices NIFTY options. Applied to this instrument it is a "
                        "borrowed number, not a measurement of it.")
@@ -12842,6 +12923,11 @@ def volatility_scan_one(ticker: str, vcfg: dict, broker: dict | None = None) -> 
         elif dvol_ccy:
             caution = (f"{dvol_ccy} has a published DVOL index. Switch the volatility input to "
                        f"DVOL for a forward-looking number instead of a backward-looking one.")
+        elif looks_indian and not is_nifty:
+            caution = ("Realised volatility is this instrument's OWN past movement. India VIX "
+                       "is deliberately not used here — it prices NIFTY options and describes "
+                       "the index, not one stock. For a forward-looking number, connect Dhan "
+                       "and switch the input to Stock IV, or type the figure in.")
 
     levels = sd_levels(spot, sigma)
 
@@ -12943,12 +13029,14 @@ def tab_volatility_levels(cfg: dict) -> None:
                                  "standard-deviation levels are always computed on DAILY data, "
                                  "whatever is picked here.")
     sigma_mode = c3.selectbox(
-        "Volatility input", ["Auto", "India VIX", "DVOL (crypto)", "Realised volatility"],
-        key="vol_sigma_mode",
+        "Volatility input",
+        ["Auto", "India VIX", "DVOL (crypto)", "Stock IV (Dhan chain)",
+         "Realised volatility"], key="vol_sigma_mode",
         help="Auto picks the index that actually prices the instrument: India VIX for NIFTY, "
-             "Deribit's DVOL for BTC and ETH, and the instrument's own realised volatility "
-             "for everything else. Forcing one onto an instrument it does not describe "
-             "borrows another market's number, and the row says so when that happens.")
+             "Deribit's DVOL for BTC and ETH, the stock's OWN at-the-money implied "
+             "volatility for an Indian name when Dhan is connected, and realised volatility "
+             "for everything else. India VIX is never applied to a single stock by Auto — it "
+             "prices NIFTY options and describes the index, not one company.")
 
     custom_text = ""
     if universe.startswith("Custom"):
@@ -12987,6 +13075,7 @@ def tab_volatility_levels(cfg: dict) -> None:
 
         crypto_names = [t for t in chosen if dvol_currency_for(t)]
         dvol_manual = 0.0
+        index_manual = 0.0
         if crypto_names or sigma_mode == "DVOL (crypto)":
             st.markdown("**DVOL** — Deribit's volatility index, published for BTC and ETH "
                         "only. Every other coin falls back to its own realised volatility "
@@ -13003,6 +13092,18 @@ def tab_volatility_levels(cfg: dict) -> None:
                 key="vol_dvol_manual",
                 help="Deribit is a third party and can be unreachable from a hosted runtime. "
                      "Type today's DVOL here and it is used instead of the fetched value.")
+
+        st.markdown("**Type the volatility index yourself**")
+        index_manual = st.number_input(
+            "Volatility index value (0 = use the automatic reading)", 0.0, 500.0, 0.0, 0.01,
+            key="vol_index_manual",
+            help="Stands in for whichever source is in play — India VIX, DVOL or a stock's "
+                 "implied volatility — so a figure read off a terminal can be used directly. "
+                 "It applies to EVERY ticker in the scan, so set it when screening one name "
+                 "or a set that shares an index, not a mixed list.")
+        if index_manual:
+            st.caption(f"Every ticker in this scan will use **{fmt(index_manual)}** as its "
+                       f"volatility index, divided by the divisor for its market.")
 
     with st.expander("ATR volatility expansion", expanded=True):
         st.markdown("`expansion = ATR(14) / average(ATR, 20)` on the timeframe above. Below "
@@ -13048,6 +13149,7 @@ def tab_volatility_levels(cfg: dict) -> None:
     vcfg = {"interval": interval, "sigma_mode": sigma_mode, "vix": live_vix,
             "vix_divisor": vix_divisor, "rv_lookback": rv_lookback,
             "dvol_divisor": dvol_divisor, "dvol_manual": dvol_manual,
+            "index_manual": index_manual,
             "atr_len": atr_len, "atr_avg_len": atr_avg,
             "squeeze_below": squeeze_below, "expand_above": expand_above,
             "use_oi": bool(use_oi and has_token), "mr_bull": mr_bull, "mr_bear": mr_bear,
@@ -14097,7 +14199,9 @@ _SMC_INK = "#8d99ae"
 
 
 def smc_analyse(df: pd.DataFrame, left: int = 3, right: int = 3,
-                lookback: int = 150, equal_tol_pct: float = 0.05) -> dict:
+                lookback: int = 150, equal_tol_pct: float = 0.05,
+                min_pierce: float = 0.15, min_reject: float = 0.10,
+                sweep_window: int = 10) -> dict:
     """
     Every SMC concept this data can support, on ONE frame.
 
@@ -14202,33 +14306,122 @@ def smc_analyse(df: pd.DataFrame, left: int = 3, right: int = 3,
             + (" — still unfilled above price" if unfilled else " — price has traded back into it"))
 
     # --- 6. liquidity sweeps -------------------------------------------------
-    # A wick through a prior swing that CLOSES back inside: stops taken, then
-    # rejection. The close is what separates a sweep from a genuine break.
-    sweep_up = sweep_down = None
+    #
+    # A sweep is a wick through a CONFIRMED prior swing that closes back
+    # inside: stops taken, then rejection. The close is what separates a sweep
+    # from a genuine break.
+    #
+    # THE BUG THIS REPLACES. The first version tested "did any bar's high
+    # exceed the running swing-high level while closing below it", over forty
+    # bars, with no minimum penetration and no minimum rejection. On a random
+    # walk that fired on 86% of samples and reported BOTH a buy-side and a
+    # sell-side sweep at once on 69% of them -- so every summary said liquidity
+    # had been taken in both directions, which reads as hardcoded text because
+    # it carries no information. Four conditions now have to hold:
+    #
+    #   1. the level is a swing CONFIRMED BEFORE the sweep bar, not a level
+    #      carried forward from the running series,
+    #   2. the wick clears it by at least `min_pierce` x ATR, so a one-tick
+    #      overshoot does not count,
+    #   3. the candle closes back inside by at least `min_reject` x ATR, which
+    #      is the rejection itself,
+    #   4. it happened within `sweep_window` candles, because liquidity taken
+    #      sixty bars ago is history, not context.
+    #
+    # Both sides can still be reported, but only the MORE RECENT one is treated
+    # as the active narrative -- a market cannot be reacting to both at once.
+    atr_now = _last(atr(closed["High"], closed["Low"], closed["Close"], 14))
+    if not _ok(atr_now) or atr_now <= 0:
+        atr_now = max(price * 0.002, 1e-9)
+    pierce = float(min_pierce) * atr_now
+    reject = float(min_reject) * atr_now
+
     tail = closed.tail(int(lookback))
-    for i in range(len(tail) - 1, max(len(tail) - 40, 0), -1):
-        stamp = tail.index[i]
-        level_high, level_low = float(prev_high.loc[stamp]) if stamp in prev_high.index else np.nan, \
-            float(prev_low.loc[stamp]) if stamp in prev_low.index else np.nan
-        if sweep_up is None and _ok(level_high) and \
-                float(tail["High"].iloc[i]) > level_high > float(tail["Close"].iloc[i]):
-            sweep_up = (level_high, stamp)
-        if sweep_down is None and _ok(level_low) and \
-                float(tail["Low"].iloc[i]) < level_low < float(tail["Close"].iloc[i]):
-            sweep_down = (level_low, stamp)
+    highs, lows = tail["High"].to_numpy(float), tail["Low"].to_numpy(float)
+    closes = tail["Close"].to_numpy(float)
+    stamps = list(tail.index)
+    sweep_up = sweep_down = None
+    scan_from = max(len(tail) - int(sweep_window), left + right + 1)
+
+    # The actual pivot POINTS, with the bar each was confirmed on. A pivot at
+    # position p is only knowable at p + right, so that is when it may be used
+    # as a level. Using the window's running high instead -- which the first
+    # attempt at this fix did -- tests whether a bar set a new extreme for the
+    # whole window, which is a different and much rarer event, and it fired
+    # asymmetrically depending on which way the sample happened to drift.
+    pivot_highs, pivot_lows = [], []
+    for p in range(left, len(tail) - right):
+        # STRICTLY higher than the bars before it, and at least as high as the
+        # bars after. A non-strict test on both sides makes every bar of a flat
+        # stretch a pivot, so a one-tick poke above a sideways range registered
+        # as a liquidity sweep of a level nobody was watching.
+        before_h, after_h = highs[p - left:p], highs[p + 1:p + right + 1]
+        before_l, after_l = lows[p - left:p], lows[p + 1:p + right + 1]
+        if len(before_h) and len(after_h) and highs[p] > before_h.max() \
+                and highs[p] >= after_h.max():
+            pivot_highs.append((p + right, highs[p]))
+        if len(before_l) and len(after_l) and lows[p] < before_l.min() \
+                and lows[p] <= after_l.min():
+            pivot_lows.append((p + right, lows[p]))
+
+    def most_recent(pivots, before: int):
+        """The newest pivot already CONFIRMED before this bar."""
+        for confirmed_at, level in reversed(pivots):
+            if confirmed_at < before:
+                return level
+        return None
+
+    # Only THE most recent confirmed swing counts, not any of fifty within
+    # reach. "It swept the previous high" is a statement about one specific
+    # level -- testing every pivot in the window gives the scan so many chances
+    # that something always matches, which is how the first two attempts at
+    # this ended up firing on nine samples out of ten.
+    for i in range(len(tail) - 1, scan_from - 1, -1):
+        if sweep_up is None:
+            level = most_recent(pivot_highs, i)
+            if level is not None and highs[i] > level + pierce \
+                    and closes[i] < level - reject:
+                sweep_up = (level, stamps[i], len(tail) - 1 - i,
+                            (highs[i] - level) / atr_now)
+        if sweep_down is None:
+            level = most_recent(pivot_lows, i)
+            if level is not None and lows[i] < level - pierce \
+                    and closes[i] > level + reject:
+                sweep_down = (level, stamps[i], len(tail) - 1 - i,
+                              (level - lows[i]) / atr_now)
         if sweep_up and sweep_down:
             break
-    out["shapes"]["sweep_up"], out["shapes"]["sweep_down"] = sweep_up, sweep_down
+
+    out["shapes"]["sweep_up"] = sweep_up[:2] if sweep_up else None
+    out["shapes"]["sweep_down"] = sweep_down[:2] if sweep_down else None
+    out["sweeps"] = {"up": sweep_up, "down": sweep_down}
+
+    # The more recent sweep is the one the market is reacting to.
+    newest = None
+    if sweep_up and sweep_down:
+        newest = "up" if sweep_up[2] <= sweep_down[2] else "down"
+    elif sweep_up:
+        newest = "up"
+    elif sweep_down:
+        newest = "down"
+    out["sweeps"]["dominant"] = newest
+
     if sweep_down:
-        add("Sell-side liquidity sweep", "bull",
-            f"wick took out {fmt(sweep_down[0])} on {fmt_time(sweep_down[1])} and closed back "
-            f"above — stops taken below, then rejected")
+        active = newest == "down"
+        add("Sell-side liquidity sweep", "bull" if active else "neutral",
+            f"wick took out {fmt(sweep_down[0])} by {fmt(sweep_down[3], 2)} ATR on "
+            f"{fmt_time(sweep_down[1])} ({sweep_down[2]} candle(s) ago) and closed back above"
+            + ("" if active else " — superseded by a more recent buy-side sweep"))
     if sweep_up:
-        add("Buy-side liquidity sweep", "bear",
-            f"wick took out {fmt(sweep_up[0])} on {fmt_time(sweep_up[1])} and closed back "
-            f"below — stops taken above, then rejected")
+        active = newest == "up"
+        add("Buy-side liquidity sweep", "bear" if active else "neutral",
+            f"wick took out {fmt(sweep_up[0])} by {fmt(sweep_up[3], 2)} ATR on "
+            f"{fmt_time(sweep_up[1])} ({sweep_up[2]} candle(s) ago) and closed back below"
+            + ("" if active else " — superseded by a more recent sell-side sweep"))
     if not sweep_up and not sweep_down:
-        add("Liquidity sweep", "neutral", "no sweep-and-reject in the recent window")
+        add("Liquidity sweep", "neutral",
+            f"no sweep-and-reject in the last {int(sweep_window)} candles: no swing has been "
+            f"pierced by {fmt(min_pierce, 2)} ATR and rejected")
 
     # --- 7. premium / discount ----------------------------------------------
     window = closed.tail(int(lookback))
@@ -14467,74 +14660,139 @@ def smc_trade_levels(analysis: dict, atr_value: float | None = None) -> dict:
 
 def smc_narrative(ticker: str, interval: str, analysis: dict, levels: dict) -> str:
     """
-    The structural read in about fifty words, with liquidity named explicitly.
+    The chart read the way a desk reads it, in the order a desk reads it.
 
-    Written from the concepts rather than templated per signal, so a HOLD
-    explains what is unresolved instead of saying nothing.
+    Seven questions, answered from the data each time and skipped when the data
+    does not answer them: what is the structure, has character changed, what
+    liquidity has been taken, what liquidity remains as a draw, is price
+    expensive or cheap, is there a point of interest in the way, and what would
+    prove the read wrong.
+
+    Nothing here is a fixed sentence. Every clause is built from a concept's
+    own verdict and reading, so a chart with no sweep says there has been no
+    sweep rather than reciting one.
     """
     concepts = analysis.get("concepts", {})
+    sweeps = analysis.get("sweeps", {}) or {}
+    shapes = analysis.get("shapes", {})
+    price = float(analysis.get("price", float("nan")))
 
     def verdict(name: str) -> str:
         return str((concepts.get(name) or {}).get("verdict", "neutral"))
 
-    bits = []
-    bos = verdict("Break of structure (BOS)")
-    choch = verdict("Change of character (CHoCH)")
-    if bos != "neutral":
-        bits.append(f"Structure is {'bullish' if bos == 'bull' else 'bearish'} after a break "
-                    f"of the last swing {'high' if bos == 'bull' else 'low'}")
-    else:
-        bits.append("Structure is unresolved, with no swing broken either way")
-    if choch != "neutral" and choch != bos:
-        bits.append(f"though character last flipped {'up' if choch == 'bull' else 'down'}, "
-                    f"so the trend is in transition")
+    def reading(name: str) -> str:
+        return str((concepts.get(name) or {}).get("reading", ""))
 
+    parts: list[str] = []
+
+    # 1 ---- structure, which is where every SMC read starts
+    bos = verdict("Break of structure (BOS)")
+    if bos == "bull":
+        parts.append("Structure is **bullish**: the last confirmed swing high has been taken "
+                     "out, so the market is making higher highs")
+    elif bos == "bear":
+        parts.append("Structure is **bearish**: the last confirmed swing low has been broken, "
+                     "so the market is making lower lows")
+    else:
+        parts.append("Structure is **unresolved** — neither the last swing high nor the last "
+                     "swing low has been broken, so there is no trend to follow yet")
+
+    # 2 ---- change of character, the warning that a trend is ending
+    choch = verdict("Change of character (CHoCH)")
+    if choch != "neutral":
+        agrees = choch == bos
+        parts.append(
+            f"character last flipped **{'bullish' if choch == 'bull' else 'bearish'}**"
+            + (", confirming the same direction" if agrees else
+               ", which disagrees with the current structure and is the first warning that "
+               "the move is maturing"))
+
+    # 3 ---- liquidity TAKEN: the engine, said in the direction it points
+    dominant = sweeps.get("dominant")
+    up_sweep, down_sweep = sweeps.get("up"), sweeps.get("down")
+    if dominant == "down" and down_sweep:
+        parts.append(
+            f"Sell-side liquidity has been taken: price wicked **{fmt(down_sweep[3], 2)} ATR** "
+            f"below {fmt(down_sweep[0])} {down_sweep[2]} candle(s) ago and closed back above "
+            f"it, so the stops under that low are gone and the sellers who were filled there "
+            f"are now trapped")
+    elif dominant == "up" and up_sweep:
+        parts.append(
+            f"Buy-side liquidity has been taken: price wicked **{fmt(up_sweep[3], 2)} ATR** "
+            f"above {fmt(up_sweep[0])} {up_sweep[2]} candle(s) ago and closed back below it, "
+            f"so the stops above that high are gone and the buyers filled there are trapped")
+    else:
+        parts.append("No swing has been swept and rejected recently, so no stop pool has been "
+                     "cleared — moves from here are starting without that fuel")
+
+    # 4 ---- liquidity REMAINING: the draw
+    equal = concepts.get("Equal highs / lows")
+    draws = []
+    if equal and equal.get("verdict") != "neutral":
+        draws.append(reading("Equal highs / lows"))
+    high, low = shapes.get("range_high"), shapes.get("range_low")
+    if np.isfinite(price) and high and low and np.isfinite(high) and np.isfinite(low):
+        draws.append(f"the range extremes at {fmt(low)} and {fmt(high)} are the obvious "
+                     f"resting places for orders")
+    if draws:
+        parts.append("As a draw on liquidity, " + "; ".join(draws))
+
+    # 5 ---- premium / discount: are you paying up or getting a discount
     zone = concepts.get("Premium / discount")
     if zone:
-        where = "discount" if zone["verdict"] == "bull" else "premium"
-        bits.append(f"price sits in {where}, which favours "
-                    f"{'buyers' if where == 'discount' else 'sellers'}")
+        cheap = zone["verdict"] == "bull"
+        parts.append(
+            f"Price is in **{'discount' if cheap else 'premium'}** "
+            f"({reading('Premium / discount').split('i.e.')[0].strip().rstrip(',')}), which "
+            f"is where {'buyers' if cheap else 'sellers'} want to be engaging — "
+            + ("buying here is buying cheap relative to the range"
+               if cheap else "selling here is selling expensive relative to the range"))
 
+    # 6 ---- the point of interest actually in the way
+    poi = []
     for side in ("Bullish order block", "Bearish order block"):
         block = concepts.get(side)
-        if block and "mitigating" in str(block.get("reading", "")):
-            bits.append(f"and is mitigating the {side.split()[0].lower()} order block")
-            break
-    else:
-        for side in ("Bullish fair value gap", "Bearish fair value gap"):
-            gap = concepts.get(side)
-            if gap and "unfilled" in str(gap.get("reading", "")):
-                bits.append(f"with an unfilled {side.split()[0].lower()} imbalance left behind")
-                break
+        if not block:
+            continue
+        if "mitigating" in reading(side):
+            poi.append(f"price is inside the {side.split()[0].lower()} order block at "
+                       f"{reading(side).split(' from ')[0]}, which is the decision point")
+        else:
+            poi.append(f"an unmitigated {side.split()[0].lower()} order block sits at "
+                       f"{reading(side).split(' from ')[0]}")
+    for side in ("Bullish fair value gap", "Bearish fair value gap"):
+        gap = concepts.get(side)
+        if gap and "unfilled" in reading(side):
+            poi.append(f"an unfilled {side.split()[0].lower()} imbalance remains at "
+                       f"{reading(side).split(' —')[0]}, and imbalances tend to be revisited")
+    if poi:
+        parts.append("Points of interest: " + "; ".join(poi[:3]))
 
-    # Liquidity, said plainly -- this is the part the operator asked to see.
-    liquidity = []
-    if verdict("Sell-side liquidity sweep") == "bull":
-        liquidity.append("Sell-side liquidity was swept and rejected, so the stops below have "
-                         "already been taken")
-    if verdict("Buy-side liquidity sweep") == "bear":
-        liquidity.append("Buy-side liquidity was swept and rejected, so the stops above have "
-                         "already been taken")
-    equal = concepts.get("Equal highs / lows")
-    if equal and equal.get("verdict") != "neutral":
-        liquidity.append("equal " + ("highs rest above as the next draw"
-                                     if equal["verdict"] == "bear" else
-                                     "lows rest below as the next draw"))
-    if not liquidity:
-        liquidity.append("No liquidity has been taken recently, so there is no obvious pool "
-                         "being hunted")
-
-    head = "; ".join(bits) + "."
-    middle = " " + ", ".join(liquidity) + "."
+    # 7 ---- the trade, and what would disprove it
     if levels.get("entry") is not None and levels.get("stop") is not None:
-        tail = (f" {levels['signal']} from {fmt(levels['entry'])}, stop {fmt(levels['stop'])}, "
-                f"target {fmt(levels['target'])}"
-                + (f", {fmt(levels['rr'])}:1." if levels.get("rr") else "."))
-        if levels.get("rr") and float(levels["rr"]) < 1.0:
-            tail += " The structure is not offering a trade worth taking at that ratio."
+        rr = levels.get("rr")
+        trade = (f"**{levels['signal']}** from {fmt(levels['entry'])} with the stop at "
+                 f"{fmt(levels['stop'])} and the draw at {fmt(levels['target'])}"
+                 + (f", a reward:risk of {fmt(rr)}:1" if rr else ""))
+        if rr and float(rr) < 1.0:
+            trade += (". At that ratio the structure is not offering a trade worth taking — "
+                      "the level is right but the geometry is not")
+        trade += (f". The read is wrong if price closes beyond {fmt(levels['stop'])}, because "
+                  f"that invalidates the structure the entry was built on")
+        parts.append(trade)
     else:
-        tail = " No level worth acting on until structure resolves."
-    return f"**{interval}** — " + head + middle + tail
+        parts.append("There is no level worth acting on until structure resolves — the honest "
+                     "position here is flat")
+
+    # Each clause is a sentence of its own, so each starts with a capital --
+    # the fragments are written to read on from one another, not to be glued.
+    sentences = []
+    for part in parts:
+        text = part.strip()
+        if text and text[0].islower() and not text.startswith("**"):
+            text = text[0].upper() + text[1:]
+        sentences.append(text)
+    return f"**{interval}** — " + ". ".join(sentences) + "."
 
 
 def smc_multi_timeframe(ticker: str, timeframes: list[str], pivot: int = 3,
@@ -17216,6 +17474,184 @@ def _test_custom_screener_and_sector_flip():
         SECTOR_BY_TICKER.pop("X.NS", None)
 
 
+def _test_sweep_detection_is_not_always_true():
+    """
+    A liquidity sweep must be an EVENT, not a constant.
+
+    THE BUG THIS EXISTS FOR, and it was spotted by reading the summaries rather
+    than the code. The first detector asked "did any bar in the last forty
+    exceed the running swing level and close the other side of it", with no
+    minimum penetration and no minimum rejection. Measured over 200 random
+    walks it fired on 86% of samples and reported BOTH a buy-side and a
+    sell-side sweep at once on 69% of them -- so every narrative said liquidity
+    had been taken in both directions. Nothing was hardcoded; the test was just
+    always true, which reads exactly the same way and is just as useless.
+
+    Two later attempts were also wrong and are worth recording: using the
+    window's running extreme made it fire asymmetrically (0% one way, 17% the
+    other), and testing every pivot within reach gave the scan so many chances
+    that it went back to 94%.
+    """
+    real_st = globals()["st"]
+    fake = _FakeStreamlit()
+    globals()["st"] = fake
+    try:
+        # ---- it must separate a real sweep from the things that resemble one
+        def built(high: float, close: float) -> pd.DataFrame:
+            """Flat tape with one pivot high at 110, then a final bar."""
+            opens = [100.0] * 60
+            highs = [101.0] * 60
+            lows = [99.0] * 60
+            closes = [100.0] * 60
+            highs[30], closes[30] = 110.0, 100.5
+            opens.append(100.0)
+            highs.append(high)
+            lows.append(99.0)
+            closes.append(close)
+            frame = pd.DataFrame(
+                {"Open": opens, "High": highs, "Low": lows, "Close": closes,
+                 "Volume": [1000.0] * len(closes)},
+                index=pd.date_range("2026-01-01", periods=len(closes), freq="15min"))
+            frame = pd.concat([frame, frame.tail(1)])      # a forming candle
+            frame.index = pd.date_range("2026-01-01", periods=len(frame), freq="15min")
+            return frame
+
+        cases = {
+            "sweep": (114.0, 100.0, True),    # pierced hard, closed far back below
+            "break": (114.0, 113.0, False),   # closed ABOVE: a real break, not a sweep
+            "graze": (110.1, 100.0, False),   # a one-tick poke is not a sweep
+            "quiet": (101.0, 100.0, False),   # nothing happened
+        }
+        for name, (high, close, expected) in cases.items():
+            found = "Buy-side liquidity sweep" in smc_analyse(built(high, close), 3, 3,
+                                                              150)["concepts"]
+            assert found is expected, f"{name}: expected {expected}, got {found}"
+
+        # It must also name the RIGHT level -- the pivot at 110, not the flat
+        # 101 that every bar of a sideways stretch ties with.
+        reading = smc_analyse(built(114.0, 100.0), 3, 3, 150)["concepts"][
+            "Buy-side liquidity sweep"]["reading"]
+        assert "110" in reading, f"the swept level must be the pivot: {reading}"
+
+        # ---- and across random data it must be informative, not constant
+        samples = 120
+        up = down = both = neither = 0
+        for seed in range(samples):
+            concepts = smc_analyse(_synthetic(400, seed=seed), 3, 3, 150)["concepts"]
+            has_up = "Buy-side liquidity sweep" in concepts
+            has_down = "Sell-side liquidity sweep" in concepts
+            up += has_up
+            down += has_down
+            both += has_up and has_down
+            neither += (not has_up) and (not has_down)
+        for label, count in (("buy-side", up), ("sell-side", down)):
+            rate = count / samples
+            assert 0.05 < rate < 0.70, \
+                f"{label} sweeps fire on {rate:.0%} of random walks, which is not an event"
+        assert neither / samples > 0.15, \
+            "a sweep must frequently be ABSENT, or the summary carries no information"
+        assert abs(up - down) / samples < 0.25, \
+            "detection must be roughly symmetric; a lopsided rate means a one-sided test"
+
+        # Only one sweep is ever the ACTIVE narrative, even when both exist.
+        for seed in range(40):
+            analysis = smc_analyse(_synthetic(400, seed=seed), 3, 3, 150)
+            active = [k for k, v in analysis["concepts"].items()
+                      if "sweep" in k.lower() and v["verdict"] != "neutral"]
+            assert len(active) <= 1, f"two active sweeps at once: {active}"
+
+        # ---- the narrative must follow the data, not recite a template
+        summaries = []
+        for seed in range(25):
+            analysis = smc_analyse(_synthetic(400, seed=seed), 3, 3, 150)
+            levels = smc_trade_levels(analysis, 5.0)
+            summaries.append(smc_narrative("X", "15m", analysis, levels))
+        assert len(set(summaries)) >= 20, \
+            f"only {len(set(summaries))} distinct summaries from 25 charts -- templated"
+        claimed = sum(1 for text in summaries if "liquidity has been taken" in text)
+        assert claimed < len(summaries) * 0.7, \
+            f"{claimed} of {len(summaries)} summaries claim liquidity was taken"
+        assert any("No swing has been swept" in text for text in summaries), \
+            "a chart with no sweep must SAY there was no sweep"
+        assert min(len(text.split()) for text in summaries) > 60, \
+            "the read must be a full paragraph, not a clause"
+        print("   liquidity sweeps: real sweep found, clean break and one-tick graze refused, "
+              f"fires on {up / samples:.0%}/{down / samples:.0%} of random walks  OK")
+    finally:
+        globals()["st"] = real_st
+
+
+def _test_volatility_source_routing():
+    """
+    Which volatility number belongs to which instrument -- the operator's own
+    question, answered in code.
+
+    India VIX is computed from NIFTY option prices. It describes the index and
+    nothing else, so Auto must NOT reach for it when the instrument is a single
+    stock. The stock's own at-the-money implied volatility is the right
+    forward-looking input; without it, the stock's own realised volatility is
+    the right backward-looking one. Either way the number is about that stock.
+    """
+    real_st = globals()["st"]
+    fake = _FakeStreamlit()
+    globals()["st"] = fake
+    saved = {"load_market_data": globals()["load_market_data"],
+             "load_dvol": globals()["load_dvol"]}
+    try:
+        n = 300
+        idx = pd.date_range(end=pd.Timestamp("2026-10-17"), periods=n, freq="D")
+        closes = np.full(n, 2500.0) + np.random.default_rng(2).normal(0, 30, n)
+        closes[-1] = 2500.0
+        daily = pd.DataFrame({"Open": closes, "High": closes * 1.01, "Low": closes * 0.99,
+                              "Close": closes, "Volume": np.full(n, 1e6)}, index=idx)
+        globals()["load_market_data"] = lambda *a, **k: DataBundle(
+            frame=daily.copy(), symbol="X", interval="1d", period="1y")
+        globals()["load_dvol"] = lambda *a, **k: None
+
+        base = {"interval": "5m", "sigma_mode": "Auto", "vix": 14.0,
+                "vix_divisor": VIX_DIVISOR_EQUITY, "rv_lookback": 20,
+                "dvol_divisor": DVOL_DIVISOR_CRYPTO, "dvol_manual": 0.0,
+                "index_manual": 0.0, "atr_len": 14, "atr_avg_len": 20,
+                "squeeze_below": 1.0, "expand_above": 1.3, "use_oi": False}
+
+        # Auto: the index gets India VIX, the stock must NOT.
+        nifty = volatility_scan_one("^NSEI", base)
+        assert "India VIX" in nifty["Sigma basis"], nifty["Sigma basis"]
+        stock = volatility_scan_one("RELIANCE.NS", base)
+        assert "India VIX" not in stock["Sigma basis"], \
+            f"India VIX must never be applied to a single stock by Auto: {stock['Sigma basis']}"
+        assert "realised" in stock["Sigma basis"]
+        assert "not used here" in stock["Caution"], stock["Caution"]
+
+        # A typed figure stands in for whichever source applies, and each
+        # market divides by its OWN annualisation constant.
+        typed = 28.0
+        for ticker, divisor in (("^NSEI", VIX_DIVISOR_EQUITY),
+                                ("RELIANCE.NS", VIX_DIVISOR_EQUITY),
+                                ("BTC-USD", DVOL_DIVISOR_CRYPTO)):
+            row = volatility_scan_one(ticker, dict(base, index_manual=typed))
+            expected = typed / divisor * row["Spot"]
+            assert abs(row["1 SD (points)"] - expected) < 0.5, \
+                f"{ticker}: {row['1 SD (points)']} vs {expected}"
+            assert "typed" in row["Sigma basis"], row["Sigma basis"]
+
+        # Forcing stock IV with no chain available must fall back to the
+        # stock's own realised volatility and say India VIX was not borrowed.
+        forced = volatility_scan_one("RELIANCE.NS",
+                                     dict(base, sigma_mode="Stock IV (Dhan chain)"))
+        assert "realised" in forced["Sigma basis"]
+        assert "India VIX was NOT substituted" in forced["Caution"], forced["Caution"]
+
+        # The chain parser must carry implied volatility, or none of this works.
+        assert _num({"implied_volatility": 21.5}, "implied_volatility") == 21.5
+        assert _num({"impliedVolatility": 21.5}, "implied_volatility") == 21.5
+        print("   volatility routing: India VIX for the index only, never for a stock; a "
+              "typed figure divides by its own market's constant  OK")
+    finally:
+        globals()["st"] = real_st
+        globals().update(saved)
+
+
 def _test_dvol_and_multi_timeframe_smc():
     """
     Crypto volatility from DVOL, and the structural read across timeframes.
@@ -17324,7 +17760,11 @@ def _test_dvol_and_multi_timeframe_smc():
                 else:
                     assert levels["stop"] > levels["entry"], read["Timeframe"]
                     assert levels["target"] < levels["entry"], read["Timeframe"]
-        assert 35 <= min(words) and max(words) <= 80, f"summary lengths: {words}"
+        # The read is now a full professional paragraph, not a clause: the
+        # operator asked for every SMC concept covered the way a desk covers
+        # them, so the floor is well above the original fifty words.
+        assert min(words) >= 60, f"summaries too short to cover the concepts: {words}"
+        assert max(words) <= 260, f"summaries have run away: {words}"
 
         # Higher timeframes must outweigh lower ones.
         assert SMC_TF_WEIGHT["1mo"] > SMC_TF_WEIGHT["1d"] > SMC_TF_WEIGHT["15m"] \
@@ -18260,6 +18700,8 @@ def run_selftest() -> int:
         _test_drawdown_and_reward_risk_objectives()
         _test_indicator_library()
         _test_custom_screener_and_sector_flip()
+        _test_sweep_detection_is_not_always_true()
+        _test_volatility_source_routing()
         _test_dvol_and_multi_timeframe_smc()
         _test_smc_concepts_and_sector_flip_direction()
         _test_momentum_pulse_checklist()
