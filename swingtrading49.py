@@ -10,7 +10,7 @@ A comprehensive trading system with:
 - Live trading and backtesting capabilities
 - Advanced position management
 
-Version: 2.0
+Version: 2.1
 
 What changed in v2.0
 --------------------
@@ -30,7 +30,9 @@ What changed in v2.0
 5. Signals are evaluated on CLOSED candles by default and each signal candle can
    trigger only one entry (no repeated entries while fast EMA > slow EMA).
    Several strategy bugs fixed (see check_* functions).
-6. 27 optional entry filters (RSI, MACD, Volume, BB, Regime, SMC BOS/CHoCH/
+6. 44 optional entry filters (incl. chart patterns: trendline, S/R retest,
+   triangle, wedge, H&S, double top/bottom, flag; CPR, IFVG, Keltner,
+   Donchian, Ichimoku, Heikin-Ashi, EMA sustain, volume+price, trap) – (RSI, MACD, Volume, BB, Regime, SMC BOS/CHoCH/
    Inducement/OB/Mitigation/FVG, Liquidity sweep, Fibonacci, EMA pullback,
    Multi EMA/SMA, Volatility, ATR, ORB, Pivot, HH/HL, VWAP, SuperTrend,
    ROC, Stochastic, Candle strength) - all disabled by default.
@@ -2764,6 +2766,546 @@ ENTRY_FILTERS = {
 }
 
 
+# ================================
+# CHART PATTERN & CHANNEL ENTRY FILTERS (all OFF by default)
+# ================================
+# Patterns are built ONLY from swing pivots already confirmed at the signal
+# candle (Swing Detection settings), so there is no look-ahead.
+# Bullish patterns confirm BUY signals, bearish patterns confirm SELL signals.
+
+def _pivots_with_pos(df, idx, kind, config, count=6, max_scan=1500):
+    """Chronological list of (position, value) of confirmed pivots (kind 'high'/'low') at bar idx"""
+    right = int(config.get('swing_right', 3))
+    col = 'PH_Raw' if kind == 'high' else 'PL_Raw'
+    if col not in df.columns:
+        add_swing_columns(df, config)
+    last = idx - right
+    if last < 0:
+        return []
+    start = max(0, last - max_scan)
+    vals = df[col].values[start:last + 1]
+    pos = np.where(~np.isnan(vals))[0]
+    return [(start + int(p), float(vals[p])) for p in pos[-count:]]
+
+
+def _make_line(p1, p2):
+    """Straight line through two (x, y) points → (fn(t), slope)"""
+    (x1, y1), (x2, y2) = p1, p2
+    m = (y2 - y1) / (x2 - x1) if x2 != x1 else 0.0
+    return (lambda t: y1 + m * (t - x1)), m
+
+
+def _flat_line(level):
+    return lambda t: level
+
+
+def _break_retest(df, idx, line, bull, start, lookback, need_retest=False,
+                  tol_pct=0.05, sustain_bars=1):
+    """
+    Generic line breakout / breakdown checker.
+      break   : a CLOSE crosses the line (above for bull, below for bear) in the
+                last `lookback` bars, after bar `start`
+      beyond  : current close is still beyond the line
+      retest  : (optional) after the break, price came back to the line
+                (within tol_pct %) and closed on the breakout side
+      sustain : last `sustain_bars` closes (all after the break) beyond the line
+    Returns (passed, detail)
+    """
+    cl, lo, hi = df['Close'].values, df['Low'].values, df['High'].values
+    s = max(int(start) + 1, idx - int(lookback) + 1, 1)
+    brk = None
+    for k in range(idx, s - 1, -1):
+        lk, lk1 = line(k), line(k - 1)
+        if bull and cl[k] > lk and cl[k - 1] <= lk1:
+            brk = k
+            break
+        if (not bull) and cl[k] < lk and cl[k - 1] >= lk1:
+            brk = k
+            break
+    word = 'breakout' if bull else 'breakdown'
+    if brk is None:
+        return False, f'no {word} in last {lookback} bars (line {line(idx):.2f})'
+    beyond = cl[idx] > line(idx) if bull else cl[idx] < line(idx)
+    if not beyond:
+        return False, f'{word} {idx - brk} bars ago failed – price back inside (line {line(idx):.2f})'
+    tol = tol_pct / 100.0
+    if need_retest:
+        retested = False
+        for j in range(brk + 1, idx + 1):
+            lj = line(j)
+            if bull and lo[j] <= lj * (1 + tol) and cl[j] > lj:
+                retested = True
+                break
+            if (not bull) and hi[j] >= lj * (1 - tol) and cl[j] < lj:
+                retested = True
+                break
+        if not retested:
+            return False, f'{word} {idx - brk} bars ago, waiting for retest (line {line(idx):.2f})'
+    k = max(1, int(sustain_bars))
+    if idx - k + 1 < brk:
+        return False, f'{word} {idx - brk} bars ago – needs {k} bars of sustain'
+    rng = range(idx - k + 1, idx + 1)
+    sus = all(cl[j] > line(j) for j in rng) if bull else all(cl[j] < line(j) for j in rng)
+    if not sus:
+        return False, f'not sustained for {k} bars beyond line'
+    return True, (f'{word} {idx - brk} bars ago' + (', retested' if need_retest else '') +
+                  f', sustained {k} bars (line {line(idx):.2f})')
+
+
+def _pattern_common(c, prefix, default_lookback=20):
+    return (int(c.get(f'{prefix}_lookback', default_lookback)),
+            float(c.get(f'{prefix}_tol', 0.05)),
+            int(c.get(f'{prefix}_sustain', 1)))
+
+
+# ── Trendline breakout / breakout + retest + sustain ─────────────────────────
+def _trendline(df, idx, bull, c):
+    """BUY: falling resistance line through last 2 swing highs.  SELL: rising support through last 2 swing lows"""
+    if bull:
+        piv = _pivots_with_pos(df, idx, 'high', c, 2)
+        if len(piv) < 2 or not piv[1][1] < piv[0][1]:
+            return None, 'no falling resistance trendline (need lower swing high)'
+    else:
+        piv = _pivots_with_pos(df, idx, 'low', c, 2)
+        if len(piv) < 2 or not piv[1][1] > piv[0][1]:
+            return None, 'no rising support trendline (need higher swing low)'
+    line, _ = _make_line(piv[0], piv[1])
+    return (line, piv[1][0]), ''
+
+
+def _flt_tl_break(df, idx, bull, c):
+    res, why = _trendline(df, idx, bull, c)
+    if res is None:
+        return False, why
+    line, start = res
+    n, tol, sus = _pattern_common(c, 'f_tlb')
+    return _break_retest(df, idx, line, bull, start, n, False, tol, sus)
+
+
+def _flt_tl_retest(df, idx, bull, c):
+    res, why = _trendline(df, idx, bull, c)
+    if res is None:
+        return False, why
+    line, start = res
+    n, tol, sus = _pattern_common(c, 'f_tlr', 40)
+    return _break_retest(df, idx, line, bull, start, n, True, tol, max(sus, 1))
+
+
+# ── Support / Resistance breakout + retest + sustain ─────────────────────────
+def _flt_sr_retest(df, idx, bull, c):
+    """BUY: breakout above a recent swing-high resistance; SELL: breakdown below swing-low support"""
+    n, tol, sus = _pattern_common(c, 'f_srr', 40)
+    need_retest = c.get('f_srr_mode', 'Breakout + Retest + Sustain').startswith('Breakout + Retest')
+    right = int(c.get('swing_right', 3))
+    piv = _pivots_with_pos(df, idx, 'high' if bull else 'low', c, int(c.get('f_srr_levels', 5)))
+    last_detail = 'no swing levels'
+    for pos, lvl in reversed(piv):   # most recent level first
+        ok, detail = _break_retest(df, idx, _flat_line(lvl), bull, pos + right - 1, n, need_retest, tol, sus)
+        if ok:
+            return True, f"{'resistance' if bull else 'support'} {lvl:.2f}: {detail}"
+        last_detail = f"{'resistance' if bull else 'support'} {lvl:.2f}: {detail}"
+    return False, last_detail
+
+
+# ── Triangle (symmetrical / ascending / descending) ──────────────────────────
+def _four_pivots(df, idx, c):
+    hs = _pivots_with_pos(df, idx, 'high', c, 2)
+    ls = _pivots_with_pos(df, idx, 'low', c, 2)
+    if len(hs) < 2 or len(ls) < 2:
+        return None
+    return hs, ls
+
+
+def _classify_triangle(hs, ls, flat_tol):
+    def flat(a, b):
+        return abs(b - a) / a * 100 <= flat_tol
+    hf, lf = flat(hs[0][1], hs[1][1]), flat(ls[0][1], ls[1][1])
+    h_down, l_up = hs[1][1] < hs[0][1], ls[1][1] > ls[0][1]
+    if hf and l_up:
+        return 'ascending'
+    if lf and h_down:
+        return 'descending'
+    if h_down and l_up and not hf and not lf:
+        return 'symmetrical'
+    return None
+
+
+def _flt_triangle(df, idx, bull, c):
+    p = _four_pivots(df, idx, c)
+    if p is None:
+        return False, 'not enough swings'
+    hs, ls = p
+    kind = _classify_triangle(hs, ls, float(c.get('f_tri_flat_tol', 0.05)))
+    if kind is None:
+        return False, 'last swings do not form a triangle'
+    upper, _ = _make_line(hs[0], hs[1])
+    lower, _ = _make_line(ls[0], ls[1])
+    start = max(hs[1][0], ls[1][0])
+    mode = c.get('f_tri_mode', 'Breakout / Breakdown')
+    n, tol, sus = _pattern_common(c, 'f_tri', 30)
+    cl = float(df['Close'].iloc[idx])
+    if mode.startswith('Pattern'):
+        inside = lower(idx) <= cl <= upper(idx)
+        ok = inside and (kind in ('ascending', 'symmetrical') if bull else kind in ('descending', 'symmetrical'))
+        return ok, f'{kind} triangle {lower(idx):.2f}–{upper(idx):.2f}, price inside: {inside}'
+    line = upper if bull else lower
+    ok, detail = _break_retest(df, idx, line, bull, start, n, mode.startswith('Breakout + Retest'), tol, sus)
+    return ok, f'{kind} triangle: {detail}'
+
+
+# ── Rising wedge (SELL) / Falling wedge (BUY) ────────────────────────────────
+def _flt_wedge(df, idx, bull, c):
+    p = _four_pivots(df, idx, c)
+    if p is None:
+        return False, 'not enough swings'
+    hs, ls = p
+    upper, mh = _make_line(hs[0], hs[1])
+    lower, ml = _make_line(ls[0], ls[1])
+    start = max(hs[1][0], ls[1][0])
+    if bull:
+        is_wedge = mh < 0 and ml < 0 and mh < ml      # both falling, converging
+        name, line = 'falling wedge', upper
+    else:
+        is_wedge = mh > 0 and ml > 0 and ml > mh      # both rising, converging
+        name, line = 'rising wedge', lower
+    if not is_wedge:
+        return False, f'no {name}'
+    if c.get('f_wedge_mode', 'Breakout required').startswith('Pattern'):
+        cl = float(df['Close'].iloc[idx])
+        inside = lower(idx) <= cl <= upper(idx)
+        return inside, f'{name} {lower(idx):.2f}–{upper(idx):.2f}, price inside: {inside}'
+    n, tol, sus = _pattern_common(c, 'f_wedge', 20)
+    ok, detail = _break_retest(df, idx, line, bull, start, n, False, tol, sus)
+    return ok, f'{name}: {detail}'
+
+
+# ── Head & Shoulders (SELL) / Inverse H&S (BUY) ──────────────────────────────
+def _flt_hs(df, idx, bull, c):
+    tol = float(c.get('f_hs_shoulder_tol', 1.0))
+    kind = 'low' if bull else 'high'
+    piv = _pivots_with_pos(df, idx, kind, c, 3)
+    name = 'inverse H&S' if bull else 'H&S'
+    if len(piv) < 3:
+        return False, f'no {name} (not enough swings)'
+    (a, ya), (b, yb), (d, yd) = piv
+    if bull:
+        head_ok = yb < ya and yb < yd
+        ref = df['High'].values
+        n1 = a + int(np.argmax(ref[a:b + 1])); n2 = b + int(np.argmax(ref[b:d + 1]))
+    else:
+        head_ok = yb > ya and yb > yd
+        ref = df['Low'].values
+        n1 = a + int(np.argmin(ref[a:b + 1])); n2 = b + int(np.argmin(ref[b:d + 1]))
+    shoulders_ok = abs(ya - yd) / abs(yb) * 100 <= tol
+    if not (head_ok and shoulders_ok):
+        return False, f'no {name} (head/shoulder proportions not met)'
+    if n1 == n2:
+        return False, f'no {name} (neckline undefined)'
+    neck, _ = _make_line((n1, ref[n1]), (n2, ref[n2]))
+    n, ttol, sus = _pattern_common(c, 'f_hs', 30)
+    ok, detail = _break_retest(df, idx, neck, bull, d, n, c.get('f_hs_retest', False), ttol, sus)
+    return ok, f'{name} neckline: {detail}'
+
+
+# ── Double bottom (BUY) / Double top (SELL) ──────────────────────────────────
+def _flt_double(df, idx, bull, c):
+    tol = float(c.get('f_dbl_tol', 0.15))
+    piv = _pivots_with_pos(df, idx, 'low' if bull else 'high', c, 2)
+    name = 'double bottom' if bull else 'double top'
+    if len(piv) < 2:
+        return False, f'no {name}'
+    (a, ya), (b, yb) = piv
+    if abs(ya - yb) / ya * 100 > tol or b - a < 3:
+        return False, f'no {name} (swings not equal within {tol}%)'
+    seg = df['High'].values[a:b + 1] if bull else df['Low'].values[a:b + 1]
+    neck = float(seg.max() if bull else seg.min())
+    n, ttol, sus = _pattern_common(c, 'f_dbl', 30)
+    ok, detail = _break_retest(df, idx, _flat_line(neck), bull, b, n, False, ttol, sus)
+    return ok, f'{name} neckline {neck:.2f}: {detail}'
+
+
+# ── Flag & pole (bull flag BUY / bear flag SELL) ─────────────────────────────
+def _flt_flag(df, idx, bull, c):
+    pole_pct = float(c.get('f_flag_pole_pct', 0.3))
+    pole_bars = int(c.get('f_flag_pole_bars', 10))
+    fmin, fmax = int(c.get('f_flag_min_bars', 3)), int(c.get('f_flag_max_bars', 15))
+    retr = float(c.get('f_flag_retrace', 50)) / 100.0
+    look = int(c.get('f_flag_lookback', 5))
+    hi, lo, cl = df['High'].values, df['Low'].values, df['Close'].values
+    for b in range(idx, max(idx - look, 0), -1):          # breakout bar
+        for flen in range(fmin, fmax + 1):
+            p = b - 1 - flen                               # last bar of the pole
+            ps = p - pole_bars
+            if ps < 1:
+                continue
+            fl = slice(p + 1, b)                           # flag bars
+            if bull:
+                pole_lo, pole_hi = lo[ps:p + 1].min(), hi[p]
+                if pole_hi < hi[ps:p + 1].max():
+                    continue
+                move = pole_hi - pole_lo
+                if move <= 0 or move / pole_lo * 100 < pole_pct:
+                    continue
+                f_hi, f_lo = hi[fl].max(), lo[fl].min()
+                if pole_hi - f_lo > retr * move or f_hi > pole_hi:
+                    continue
+                if cl[b] > f_hi and cl[b - 1] <= f_hi and cl[idx] > f_hi:
+                    return True, f'bull flag: pole {move:.1f} pts, flag {flen} bars, breakout {idx - b} bars ago'
+            else:
+                pole_hi, pole_lo = hi[ps:p + 1].max(), lo[p]
+                if pole_lo > lo[ps:p + 1].min():
+                    continue
+                move = pole_hi - pole_lo
+                if move <= 0 or move / pole_hi * 100 < pole_pct:
+                    continue
+                f_hi, f_lo = hi[fl].max(), lo[fl].min()
+                if f_hi - pole_lo > retr * move or f_lo < pole_lo:
+                    continue
+                if cl[b] < f_lo and cl[b - 1] >= f_lo and cl[idx] < f_lo:
+                    return True, f'bear flag: pole {move:.1f} pts, flag {flen} bars, breakdown {idx - b} bars ago'
+    return False, 'no flag & pole breakout'
+
+
+# ── EMA sustain ──────────────────────────────────────────────────────────────
+def _flt_ema_sustain(df, idx, bull, c):
+    p, k = int(c.get('f_emas_period', 20)), max(1, int(c.get('f_emas_bars', 3)))
+    ema = _cache(df, f'_F_EMA_{p}', lambda: tv_ema(df['Close'], p)).values
+    cl = df['Close'].values
+    if idx - k + 1 < 0 or np.isnan(ema[idx - k + 1]):
+        return False, 'EMA not available'
+    rng = range(idx - k + 1, idx + 1)
+    ok = all(cl[j] > ema[j] for j in rng) if bull else all(cl[j] < ema[j] for j in rng)
+    if ok and c.get('f_emas_slope', True) and idx >= 3:
+        ok = ema[idx] > ema[idx - 3] if bull else ema[idx] < ema[idx - 3]
+    return ok, f'{k} closes {"above" if bull else "below"} EMA{p} ({ema[idx]:.2f}): {ok}'
+
+
+# ── Volume increase + price increase ─────────────────────────────────────────
+def _flt_vol_price(df, idx, bull, c):
+    if not has_volume(df):
+        return True, 'no volume data for this ticker (filter skipped)'
+    p, mult = int(c.get('f_vp_period', 20)), float(c.get('f_vp_mult', 1.2))
+    vma = _cache(df, f'_F_VMA_{p}', lambda: tv_sma(df['Volume'], p)).values
+    v, cl = df['Volume'].values, df['Close'].values
+    if idx < 1 or np.isnan(vma[idx]):
+        return False, 'volume MA not available'
+    vol_up = v[idx] > v[idx - 1] and v[idx] >= mult * vma[idx]
+    px = cl[idx] > cl[idx - 1] if bull else cl[idx] < cl[idx - 1]
+    return vol_up and px, f'vol {v[idx]:,.0f} (prev {v[idx-1]:,.0f}, avg {vma[idx]:,.0f}), price {"up" if cl[idx] > cl[idx-1] else "down"}'
+
+
+# ── Trap filter ──────────────────────────────────────────────────────────────
+def _flt_trap(df, idx, bull, c):
+    """
+    Avoid traps   : BUY blocked after a failed breakout above a swing high (bull trap)
+                    or when the signal candle has a long rejection wick (mirror for SELL).
+    Trade the trap: BUY only after a bear trap (break below swing low, closed back above).
+    """
+    n = int(c.get('f_trap_lookback', 10))
+    mode = c.get('f_trap_mode', 'Avoid traps')
+    o, h, l, cl = (df[x].values for x in ('Open', 'High', 'Low', 'Close'))
+    lvl_h = df['Swing_High'].shift(1).values
+    lvl_l = df['Swing_Low'].shift(1).values
+    s = max(1, idx - n + 1)
+
+    def failed(up):
+        for j in range(s, idx + 1):
+            L = lvl_h[j] if up else lvl_l[j]
+            if np.isnan(L):
+                continue
+            if up and cl[j] > L and cl[j - 1] <= L and cl[j:idx + 1].min() < L:
+                return L
+            if (not up) and cl[j] < L and cl[j - 1] >= L and cl[j:idx + 1].max() > L:
+                return L
+        return None
+
+    if mode.startswith('Trade'):
+        L = failed(up=not bull)          # BUY after bear trap, SELL after bull trap
+        if L is None:
+            return False, f'no {"bear" if bull else "bull"} trap in last {n} bars'
+        ok = cl[idx] > L if bull else cl[idx] < L
+        return ok, f'{"bear" if bull else "bull"} trap at {L:.2f}, price reclaimed: {ok}'
+    L = failed(up=bull)
+    rng = h[idx] - l[idx]
+    wick = (h[idx] - max(o[idx], cl[idx])) if bull else (min(o[idx], cl[idx]) - l[idx])
+    wick_pct = wick / rng * 100 if rng > 0 else 0.0
+    max_wick = float(c.get('f_trap_wick_pct', 50))
+    ok = L is None and wick_pct <= max_wick
+    why = f'recent {"bull" if bull else "bear"} trap at {L:.2f}' if L is not None else 'no recent trap'
+    return ok, f'{why}, rejection wick {wick_pct:.0f}% (max {max_wick:g}%)'
+
+
+# ── CPR breakout / breakdown + sustain ───────────────────────────────────────
+def _flt_cpr(df, idx, bull, c):
+    if 'Prev_Day_High' not in df.columns:
+        add_session_columns(df)
+    H, L, C = (float(df[x].iloc[idx]) for x in ('Prev_Day_High', 'Prev_Day_Low', 'Prev_Session_Close'))
+    if any(np.isnan(v) for v in (H, L, C)):
+        return False, 'previous day not available'
+    P = (H + L + C) / 3
+    BC = (H + L) / 2
+    TC = 2 * P - BC
+    top, bot = max(TC, BC), min(TC, BC)
+    width_pct = (top - bot) / P * 100
+    max_w = float(c.get('f_cpr_max_width', 0.0))
+    if max_w > 0 and width_pct > max_w:
+        return False, f'CPR width {width_pct:.3f}% > {max_w}% (wide CPR)'
+    n, tol, sus = _pattern_common(c, 'f_cpr', 30)
+    level = top if bull else bot
+    if c.get('f_cpr_need_break', True):
+        ok, detail = _break_retest(df, idx, _flat_line(level), bull, 0, n,
+                                   c.get('f_cpr_retest', False), tol, max(sus, 1))
+    else:
+        cl = df['Close'].values
+        rng = range(max(0, idx - sus + 1), idx + 1)
+        ok = all(cl[j] > level for j in rng) if bull else all(cl[j] < level for j in rng)
+        detail = f'{sus} closes {"above TC" if bull else "below BC"}: {ok}'
+    return ok, f'CPR {bot:.2f}–{top:.2f} (P {P:.2f}, width {width_pct:.3f}%): {detail}'
+
+
+# ── Inversion Fair Value Gap ─────────────────────────────────────────────────
+def _flt_ifvg(df, idx, bull, c):
+    """
+    BUY : a BEARISH FVG was invalidated (close above its top) → flips to support,
+          price still above it (optionally retested).
+    SELL: a BULLISH FVG was invalidated (close below its bottom) → flips to resistance.
+    """
+    n = int(c.get('f_ifvg_lookback', 30))
+    need_retest = c.get('f_ifvg_retest', False)
+    lo, hi, cl = df['Low'].values, df['High'].values, df['Close'].values
+    for k in range(idx - 1, max(1, idx - n), -1):
+        if k < 2:
+            break
+        if bull and hi[k] < lo[k - 2]:                    # bearish FVG
+            bottom, top = hi[k], lo[k - 2]
+            inv = next((j for j in range(k + 1, idx + 1) if cl[j] > top), None)
+            if inv is None or cl[idx] <= top:
+                continue
+            if need_retest and not any(lo[j] <= top for j in range(inv + 1, idx + 1)):
+                continue
+            return True, f'bearish FVG {bottom:.2f}–{top:.2f} inverted {idx - inv} bars ago (now support)'
+        if (not bull) and lo[k] > hi[k - 2]:              # bullish FVG
+            bottom, top = hi[k - 2], lo[k]
+            inv = next((j for j in range(k + 1, idx + 1) if cl[j] < bottom), None)
+            if inv is None or cl[idx] >= bottom:
+                continue
+            if need_retest and not any(hi[j] >= bottom for j in range(inv + 1, idx + 1)):
+                continue
+            return True, f'bullish FVG {bottom:.2f}–{top:.2f} inverted {idx - inv} bars ago (now resistance)'
+    return False, 'no inversion FVG'
+
+
+# ── Keltner Channel (TradingView: EMA basis, EMA of True Range) ──────────────
+def _flt_keltner(df, idx, bull, c):
+    p, m = int(c.get('f_kc_period', 20)), float(c.get('f_kc_mult', 2.0))
+    key = f'_F_KC_{p}_{m}'
+    if key + '_M' not in df.columns:
+        basis = tv_ema(df['Close'], p)
+        rng = tv_ema(tv_true_range(df, handle_na=True), p)
+        df[key + '_M'], df[key + '_U'], df[key + '_L'] = basis, basis + m * rng, basis - m * rng
+    mid, up, lo = (float(df[key + s].iloc[idx]) for s in ('_M', '_U', '_L'))
+    if np.isnan(mid) or np.isnan(up):
+        return False, 'Keltner not available'
+    cl = float(df['Close'].iloc[idx])
+    mode = c.get('f_kc_mode', 'Price on trend side of basis')
+    if mode.startswith('Breakout'):
+        ok = cl > up if bull else cl < lo
+    elif mode.startswith('Inside'):
+        ok = lo < cl < up
+    else:
+        ok = cl > mid if bull else cl < mid
+    return ok, f'KC {lo:.2f}/{mid:.2f}/{up:.2f}, close {cl:.2f}'
+
+
+# ── Donchian Channel ─────────────────────────────────────────────────────────
+def _flt_donchian(df, idx, bull, c):
+    p = int(c.get('f_dc_period', 20))
+    key = f'_F_DC_{p}'
+    if key + '_U' not in df.columns:
+        df[key + '_U'] = df['High'].rolling(p).max()
+        df[key + '_L'] = df['Low'].rolling(p).min()
+    up, lo = df[key + '_U'].values, df[key + '_L'].values
+    if idx < 1 or np.isnan(up[idx - 1]):
+        return False, 'Donchian not available'
+    cl = float(df['Close'].iloc[idx])
+    if c.get('f_dc_mode', 'Breakout of previous channel').startswith('Breakout'):
+        ok = cl > up[idx - 1] if bull else cl < lo[idx - 1]
+        return ok, f'prev channel {lo[idx-1]:.2f}–{up[idx-1]:.2f}, close {cl:.2f}'
+    mid = (up[idx] + lo[idx]) / 2
+    ok = cl > mid if bull else cl < mid
+    return ok, f'channel mid {mid:.2f}, close {cl:.2f}'
+
+
+# ── Ichimoku (TradingView defaults 9/26/52, displacement 26) ─────────────────
+def _flt_ichimoku(df, idx, bull, c):
+    key = '_F_ICHI'
+    if key + '_A' not in df.columns:
+        def dc(n):
+            return (df['High'].rolling(n).max() + df['Low'].rolling(n).min()) / 2
+        conv, base = dc(9), dc(26)
+        df[key + '_T'], df[key + '_K'] = conv, base
+        df[key + '_A'] = ((conv + base) / 2).shift(25)    # cloud value at the current bar
+        df[key + '_B'] = dc(52).shift(25)
+    t, k, a, b = (float(df[key + s].iloc[idx]) for s in ('_T', '_K', '_A', '_B'))
+    if any(np.isnan(v) for v in (t, k, a, b)):
+        return False, 'Ichimoku not available'
+    cl = float(df['Close'].iloc[idx])
+    top, bot = max(a, b), min(a, b)
+    ok = cl > top if bull else cl < bot
+    parts = [f'cloud {bot:.2f}–{top:.2f}']
+    if c.get('f_ichi_tk', True):
+        ok = ok and (t > k if bull else t < k)
+        parts.append(f'Tenkan {t:.2f} / Kijun {k:.2f}')
+    if c.get('f_ichi_chikou', False) and idx >= 25:
+        past = float(df['Close'].iloc[idx - 25])
+        ok = ok and (cl > past if bull else cl < past)
+        parts.append(f'Chikou vs price 26 bars ago {past:.2f}')
+    if c.get('f_ichi_future', False):
+        fa, fb = (t + k) / 2, float(((df['High'].rolling(52).max() + df['Low'].rolling(52).min()) / 2).iloc[idx])
+        ok = ok and (fa > fb if bull else fa < fb)
+        parts.append('future cloud ' + ('green' if fa > fb else 'red'))
+    return ok, ', '.join(parts)
+
+
+# ── Heikin-Ashi trend ────────────────────────────────────────────────────────
+def _flt_heikin(df, idx, bull, c):
+    key = '_F_HA'
+    if key + '_C' not in df.columns:
+        o, h, l, cl = (df[x].values for x in ('Open', 'High', 'Low', 'Close'))
+        hac = (o + h + l + cl) / 4
+        hao = np.empty(len(o))
+        hao[0] = (o[0] + cl[0]) / 2
+        for i in range(1, len(o)):
+            hao[i] = (hao[i - 1] + hac[i - 1]) / 2
+        df[key + '_O'], df[key + '_C'] = hao, hac
+    k = max(1, int(c.get('f_ha_bars', 2)))
+    hao, hac = df[key + '_O'].values, df[key + '_C'].values
+    rng = range(max(0, idx - k + 1), idx + 1)
+    ok = all(hac[j] > hao[j] for j in rng) if bull else all(hac[j] < hao[j] for j in rng)
+    return ok, f'last {k} Heikin-Ashi candles {"green" if bull else "red"}: {ok}'
+
+
+ENTRY_FILTERS.update({
+    'f_tl_break':   ('Pattern: Trendline Breakout / Breakdown', _flt_tl_break),
+    'f_tl_retest':  ('Pattern: Trendline Breakout + Retest + Sustain', _flt_tl_retest),
+    'f_sr_retest':  ('Pattern: Support / Resistance Breakout + Retest + Sustain', _flt_sr_retest),
+    'f_triangle':   ('Pattern: Triangle (pattern / breakout / retest)', _flt_triangle),
+    'f_wedge':      ('Pattern: Falling Wedge (BUY) / Rising Wedge (SELL)', _flt_wedge),
+    'f_hs':         ('Pattern: Inverse H&S (BUY) / Head & Shoulders (SELL)', _flt_hs),
+    'f_double':     ('Pattern: Double Bottom (BUY) / Double Top (SELL)', _flt_double),
+    'f_flag':       ('Pattern: Flag & Pole (Bull / Bear Flag)', _flt_flag),
+    'f_ema_sustain':('EMA Sustain (closes held above / below EMA)', _flt_ema_sustain),
+    'f_vol_price':  ('Volume Increase + Price Increase', _flt_vol_price),
+    'f_trap':       ('Trap Filter (bull / bear trap)', _flt_trap),
+    'f_cpr':        ('CPR Breakout / Breakdown + Sustain', _flt_cpr),
+    'f_ifvg':       ('SMC: Inversion Fair Value Gap (IFVG)', _flt_ifvg),
+    'f_keltner':    ('Keltner Channel Filter', _flt_keltner),
+    'f_donchian':   ('Donchian Channel Filter', _flt_donchian),
+    'f_ichimoku':   ('Ichimoku Cloud Filter', _flt_ichimoku),
+    'f_heikin':     ('Heikin-Ashi Trend Filter', _flt_heikin),
+})
+
+
 def check_entry_filters(df, idx, signal, config):
     """
     Evaluate every ENABLED additional entry filter for the raw strategy signal.
@@ -4096,6 +4638,102 @@ def render_entry_filters_ui(config):
             config['f_stoch_os'] = c2.number_input("OS", 0.0, 50.0, 20.0, key="f_sto_os")
         if chk('f_candle', "Signal candle body ≥ X% of its range and in the signal direction."):
             config['f_candle_body_pct'] = st.number_input("Min body % of range", 0.0, 100.0, 60.0, key="f_cdl")
+
+        st.markdown("**📐 Chart Patterns** (built from confirmed swings – see Swing Detection)")
+
+        def common(prefix, look_default, sus_default=1, retest_tol=True):
+            c1, c2, c3 = st.columns(3)
+            config[f'{prefix}_lookback'] = c1.number_input("Within N bars", 1, 500, look_default, key=f"{prefix}_n")
+            config[f'{prefix}_sustain'] = c2.number_input("Sustain bars", 1, 50, sus_default, key=f"{prefix}_k")
+            if retest_tol:
+                config[f'{prefix}_tol'] = c3.number_input("Retest tol %", 0.0, 5.0, 0.05, step=0.01,
+                                                          format="%.3f", key=f"{prefix}_t")
+
+        if chk('f_tl_break', "BUY: close breaks above the falling trendline through the last 2 swing highs. "
+                             "SELL: close breaks below the rising trendline through the last 2 swing lows."):
+            common('f_tlb', 20, 1, retest_tol=False)
+        if chk('f_tl_retest', "Trendline broken, price came back to the line, held it, and closed beyond it "
+                              "for the sustain bars."):
+            common('f_tlr', 40, 2)
+        if chk('f_sr_retest', "BUY: a recent swing-high resistance broke, was retested and held. "
+                              "SELL: a swing-low support broke, was retested and held."):
+            config['f_srr_mode'] = st.selectbox("S/R condition", ["Breakout + Retest + Sustain", "Breakout + Sustain"],
+                                                key="f_srr_mode")
+            config['f_srr_levels'] = st.number_input("Swing levels to check", 1, 20, 5, key="f_srr_lv")
+            common('f_srr', 40, 2)
+        if chk('f_triangle', "Symmetrical / ascending / descending triangle from the last 2 swing highs + 2 swing lows."):
+            config['f_tri_mode'] = st.selectbox("Triangle condition", ["Breakout / Breakdown",
+                                                                       "Breakout + Retest + Sustain",
+                                                                       "Pattern present (price inside)"], key="f_tri_mode")
+            config['f_tri_flat_tol'] = st.number_input("Flat side tolerance %", 0.0, 2.0, 0.05, step=0.01,
+                                                       format="%.3f", key="f_tri_flat")
+            common('f_tri', 30, 1)
+        if chk('f_wedge', "Falling wedge (converging, both lines down) breakout confirms BUY; "
+                          "rising wedge breakdown confirms SELL."):
+            config['f_wedge_mode'] = st.selectbox("Wedge condition", ["Breakout required", "Pattern present (price inside)"],
+                                                  key="f_wedge_mode")
+            common('f_wedge', 20, 1, retest_tol=False)
+        if chk('f_hs', "Inverse H&S neckline breakout confirms BUY; H&S neckline breakdown confirms SELL."):
+            config['f_hs_shoulder_tol'] = st.number_input("Shoulder equality tol %", 0.0, 10.0, 1.0, step=0.1, key="f_hs_st")
+            config['f_hs_retest'] = st.checkbox("Require neckline retest", False, key="f_hs_rt")
+            common('f_hs', 30, 1)
+        if chk('f_double', "Double bottom neckline breakout confirms BUY; double top neckline breakdown confirms SELL."):
+            config['f_dbl_tol'] = st.number_input("Equal swing tol %", 0.0, 5.0, 0.15, step=0.05, key="f_dbl_t2")
+            common('f_dbl', 30, 1, retest_tol=False)
+        if chk('f_flag', "Strong pole, tight counter-trend flag, then breakout of the flag."):
+            c1, c2 = st.columns(2)
+            config['f_flag_pole_pct'] = c1.number_input("Min pole move %", 0.01, 20.0, 0.3, step=0.05, key="f_flag_pp")
+            config['f_flag_pole_bars'] = c2.number_input("Pole bars", 2, 100, 10, key="f_flag_pb")
+            config['f_flag_min_bars'] = c1.number_input("Flag min bars", 2, 100, 3, key="f_flag_fmin")
+            config['f_flag_max_bars'] = c2.number_input("Flag max bars", 2, 200, 15, key="f_flag_fmax")
+            config['f_flag_retrace'] = c1.number_input("Max flag retrace %", 5.0, 100.0, 50.0, key="f_flag_rt")
+            config['f_flag_lookback'] = c2.number_input("Breakout within N bars", 1, 50, 5, key="f_flag_n")
+
+        st.markdown("**📏 Levels, Channels & Confirmation**")
+        if chk('f_ema_sustain', "Last N closes above the EMA (BUY) / below it (SELL)."):
+            c1, c2 = st.columns(2)
+            config['f_emas_period'] = c1.number_input("EMA period", 1, 500, 20, key="f_emas_p")
+            config['f_emas_bars'] = c2.number_input("Sustain closes", 1, 50, 3, key="f_emas_k")
+            config['f_emas_slope'] = st.checkbox("Also require EMA sloping in signal direction", True, key="f_emas_s")
+        if chk('f_vol_price', "Volume higher than previous candle and ≥ N × average, with price moving in signal "
+                              "direction. Skipped for indices (no volume)."):
+            c1, c2 = st.columns(2)
+            config['f_vp_period'] = c1.number_input("Vol avg period", 1, 200, 20, key="f_vp_p")
+            config['f_vp_mult'] = c2.number_input("N × avg", 0.1, 20.0, 1.2, step=0.1, key="f_vp_m")
+        if chk('f_trap', "Avoid traps: block entries after a failed breakout or on a long rejection wick. "
+                         "Trade the trap: BUY only after a bear trap, SELL only after a bull trap."):
+            config['f_trap_mode'] = st.selectbox("Trap mode", ["Avoid traps", "Trade the trap (reversal)"], key="f_trap_mode")
+            c1, c2 = st.columns(2)
+            config['f_trap_lookback'] = c1.number_input("Lookback bars", 2, 200, 10, key="f_trap_n")
+            config['f_trap_wick_pct'] = c2.number_input("Max rejection wick %", 0.0, 100.0, 50.0, key="f_trap_w")
+        if chk('f_cpr', "BUY: price broke above CPR top (TC) and held. SELL: broke below CPR bottom (BC) and held. "
+                        "CPR from previous session's H/L/C."):
+            config['f_cpr_need_break'] = st.checkbox("Require the break (cross) within N bars", True, key="f_cpr_b")
+            config['f_cpr_retest'] = st.checkbox("Require retest of CPR", False, key="f_cpr_r")
+            config['f_cpr_max_width'] = st.number_input("Max CPR width % (0 = off, narrow CPR only)", 0.0, 5.0, 0.0,
+                                                        step=0.01, format="%.3f", key="f_cpr_w")
+            common('f_cpr', 30, 2)
+        if chk('f_ifvg', "BUY: a bearish FVG was closed through and now acts as support. "
+                         "SELL: a bullish FVG was closed through and now acts as resistance. "
+                         "(Plain FVG filter is in the SMC section above.)"):
+            config['f_ifvg_lookback'] = st.number_input("FVG within last N bars", 3, 500, 30, key="f_ifvg_n")
+            config['f_ifvg_retest'] = st.checkbox("Require retest of the inverted gap", False, key="f_ifvg_r")
+        if chk('f_keltner', "TradingView Keltner Channel (EMA basis, EMA of True Range)."):
+            c1, c2 = st.columns(2)
+            config['f_kc_period'] = c1.number_input("KC length", 1, 200, 20, key="f_kc_p")
+            config['f_kc_mult'] = c2.number_input("KC multiplier", 0.1, 10.0, 2.0, step=0.1, key="f_kc_m")
+            config['f_kc_mode'] = st.selectbox("KC condition", ["Price on trend side of basis", "Breakout beyond band",
+                                                                "Inside channel (avoid extremes)"], key="f_kc_mode")
+        if chk('f_donchian', "BUY: close above previous N-bar high (or above mid). SELL: mirror."):
+            config['f_dc_period'] = st.number_input("Donchian length", 2, 500, 20, key="f_dc_p")
+            config['f_dc_mode'] = st.selectbox("Donchian condition", ["Breakout of previous channel",
+                                                                      "Above / below middle line"], key="f_dc_mode")
+        if chk('f_ichimoku', "BUY: price above the cloud (SELL: below), with optional TK / Chikou / future cloud checks."):
+            config['f_ichi_tk'] = st.checkbox("Require Tenkan > Kijun (BUY) / < (SELL)", True, key="f_ichi_tk")
+            config['f_ichi_chikou'] = st.checkbox("Require Chikou above/below price 26 bars ago", False, key="f_ichi_ch")
+            config['f_ichi_future'] = st.checkbox("Require future cloud colour in signal direction", False, key="f_ichi_fu")
+        if chk('f_heikin', "Last N Heikin-Ashi candles green (BUY) / red (SELL)."):
+            config['f_ha_bars'] = st.number_input("HA candles", 1, 20, 2, key="f_ha_k")
 
         n_on = len(enabled_filter_labels(config))
         st.caption(f"✅ {n_on} filter(s) enabled" if n_on else "No additional filters enabled")
