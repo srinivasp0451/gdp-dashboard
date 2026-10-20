@@ -15228,6 +15228,1418 @@ def tab_custom_screener(cfg: dict) -> None:
     render_analyst_panel("cust", "these custom indicator results", _frame_context(frame))
 
 
+# =============================================================================
+# SECTION 19k -- MAKE OR BREAK SCREENER
+# =============================================================================
+# Tickers standing at a decision, as opposed to tickers that have already
+# decided. The Chart Patterns tab answers "what pattern COMPLETED"; this one
+# answers "what is coiled, pressed against a level, or has just been shaken out
+# and is about to resolve".
+#
+# WHAT A READINESS SCORE IS AND IS NOT. Each detector returns 0-100 for how
+# textbook its own shape currently looks -- how tight the compression, how many
+# times the level held, how close price sits to the trigger. It is a measure of
+# how WELL FORMED the setup is, not of how likely it is to work. A perfect
+# ascending triangle at the apex scores high and then breaks the wrong way
+# often enough to ruin anyone who mistakes the two. The tab says so, and the
+# levels it proposes are the structure's own, not a forecast.
+
+
+@dataclass
+class MBContext:
+    """Everything the detectors share, computed once per ticker/timeframe."""
+    frame: pd.DataFrame
+    closed: pd.DataFrame
+    price: float
+    atr: float
+    highs: np.ndarray
+    lows: np.ndarray
+    closes: np.ndarray
+    volumes: np.ndarray
+    pivot_highs: list
+    pivot_lows: list
+    range_high: float
+    range_low: float
+    lookback: int
+    tol: float                  # level tolerance in price units
+    rsi_now: float
+    vol_ratio: float
+    vol_trend: float            # recent volume over earlier volume, <1 = drying up
+    compression: float          # current range over its own historical median
+
+
+def _mb_pivots(highs: np.ndarray, lows: np.ndarray, left: int, right: int):
+    """
+    Confirmed swing pivots, strictly higher/lower than the bars before them.
+
+    Strict on the left and non-strict on the right, the same convention the
+    liquidity-sweep detector uses: a non-strict test on both sides turns every
+    bar of a flat stretch into a pivot.
+    """
+    pivot_highs, pivot_lows = [], []
+    for p in range(left, len(highs) - right):
+        before_h, after_h = highs[p - left:p], highs[p + 1:p + right + 1]
+        before_l, after_l = lows[p - left:p], lows[p + 1:p + right + 1]
+        if len(before_h) and len(after_h) and highs[p] > before_h.max() \
+                and highs[p] >= after_h.max():
+            pivot_highs.append((p, float(highs[p])))
+        if len(before_l) and len(after_l) and lows[p] < before_l.min() \
+                and lows[p] <= after_l.min():
+            pivot_lows.append((p, float(lows[p])))
+    return pivot_highs, pivot_lows
+
+
+def mb_context(df: pd.DataFrame, lookback: int = 120, pivot: int = 3,
+               tol_atr: float = 0.5) -> MBContext | None:
+    """Precompute the shared measurements. Returns None when history is short."""
+    closed = df.iloc[:-1] if len(df) > 2 else df
+    if len(closed) < max(40, lookback // 3):
+        return None
+    window = closed.tail(int(lookback))
+    highs = window["High"].to_numpy(float)
+    lows = window["Low"].to_numpy(float)
+    closes = window["Close"].to_numpy(float)
+    volumes = window["Volume"].fillna(0.0).to_numpy(float)
+
+    atr_now = _last(atr(closed["High"], closed["Low"], closed["Close"], 14))
+    price = float(closes[-1])
+    if not np.isfinite(atr_now) or atr_now <= 0:
+        atr_now = max(price * 0.004, 1e-9)
+
+    pivot_highs, pivot_lows = _mb_pivots(highs, lows, int(pivot), int(pivot))
+
+    # Compression: this window's span against the median span of equal windows
+    # earlier in the series. Below 1 the market is quieter than its own norm.
+    span_now = float(highs.max() - lows.min())
+    spans = []
+    step = max(len(closed) // 12, 5)
+    for end in range(len(closed) - len(window), 0, -step):
+        chunk = closed.iloc[max(end - len(window), 0):end]
+        if len(chunk) >= len(window) // 2:
+            spans.append(float(chunk["High"].max() - chunk["Low"].min()))
+    median_span = float(np.median(spans)) if spans else span_now
+    compression = span_now / median_span if median_span > 0 else 1.0
+
+    has_volume = float(np.abs(volumes).sum()) > 0
+    half = max(len(volumes) // 4, 1)
+    vol_recent = float(volumes[-half:].mean()) if has_volume else float("nan")
+    vol_earlier = float(volumes[:-half].mean()) if has_volume and len(volumes) > half \
+        else float("nan")
+    vol_avg = float(volumes.mean()) if has_volume else float("nan")
+
+    return MBContext(
+        frame=df, closed=closed, price=price, atr=float(atr_now),
+        highs=highs, lows=lows, closes=closes, volumes=volumes,
+        pivot_highs=pivot_highs, pivot_lows=pivot_lows,
+        range_high=float(highs.max()), range_low=float(lows.min()),
+        lookback=len(window), tol=float(tol_atr) * float(atr_now),
+        rsi_now=_last(rsi(closed["Close"], 14)),
+        vol_ratio=(float(volumes[-1]) / vol_avg) if (has_volume and vol_avg) else float("nan"),
+        vol_trend=(vol_recent / vol_earlier) if (has_volume and vol_earlier) else float("nan"),
+        compression=compression)
+
+
+def _touches(levels: np.ndarray, level: float, tol: float) -> int:
+    """How many bars came within `tol` of a level."""
+    if not np.isfinite(level):
+        return 0
+    return int(np.sum(np.abs(levels - level) <= tol))
+
+
+def _hit(setup, direction, score, reading, trigger=None, invalidation=None,
+         objective=None, extras=None) -> dict:
+    out = {"setup": setup, "direction": direction, "score": float(max(0.0, min(100.0, score))),
+           "reading": reading, "trigger": trigger, "invalidation": invalidation,
+           "objective": objective}
+    out.update(extras or {})
+    return out
+
+
+# --- the shapes -------------------------------------------------------------
+def mb_inverted_v(ctx: MBContext):
+    """
+    Rose, topped, and came all the way back to where the move began.
+
+    The operator's own description: "a ticker went up and then returned and
+    reached exact location". From there it can go down, up, or sideways -- the
+    point is that the entire advance has been given back, which is a decision
+    rather than a trend.
+    """
+    peak_i = int(np.argmax(ctx.highs))
+    if peak_i < 5 or peak_i > len(ctx.highs) - 4:
+        return None
+    base_i = int(np.argmin(ctx.lows[:peak_i]))
+    base = float(ctx.lows[base_i])
+    peak = float(ctx.highs[peak_i])
+    rise = peak - base
+    if rise < 3.0 * ctx.atr:
+        return None
+    back = abs(ctx.price - base)
+    if back > 1.5 * ctx.atr:
+        return None
+    retrace = (peak - ctx.price) / rise if rise > 0 else 0.0
+    score = 55.0 + 30.0 * min(rise / (6.0 * ctx.atr), 1.0) + 15.0 * (1.0 - back / (1.5 * ctx.atr))
+    return _hit("Inverted V (round top)", "EITHER", score,
+                f"rose {fmt(rise)} from {fmt(base)} to {fmt(peak)} and has given back "
+                f"{retrace * 100:.0f}% of it, sitting {fmt(back)} from where the move began",
+                trigger=base, invalidation=peak, objective=base - rise * 0.5,
+                extras={"pivot_high": peak, "pivot_low": base})
+
+
+def mb_v_bottom(ctx: MBContext):
+    """Fell, bottomed, and has climbed back to the level it fell from."""
+    trough_i = int(np.argmin(ctx.lows))
+    if trough_i < 5 or trough_i > len(ctx.lows) - 4:
+        return None
+    start_i = int(np.argmax(ctx.highs[:trough_i]))
+    start = float(ctx.highs[start_i])
+    trough = float(ctx.lows[trough_i])
+    fall = start - trough
+    if fall < 3.0 * ctx.atr:
+        return None
+    back = abs(ctx.price - start)
+    if back > 1.5 * ctx.atr:
+        return None
+    score = 55.0 + 30.0 * min(fall / (6.0 * ctx.atr), 1.0) + 15.0 * (1.0 - back / (1.5 * ctx.atr))
+    return _hit("V bottom (round bottom)", "EITHER", score,
+                f"fell {fmt(fall)} from {fmt(start)} to {fmt(trough)} and has recovered the "
+                f"whole move, sitting {fmt(back)} from where the fall began",
+                trigger=start, invalidation=trough, objective=start + fall * 0.5,
+                extras={"pivot_high": start, "pivot_low": trough})
+
+
+def mb_at_resistance(ctx: MBContext):
+    """Pressed against the top of its range, with the level repeatedly tested."""
+    level = ctx.range_high
+    distance = level - ctx.price
+    if distance < -ctx.tol or distance > 1.5 * ctx.atr:
+        return None
+    hits = _touches(ctx.highs, level, ctx.tol)
+    if hits < 2:
+        return None
+    height = ctx.range_high - ctx.range_low
+    score = 45.0 + 8.0 * min(hits, 5) + 15.0 * (1.0 - min(distance / (1.5 * ctx.atr), 1.0))
+    return _hit("At resistance (about to break out)", "UP", score,
+                f"price is {fmt(max(distance, 0))} under {fmt(level)}, a level touched "
+                f"{hits} time(s) in {ctx.lookback} candles",
+                trigger=level + 0.25 * ctx.atr, invalidation=level - 1.5 * ctx.atr,
+                objective=level + height, extras={"touches": hits, "level": level})
+
+
+def mb_at_support(ctx: MBContext):
+    """Pressed against the bottom of its range."""
+    level = ctx.range_low
+    distance = ctx.price - level
+    if distance < -ctx.tol or distance > 1.5 * ctx.atr:
+        return None
+    hits = _touches(ctx.lows, level, ctx.tol)
+    if hits < 2:
+        return None
+    height = ctx.range_high - ctx.range_low
+    score = 45.0 + 8.0 * min(hits, 5) + 15.0 * (1.0 - min(distance / (1.5 * ctx.atr), 1.0))
+    return _hit("At support (about to break down)", "DOWN", score,
+                f"price is {fmt(max(distance, 0))} above {fmt(level)}, a level touched "
+                f"{hits} time(s) in {ctx.lookback} candles",
+                trigger=level - 0.25 * ctx.atr, invalidation=level + 1.5 * ctx.atr,
+                objective=level - height, extras={"touches": hits, "level": level})
+
+
+def mb_multi_touch(ctx: MBContext):
+    """A level tested three or more times from the same side."""
+    # Counted on PIVOTS, not on every bar, and the touches must sit tightly on
+    # one price. Counting bars inside a half-ATR band meant a sine wave's whole
+    # upper shoulder registered as "touches", so this fired on every shape in
+    # the bench; a level nobody can point to is not a level.
+    band = 0.3 * ctx.atr
+    best = None
+    for pivots, side, label in ((ctx.pivot_highs, "UP", "resistance"),
+                                (ctx.pivot_lows, "DOWN", "support")):
+        if len(pivots) < 3:
+            continue
+        values = np.array([v for _p, v in pivots], float)
+        extreme = values.max() if side == "UP" else values.min()
+        near = values[np.abs(values - extreme) <= band]
+        if len(near) < 3:
+            continue
+        spread = float(near.std())
+        if spread > 0.25 * ctx.atr:
+            continue                      # the touches are not on one price
+        candidate = float(near.mean())
+        if abs(ctx.price - candidate) > 4.0 * ctx.atr:
+            continue                      # too far away to be the live question
+        if best is None or len(near) > best[0]:
+            best = (int(len(near)), candidate, side, label)
+    if best is None:
+        return None
+    hits, level, side, label = best
+    height = ctx.range_high - ctx.range_low
+    away = abs(ctx.price - level)
+    score = 40.0 + 10.0 * min(hits, 6) - 10.0 * min(away / (3.0 * ctx.atr), 1.0)
+    return _hit(f"Multi-touch {label} ({hits} hits)", side, score,
+                f"{hits} touches of {fmt(level)} within {fmt(ctx.tol)}; price is "
+                f"{fmt(away)} away. The more often a level is tested the thinner it gets",
+                trigger=level + (0.25 * ctx.atr if side == "UP" else -0.25 * ctx.atr),
+                invalidation=level - (1.5 * ctx.atr if side == "UP" else -1.5 * ctx.atr),
+                objective=level + (height if side == "UP" else -height),
+                extras={"touches": hits, "level": level})
+
+
+def mb_compression(ctx: MBContext):
+    """A long quiet stretch: range well below its own historical norm."""
+    if not np.isfinite(ctx.compression) or ctx.compression > 0.6:
+        return None
+    quiet = ""
+    if np.isfinite(ctx.vol_trend) and ctx.vol_trend < 0.9:
+        quiet = f"; volume is drying up ({ctx.vol_trend:.2f}x its earlier average)"
+    height = ctx.range_high - ctx.range_low
+    score = 50.0 + 45.0 * (1.0 - ctx.compression / 0.6)
+    return _hit("Compression / accumulation zone", "EITHER", score,
+                f"the last {ctx.lookback} candles span {fmt(height)}, only "
+                f"{ctx.compression:.2f}x this instrument's usual range{quiet}",
+                trigger=ctx.range_high + 0.25 * ctx.atr,
+                invalidation=ctx.range_low - 0.25 * ctx.atr,
+                objective=ctx.range_high + height,
+                extras={"level": ctx.range_high, "lower": ctx.range_low})
+
+
+def mb_triangle(ctx: MBContext):
+    """Converging highs and lows, with the apex close."""
+    if len(ctx.pivot_highs) < 2 or len(ctx.pivot_lows) < 2:
+        return None
+    hx = np.array([p for p, _v in ctx.pivot_highs], float)
+    hy = np.array([v for _p, v in ctx.pivot_highs], float)
+    lx = np.array([p for p, _v in ctx.pivot_lows], float)
+    ly = np.array([v for _p, v in ctx.pivot_lows], float)
+    try:
+        hs = float(np.polyfit(hx, hy, 1)[0])
+        ls = float(np.polyfit(lx, ly, 1)[0])
+    except Exception:                                               # noqa: BLE001
+        return None
+    if not (np.isfinite(hs) and np.isfinite(ls)):
+        return None
+    converging = (hs < 0 and ls > 0) or (abs(hs) < 1e-9 and ls > 0) or \
+                 (hs < 0 and abs(ls) < 1e-9)
+    if not converging:
+        return None
+    gap_now = float(ctx.highs[-10:].max() - ctx.lows[-10:].min())
+    gap_then = float(ctx.highs[:20].max() - ctx.lows[:20].min())
+    if gap_then <= 0 or gap_now / gap_then > 0.7:
+        return None
+    kind = ("Symmetrical" if hs < 0 and ls > 0 else
+            "Descending" if hs < 0 else "Ascending")
+    height = gap_then
+    score = 50.0 + 45.0 * (1.0 - gap_now / gap_then)
+    return _hit(f"{kind} triangle at the apex", "EITHER", score,
+                f"highs sloping {hs:+.4f} and lows {ls:+.4f} per candle have narrowed the "
+                f"range from {fmt(gap_then)} to {fmt(gap_now)}",
+                trigger=float(ctx.highs[-10:].max()) + 0.25 * ctx.atr,
+                invalidation=float(ctx.lows[-10:].min()) - 0.25 * ctx.atr,
+                objective=float(ctx.highs[-10:].max()) + height,
+                extras={"level": float(ctx.highs[-10:].max()),
+                        "lower": float(ctx.lows[-10:].min())})
+
+
+def _prior_extreme(ctx: MBContext, bars_back: int):
+    cut = max(len(ctx.highs) - bars_back, 10)
+    return float(ctx.highs[:cut].max()), float(ctx.lows[:cut].min())
+
+
+def mb_breakout_retest(ctx: MBContext):
+    """Broke above an old high, came back to it, and is holding."""
+    old_high, _ = _prior_extreme(ctx, 20)
+    recent_max = float(ctx.highs[-20:].max())
+    if recent_max <= old_high + 0.5 * ctx.atr:
+        return None                                   # no break happened
+    if ctx.price < old_high - 0.5 * ctx.atr:
+        return None                                   # fell back through: not holding
+    if ctx.price > old_high + 2.0 * ctx.atr:
+        return None                                   # already gone, no retest
+    score = 60.0 + 30.0 * (1.0 - abs(ctx.price - old_high) / (2.0 * ctx.atr))
+    return _hit("Breakout, retest holding", "UP", score,
+                f"broke {fmt(old_high)} (high was {fmt(recent_max)}) and has come back to "
+                f"{fmt(ctx.price)}, still above the level it broke",
+                trigger=ctx.price + 0.25 * ctx.atr, invalidation=old_high - 0.75 * ctx.atr,
+                objective=ctx.price + (recent_max - old_high) * 2.0,
+                extras={"level": old_high})
+
+
+def mb_breakdown_retest(ctx: MBContext):
+    """Broke below an old low, came back to it, and is being rejected."""
+    _, old_low = _prior_extreme(ctx, 20)
+    recent_min = float(ctx.lows[-20:].min())
+    if recent_min >= old_low - 0.5 * ctx.atr:
+        return None
+    if ctx.price > old_low + 0.5 * ctx.atr:
+        return None
+    if ctx.price < old_low - 2.0 * ctx.atr:
+        return None
+    score = 60.0 + 30.0 * (1.0 - abs(ctx.price - old_low) / (2.0 * ctx.atr))
+    return _hit("Breakdown, retest rejecting", "DOWN", score,
+                f"broke {fmt(old_low)} (low was {fmt(recent_min)}) and has come back to "
+                f"{fmt(ctx.price)}, still below the level it broke",
+                trigger=ctx.price - 0.25 * ctx.atr, invalidation=old_low + 0.75 * ctx.atr,
+                objective=ctx.price - (old_low - recent_min) * 2.0,
+                extras={"level": old_low})
+
+
+def mb_equal_highs(ctx: MBContext):
+    """Two or more highs at the same price: a pool of stops sitting above."""
+    if len(ctx.pivot_highs) < 2:
+        return None
+    # The LAST few pivots only, and within a quarter-ATR. "Equal highs" means a
+    # pair a trader could point at, not any two peaks of a sine wave that
+    # happen to land inside a half-ATR band.
+    recent = np.array([v for _p, v in ctx.pivot_highs[-4:]], float)
+    top = float(recent.max())
+    band = 0.25 * ctx.atr
+    matched = int(np.sum(np.abs(recent - top) <= band))
+    if matched < 2:
+        return None
+    away = top - ctx.price
+    if abs(away) > 4.0 * ctx.atr:
+        return None
+    score = 45.0 + 12.0 * min(matched, 4) - 12.0 * min(abs(away) / (4.0 * ctx.atr), 1.0)
+    return _hit("Equal highs (liquidity above)", "UP", score,
+                f"{matched} swing highs within {fmt(band)} of {fmt(top)}; the stops of "
+                f"everyone short sit just above it, which is what makes it a target",
+                trigger=top + 0.25 * ctx.atr, invalidation=top - 1.5 * ctx.atr,
+                objective=top + (ctx.range_high - ctx.range_low) * 0.5,
+                extras={"level": top, "touches": matched})
+
+
+def mb_equal_lows(ctx: MBContext):
+    """Two or more lows at the same price."""
+    if len(ctx.pivot_lows) < 2:
+        return None
+    recent = np.array([v for _p, v in ctx.pivot_lows[-4:]], float)
+    bottom = float(recent.min())
+    band = 0.25 * ctx.atr
+    matched = int(np.sum(np.abs(recent - bottom) <= band))
+    if matched < 2:
+        return None
+    away = ctx.price - bottom
+    if abs(away) > 4.0 * ctx.atr:
+        return None
+    score = 45.0 + 12.0 * min(matched, 4) - 12.0 * min(abs(away) / (4.0 * ctx.atr), 1.0)
+    return _hit("Equal lows (liquidity below)", "DOWN", score,
+                f"{matched} swing lows within {fmt(band)} of {fmt(bottom)}; the stops of "
+                f"everyone long sit just below it",
+                trigger=bottom - 0.25 * ctx.atr, invalidation=bottom + 1.5 * ctx.atr,
+                objective=bottom - (ctx.range_high - ctx.range_low) * 0.5,
+                extras={"level": bottom, "touches": matched})
+
+
+def mb_failed_breakdown(ctx: MBContext):
+    """Swept the lows and reclaimed them: the shakeout that traps sellers."""
+    if len(ctx.pivot_lows) < 1:
+        return None
+    level = min(v for _p, v in ctx.pivot_lows)
+    tail = slice(max(len(ctx.lows) - 10, 0), len(ctx.lows))
+    pierced = float(ctx.lows[tail].min())
+    if pierced > level - 0.3 * ctx.atr:
+        return None
+    if ctx.price < level + 0.2 * ctx.atr:
+        return None                                   # not reclaimed
+    depth = (level - pierced) / ctx.atr
+    score = 60.0 + 25.0 * min(depth, 1.5) / 1.5
+    return _hit("Support swept and reclaimed", "UP", score,
+                f"price wicked {fmt(depth, 2)} ATR below {fmt(level)} and closed back above "
+                f"it: the sellers filled on that break are trapped",
+                trigger=ctx.price + 0.25 * ctx.atr, invalidation=pierced - 0.25 * ctx.atr,
+                objective=ctx.range_high, extras={"level": level})
+
+
+def mb_failed_breakout(ctx: MBContext):
+    """Swept the highs and lost them again."""
+    if len(ctx.pivot_highs) < 1:
+        return None
+    level = max(v for _p, v in ctx.pivot_highs)
+    tail = slice(max(len(ctx.highs) - 10, 0), len(ctx.highs))
+    pierced = float(ctx.highs[tail].max())
+    if pierced < level + 0.3 * ctx.atr:
+        return None
+    if ctx.price > level - 0.2 * ctx.atr:
+        return None
+    depth = (pierced - level) / ctx.atr
+    score = 60.0 + 25.0 * min(depth, 1.5) / 1.5
+    return _hit("Resistance swept and lost", "DOWN", score,
+                f"price wicked {fmt(depth, 2)} ATR above {fmt(level)} and closed back below "
+                f"it: the buyers filled on that break are trapped",
+                trigger=ctx.price - 0.25 * ctx.atr, invalidation=pierced + 0.25 * ctx.atr,
+                objective=ctx.range_low, extras={"level": level})
+
+
+def mb_double_bottom(ctx: MBContext):
+    """W: two lows at the same price with a peak between them."""
+    if len(ctx.pivot_lows) < 2:
+        return None
+    (i1, v1), (i2, v2) = ctx.pivot_lows[-2], ctx.pivot_lows[-1]
+    if abs(v1 - v2) > ctx.tol or i2 - i1 < 5:
+        return None
+    between = [v for p, v in ctx.pivot_highs if i1 < p < i2]
+    if not between:
+        return None
+    neckline = float(max(between))
+    depth = neckline - min(v1, v2)
+    if depth < 3.0 * ctx.atr:
+        return None
+    # A W has to be AT THE BOTTOM. Two similar lows anywhere inside an
+    # oscillation are just an oscillation; what makes it a double bottom is
+    # that the pair sits at the low of the range being reversed.
+    if min(v1, v2) > ctx.range_low + 1.0 * ctx.atr:
+        return None
+    broken = ctx.price > neckline
+    score = 55.0 + 25.0 * min(depth / (5.0 * ctx.atr), 1.0) + (15.0 if broken else 0.0)
+    return _hit("Double bottom (W)" + (" — neckline broken" if broken else ""), "UP", score,
+                f"two lows at {fmt(v1)} and {fmt(v2)} with a neckline at {fmt(neckline)}"
+                + (", already broken" if broken else
+                   f", {fmt(neckline - ctx.price)} above price"),
+                trigger=neckline + 0.25 * ctx.atr, invalidation=min(v1, v2) - 0.5 * ctx.atr,
+                objective=neckline + depth, extras={"level": neckline, "touches": 2})
+
+
+def mb_double_top(ctx: MBContext):
+    """M: two highs at the same price with a trough between them."""
+    if len(ctx.pivot_highs) < 2:
+        return None
+    (i1, v1), (i2, v2) = ctx.pivot_highs[-2], ctx.pivot_highs[-1]
+    if abs(v1 - v2) > ctx.tol or i2 - i1 < 5:
+        return None
+    between = [v for p, v in ctx.pivot_lows if i1 < p < i2]
+    if not between:
+        return None
+    neckline = float(min(between))
+    depth = max(v1, v2) - neckline
+    if depth < 3.0 * ctx.atr:
+        return None
+    if max(v1, v2) < ctx.range_high - 1.0 * ctx.atr:
+        return None
+    broken = ctx.price < neckline
+    score = 55.0 + 25.0 * min(depth / (5.0 * ctx.atr), 1.0) + (15.0 if broken else 0.0)
+    return _hit("Double top (M)" + (" — neckline broken" if broken else ""), "DOWN", score,
+                f"two highs at {fmt(v1)} and {fmt(v2)} with a neckline at {fmt(neckline)}"
+                + (", already broken" if broken else
+                   f", {fmt(ctx.price - neckline)} below price"),
+                trigger=neckline - 0.25 * ctx.atr, invalidation=max(v1, v2) + 0.5 * ctx.atr,
+                objective=neckline - depth, extras={"level": neckline, "touches": 2})
+
+
+def mb_trendline_retest(ctx: MBContext):
+    """
+    A sloping trendline broken, retested, and still holding.
+
+    The line is fitted through the swing pivots rather than drawn by eye: a
+    descending resistance line through the swing HIGHS, an ascending support
+    line through the swing LOWS. The setup needs all three stages -- a close
+    through the line, a pullback that comes back to it, and price still on the
+    breaking side now. A break alone is the Chart Patterns tab's job; what
+    makes this one tradable is that the line has since been defended.
+    """
+    for pivots, side, name in ((ctx.pivot_highs, "UP", "resistance"),
+                               (ctx.pivot_lows, "DOWN", "support")):
+        if len(pivots) < 3:
+            continue
+        xs = np.array([p for p, _v in pivots], float)
+        ys = np.array([v for _p, v in pivots], float)
+        try:
+            slope_, intercept = np.polyfit(xs, ys, 1)
+        except Exception:                                           # noqa: BLE001
+            continue
+        if not (np.isfinite(slope_) and np.isfinite(intercept)):
+            continue
+        # A resistance line worth breaking slopes down or sideways; a support
+        # line worth breaking slopes up or sideways.
+        if side == "UP" and slope_ > 0.02 * ctx.atr:
+            continue
+        if side == "DOWN" and slope_ < -0.02 * ctx.atr:
+            continue
+
+        last = len(ctx.closes) - 1
+        line_at = lambda i: float(slope_ * i + intercept)           # noqa: E731
+        line_now = line_at(last)
+        if not np.isfinite(line_now):
+            continue
+
+        recent = range(max(last - 25, 1), last + 1)
+        broke_at = None
+        for i in recent:
+            above = ctx.closes[i] > line_at(i) + 0.4 * ctx.atr
+            below = ctx.closes[i] < line_at(i) - 0.4 * ctx.atr
+            if (side == "UP" and above) or (side == "DOWN" and below):
+                broke_at = i
+                break
+        if broke_at is None or broke_at >= last - 1:
+            continue                       # no break, or it only just happened
+
+        # A retest: price came back within half an ATR of the line AFTER the
+        # break, and is still on the breaking side now.
+        retested = any(abs(ctx.closes[i] - line_at(i)) <= 0.6 * ctx.atr
+                       for i in range(broke_at + 1, last + 1))
+        if not retested:
+            continue
+        holding = (ctx.price > line_now) if side == "UP" else (ctx.price < line_now)
+        if not holding:
+            continue
+
+        height = ctx.range_high - ctx.range_low
+        bars_since = last - broke_at
+        score = 62.0 + 25.0 * (1.0 - min(bars_since / 25.0, 1.0))
+        objective = (line_now + height * 0.6) if side == "UP" else (line_now - height * 0.6)
+        stop = (line_now - 0.75 * ctx.atr) if side == "UP" else (line_now + 0.75 * ctx.atr)
+        return _hit(f"Trendline break + retest holding ({name})", side, score,
+                    f"a {name} line fitted through {len(pivots)} pivots (slope "
+                    f"{slope_:+.4f} per candle) was broken {bars_since} candle(s) ago at "
+                    f"{fmt(line_at(broke_at))}, retested, and price is still "
+                    f"{'above' if side == 'UP' else 'below'} it at {fmt(line_now)}",
+                    trigger=ctx.price + (0.25 * ctx.atr if side == "UP" else -0.25 * ctx.atr),
+                    invalidation=stop, objective=objective,
+                    extras={"level": line_now, "touches": len(pivots)})
+    return None
+
+
+MAKE_BREAK_SETUPS = [
+    ("inverted_v", "Inverted V (round top)", mb_inverted_v),
+    ("v_bottom", "V bottom (round bottom)", mb_v_bottom),
+    ("at_resistance", "At resistance", mb_at_resistance),
+    ("at_support", "At support", mb_at_support),
+    ("multi_touch", "Multi-touch level (3+)", mb_multi_touch),
+    ("compression", "Compression / accumulation", mb_compression),
+    ("triangle", "Converging triangle at apex", mb_triangle),
+    ("breakout_retest", "Breakout + retest holding", mb_breakout_retest),
+    ("breakdown_retest", "Breakdown + retest rejecting", mb_breakdown_retest),
+    ("equal_highs", "Equal highs", mb_equal_highs),
+    ("equal_lows", "Equal lows", mb_equal_lows),
+    ("failed_breakdown", "Support swept and reclaimed", mb_failed_breakdown),
+    ("failed_breakout", "Resistance swept and lost", mb_failed_breakout),
+    ("double_bottom", "Double bottom / W", mb_double_bottom),
+    ("double_top", "Double top / M", mb_double_top),
+    ("trendline_retest", "Trendline break + retest", mb_trendline_retest),
+]
+MAKE_BREAK_BY_KEY = {key: (label, fn) for key, label, fn in MAKE_BREAK_SETUPS}
+
+
+def mb_confirmations(ctx: MBContext, direction: str) -> tuple[float, list[str]]:
+    """
+    What the secondary evidence says about the proposed direction.
+
+    Returns a score adjustment and the reasons for it. Volume and RSI do not
+    create the setup -- the structure does -- but they say whether anyone is
+    showing up for it.
+    """
+    bonus, notes = 0.0, []
+
+    if np.isfinite(ctx.vol_ratio):
+        if ctx.vol_ratio >= 1.5:
+            bonus += 8.0
+            notes.append(f"volume {fmt(ctx.vol_ratio)}x average on the latest candle")
+        elif ctx.vol_ratio < 0.7:
+            notes.append(f"volume only {fmt(ctx.vol_ratio)}x average — nobody is here yet")
+    if np.isfinite(ctx.vol_trend) and ctx.vol_trend < 0.85:
+        bonus += 5.0
+        notes.append(f"participation drying up ({fmt(ctx.vol_trend)}x), which is what a "
+                     f"coil looks like before it releases")
+
+    if np.isfinite(ctx.rsi_now):
+        if direction == "UP" and ctx.rsi_now < 35:
+            bonus += 6.0
+            notes.append(f"RSI {fmt(ctx.rsi_now)} — oversold into the level")
+        elif direction == "DOWN" and ctx.rsi_now > 65:
+            bonus += 6.0
+            notes.append(f"RSI {fmt(ctx.rsi_now)} — overbought into the level")
+        elif direction == "UP" and ctx.rsi_now > 70:
+            bonus -= 6.0
+            notes.append(f"RSI {fmt(ctx.rsi_now)} — already stretched for a long")
+        elif direction == "DOWN" and ctx.rsi_now < 30:
+            bonus -= 6.0
+            notes.append(f"RSI {fmt(ctx.rsi_now)} — already stretched for a short")
+        else:
+            notes.append(f"RSI {fmt(ctx.rsi_now)}, neither stretched nor washed out")
+
+    if np.isfinite(ctx.compression) and ctx.compression < 0.7:
+        bonus += 4.0
+        notes.append(f"range is {ctx.compression:.2f}x its own norm — energy stored")
+    return bonus, notes
+
+
+def mb_plan(ctx: MBContext, hit: dict) -> dict:
+    """
+    Entry, stop and target for one setup.
+
+    Built from the structure's own levels: the trigger is the price that
+    confirms the setup, the stop sits beyond what would disprove it, and the
+    objective is the pattern's measured move. When the geometry does not offer
+    a reward worth the risk, the row says so rather than quietly presenting a
+    0.4:1 trade as an opportunity.
+    """
+    direction = hit["direction"]
+    if direction == "EITHER":
+        # An undecided shape gets both sides, which is the honest output for a
+        # coil: you do not know which way, you know where.
+        upper = hit.get("trigger")
+        lower = hit.get("invalidation")
+        return {"side": "WAIT", "entry": None, "stop": None, "target": None, "rr": None,
+                "note": (f"Undecided. Long above {fmt(upper)}, short below {fmt(lower)}; "
+                         f"trade the break, not the coil.")}
+
+    entry = hit.get("trigger")
+    stop = hit.get("invalidation")
+    target = hit.get("objective")
+    if entry is None or stop is None or target is None:
+        return {"side": direction, "entry": entry, "stop": stop, "target": target,
+                "rr": None, "note": "the structure does not define a complete level set"}
+
+    risk = abs(float(entry) - float(stop))
+    reward = abs(float(target) - float(entry))
+    rr = round(reward / risk, 2) if risk > 0 else None
+    note = ""
+    if rr is not None and rr < 1.0:
+        note = ("The geometry is poor: the stop is further than the objective, so the level "
+                "is right but the trade is not.")
+    return {"side": "LONG" if direction == "UP" else "SHORT", "entry": float(entry),
+            "stop": float(stop), "target": float(target), "rr": rr, "note": note}
+
+
+def make_break_scan_one(ticker: str, interval: str, period: str, wanted: list[str],
+                        lookback: int = 120, pivot: int = 3, tol_atr: float = 0.5,
+                        min_score: float = 0.0) -> list[dict]:
+    """Every selected setup that is currently present on one ticker/timeframe."""
+    frame = load_market_data(ticker, period, interval,
+                             freshness_seconds=180, min_bars=60).frame
+    ctx = mb_context(frame, lookback, pivot, tol_atr)
+    if ctx is None:
+        return []
+
+    rows = []
+    for key in wanted:
+        entry = MAKE_BREAK_BY_KEY.get(key)
+        if not entry:
+            continue
+        label, fn = entry
+        try:
+            hit = fn(ctx)
+        except Exception as exc:                                    # noqa: BLE001
+            rows.append({"Ticker": ticker, "Timeframe": interval, "Period": period,
+                         "Setup": label, "Direction": "-", "Readiness": 0.0,
+                         "Reading": f"failed: {str(exc)[:80]}"})
+            continue
+        if not hit:
+            continue
+        bonus, notes = mb_confirmations(ctx, hit["direction"])
+        plan = mb_plan(ctx, hit)
+        readiness = max(0.0, min(100.0, hit["score"] + bonus))
+        if readiness < float(min_score):
+            continue
+        rows.append({
+            "Ticker": ticker, "Timeframe": interval, "Period": period,
+            "Setup": hit["setup"], "Direction": hit["direction"],
+            "Readiness": round(readiness, 1),
+            "Side": plan["side"], "Entry": plan["entry"], "Stop": plan["stop"],
+            "Target": plan["target"], "R:R": plan["rr"],
+            "Price": round(ctx.price, 2),
+            "Distance to trigger": round(abs(ctx.price - float(hit["trigger"])), 2)
+            if hit.get("trigger") is not None else None,
+            "Touches": hit.get("touches"),
+            "Volume x": round(ctx.vol_ratio, 2) if np.isfinite(ctx.vol_ratio) else None,
+            "RSI": round(ctx.rsi_now, 1) if np.isfinite(ctx.rsi_now) else None,
+            "Compression": round(ctx.compression, 2) if np.isfinite(ctx.compression) else None,
+            "Reading": hit["reading"],
+            "Confirmations": "; ".join(notes) if notes else "none",
+            "Plan note": plan.get("note", ""),
+            "Checked at": pd.Timestamp.now(),
+        })
+    return rows
+
+
+def tab_make_break(cfg: dict) -> None:
+    st.subheader("Make or Break — tickers standing at a decision")
+    st.warning(
+        "**A readiness score says how well formed a setup is, not how likely it is to "
+        "work.** A textbook ascending triangle at the apex scores high and then breaks the "
+        "wrong way often enough to ruin anyone who confuses the two. The levels below are the "
+        "structure's own — where the trigger sits, where the idea is disproved, and what the "
+        "pattern measures to — not a forecast. Rank, apply to the sidebar, then test it in "
+        "Backtesting before trusting it.")
+
+    c1, c2 = st.columns([1, 1])
+    universe = c1.selectbox("Universe", SCREENER_UNIVERSES, key="mb_universe")
+    min_score = c2.number_input("Minimum readiness", 0, 100, 55, 5, key="mb_minscore",
+                                help="Setups below this are not listed. 55 keeps the "
+                                     "reasonably formed ones; raise it to shortlist harder.")
+
+    custom_text = ""
+    if universe.startswith("Custom"):
+        custom_text = st.text_area("Tickers", "RELIANCE\nTCS\nINFY", key="mb_custom")
+    all_tickers, note = universe_tickers_ui(universe, custom_text, None, "mb")
+    chosen = st.multiselect(f"Tickers ({len(all_tickers)} in {universe})", all_tickers,
+                            default=all_tickers, key=f"mb_tickers_{universe}")
+    if note:
+        st.caption(note)
+
+    with st.container(border=True):
+        timeframes = _multi_picker("Timeframes", list(INTERVALS), "mb_tf", ["15m", "1d"])
+    with st.container(border=True):
+        periods = _multi_picker("History windows", list(PERIODS), "mb_period", ["3mo"],
+                                formatter=str)
+    if not timeframes or not periods:
+        st.error("Pick at least one timeframe and one history window.")
+        return
+
+    with st.container(border=True):
+        st.markdown(f"**Setups** — {len(MAKE_BREAK_SETUPS)} available")
+        keys = [key for key, _l, _f in MAKE_BREAK_SETUPS]
+        a, b = st.columns(2)
+        if a.button("Select all setups", key="mb_all", width="stretch"):
+            for key in keys:
+                st.session_state[f"mb_setup_{key}"] = True
+            st.rerun()
+        if b.button("Clear all setups", key="mb_none", width="stretch"):
+            for key in keys:
+                st.session_state[f"mb_setup_{key}"] = False
+            st.rerun()
+        wanted = []
+        columns = st.columns(3)
+        for i, (key, label, _fn) in enumerate(MAKE_BREAK_SETUPS):
+            if columns[i % 3].checkbox(label, value=True, key=f"mb_setup_{key}"):
+                wanted.append(key)
+    if not wanted:
+        st.error("Pick at least one setup.")
+        return
+
+    with st.expander("Detection settings", expanded=False):
+        d1, d2, d3 = st.columns(3)
+        lookback = d1.number_input("Structure lookback (candles)", 40, 500, 120, 10,
+                                   key="mb_look",
+                                   help="How far back a level, range or coil is measured.")
+        pivot = d2.number_input("Swing strength (candles either side)", 1, 15, 3, 1,
+                                key="mb_pivot")
+        tol_atr = d3.number_input("Level tolerance (ATR)", 0.1, 3.0, 0.5, 0.1, key="mb_tol",
+                                  help="How close two highs must be to count as the same "
+                                       "level. Wider finds more, and finds them vaguer.")
+
+    jobs = [(t, tf, p) for t in chosen for tf in timeframes for p in periods]
+    scan_cost_notice(len(jobs), per_job_hint=1.6, prefix="mb")
+
+    def _worker(job):
+        ticker, interval, period = job
+        try:
+            effective, _clamp = sanitize_period(interval, period)
+            rows = make_break_scan_one(ticker, interval, effective, wanted,
+                                       int(lookback), int(pivot), float(tol_atr),
+                                       float(min_score))
+            return rows, []
+        except Exception as exc:                                    # noqa: BLE001
+            return [], [{"Ticker": ticker, "Timeframe": interval, "Period": period,
+                         "Problem": str(exc)[:140]}]
+
+    rows, errs, _done = chunked_sweep("mb", jobs, _worker, _auto_slice_seconds(),
+                                      "ticker/timeframe/period jobs",
+                                      describe=lambda j: f"{j[0]} · {j[1]} · {j[2]}")
+
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        st.info("Nothing scanned yet, or nothing cleared the readiness bar. Press **Run** "
+                "above, or lower the minimum readiness.")
+        if errs:
+            with st.expander(f"Jobs that failed ({len(errs)})"):
+                st.dataframe(pd.DataFrame(errs), width="stretch", hide_index=True)
+        return
+
+    frame = frame.sort_values("Readiness", ascending=False).reset_index(drop=True)
+    frame.insert(0, "Rank", range(1, len(frame) + 1))
+
+    a, b, c, d = st.columns(4)
+    a.metric("Setups found", len(frame))
+    a_long = frame[frame["Side"] == "LONG"]
+    a_short = frame[frame["Side"] == "SHORT"]
+    b.metric("Long side", len(a_long))
+    c.metric("Short side", len(a_short))
+    d.metric("Undecided coils", int((frame["Side"] == "WAIT").sum()),
+             "direction unknown, level known")
+
+    side = st.radio("Show", ["Everything", "Long only", "Short only", "Undecided only"],
+                    horizontal=True, key="mb_side")
+    view = frame
+    if side == "Long only":
+        view = frame[frame["Side"] == "LONG"]
+    elif side == "Short only":
+        view = frame[frame["Side"] == "SHORT"]
+    elif side == "Undecided only":
+        view = frame[frame["Side"] == "WAIT"]
+    if view.empty:
+        st.info("Nothing on that side. Switch back to Everything.")
+        return
+
+    order = [c for c in ["Rank", "Ticker", "Timeframe", "Period", "Setup", "Direction",
+                         "Readiness", "Side", "Price", "Entry", "Stop", "Target", "R:R",
+                         "Distance to trigger", "Touches", "Volume x", "RSI", "Compression",
+                         "Reading", "Confirmations", "Plan note", "Checked at"]
+             if c in view.columns]
+    st.dataframe(view[order], width="stretch", hide_index=True,
+                 column_config={"Readiness": st.column_config.ProgressColumn(
+                     "Readiness", min_value=0, max_value=100, format="%.0f")})
+    st.download_button("Download the scan (CSV)", view[order].to_csv(index=False).encode(),
+                       f"make_or_break_{pd.Timestamp.now():%Y%m%d_%H%M}.csv", "text/csv",
+                       key="mb_dl")
+
+    st.markdown("#### Inspect and apply")
+    labels = [f"#{r['Rank']}  {r['Ticker']} · {r['Timeframe']} · {r['Setup']}"
+              for _i, r in view.iterrows()]
+    i1, i2 = st.columns([3, 1])
+    picked_label = i1.selectbox("Ranked setup", labels, key="mb_pick")
+    picked = view.iloc[labels.index(picked_label)].to_dict()
+
+    tone = {"LONG": st.success, "SHORT": st.error}.get(picked["Side"], st.info)
+    tone(f"**{picked['Setup']}** on `{picked['Ticker']}` ({picked['Timeframe']}) — "
+         f"readiness {fmt(picked['Readiness'], 0)} / 100, side **{picked['Side']}**")
+    st.markdown(f"**What the chart shows.** {picked['Reading']}.")
+    st.markdown(f"**Secondary evidence.** {picked['Confirmations']}.")
+
+    if picked.get("Entry") is not None:
+        p1, p2, p3, p4 = st.columns(4)
+        p1.metric("Entry (trigger)", fmt(picked["Entry"]))
+        p2.metric("Stop (invalidation)", fmt(picked["Stop"]),
+                  f"{fmt(abs(float(picked['Entry']) - float(picked['Stop'])))} risk")
+        p3.metric("Target (measured move)", fmt(picked["Target"]),
+                  f"{fmt(abs(float(picked['Target']) - float(picked['Entry'])))} reward")
+        p4.metric("Reward : risk", f"{fmt(picked['R:R'])} : 1" if picked.get("R:R") else "--")
+    if str(picked.get("Plan note") or ""):
+        st.warning(picked["Plan note"])
+
+    if i2.button("Apply to the sidebar", width="stretch", key="mb_apply",
+                 help="Sends this ticker and timeframe to the control console so it can be "
+                      "backtested or traded live with a real strategy."):
+        st.session_state.pending_ticker = picked["Ticker"]
+        bullish = picked["Side"] == "LONG"
+        st.session_state.pending_combo = {
+            "strategy": ("05 · Opening Range Breakout (ORB)" if bullish
+                         else "25 · SuperTrend Flip"),
+            "sl_type": "ATR Multiple", "sl_value": 1.5,
+            "tp_type": "Risk : Reward Multiple", "tp_value": 2.0,
+            "filter_key": "", "widgets": {"cfg_interval": picked["Timeframe"]}}
+        st.rerun()
+
+    st.caption("The sidebar receives the ticker and timeframe. It does NOT receive the "
+               "pattern — no strategy in this app trades 'a triangle', so a sensible "
+               "breakout profile is applied and you should replace it with whatever you "
+               "actually want to test.")
+
+    if errs:
+        with st.expander(f"Jobs that failed ({len(errs)})"):
+            st.dataframe(pd.DataFrame(errs), width="stretch", hide_index=True)
+    render_analyst_panel("mb", "these make-or-break candidates", _frame_context(frame))
+
+
+# =============================================================================
+# SECTION 19l -- CHART STUDIO
+# =============================================================================
+# One ticker, read properly: a large chart, what the structure says, the bar by
+# bar record, and how it has moved against a second instrument.
+#
+# The returns heatmaps use a DIVERGING scale -- the app's own red and teal poles
+# with a neutral grey midpoint -- because a return is polarity data, signed
+# around zero. A sequential ramp would make "slightly positive" and "very
+# negative" neighbours on the same hue, which is the wrong question entirely.
+# Both poles are validated against the light and dark chart surfaces, and every
+# cell carries its own number so the colour never has to be decoded alone.
+_DIVERGING_RETURNS = [
+    [0.0, "#b3372f"], [0.25, "#ef5350"], [0.5, "#8c8c8c"],
+    [0.75, "#26a69a"], [1.0, "#15756c"],
+]
+
+
+def align_two_series(a: pd.DataFrame, b: pd.DataFrame) -> tuple[pd.DataFrame, str]:
+    """
+    Put two instruments on one index, whatever clocks they arrived on.
+
+    Three things go wrong here, and all three are the timezone problem the user
+    flagged. Yahoo stamps Indian equities Asia/Kolkata, crypto in UTC, and some
+    series with no zone at all; joining those as they arrive either raises or --
+    far worse -- silently pairs bars hours apart and calls the result a ratio.
+    So everything is converted to UTC first, and a naive index is read as UTC
+    with that assumption stated rather than hidden.
+
+    That alone is not enough. India is UTC+5:30, so an hourly Indian bar lands
+    at 03:45, 04:45 UTC while an hourly crypto bar lands at 04:00, 05:00 -- the
+    two never share a single timestamp, and an exact join would refuse every
+    India-against-crypto intraday pair outright. When an exact match is thin,
+    each bar is therefore paired with the NEAREST bar of the other leg within
+    half a bar's width, which is an honest pairing because no closer partner
+    exists. Anything wider than half a bar is left unpaired rather than
+    stretched, and the note says which rule was used.
+    """
+    notes = []
+
+    def to_utc(frame: pd.DataFrame, label: str) -> pd.DataFrame:
+        out = frame.copy()
+        index = pd.DatetimeIndex(out.index)
+        if index.tz is None:
+            notes.append(f"{label} arrived without a timezone and was read as UTC")
+            index = index.tz_localize("UTC")
+        else:
+            index = index.tz_convert("UTC")
+        out.index = index
+        out = out[~out.index.duplicated(keep="last")].sort_index()
+        return out[["Open", "High", "Low", "Close"]].dropna()
+
+    left, right = to_utc(a, "the first ticker"), to_utc(b, "the second")
+    if left.empty or right.empty:
+        return pd.DataFrame(), "One of the two legs has no usable candles."
+
+    overlap_span = (min(left.index[-1], right.index[-1])
+                    - max(left.index[0], right.index[0]))
+    if overlap_span <= pd.Timedelta(0):
+        return pd.DataFrame(), ("These two have no overlapping history on this timeframe, "
+                                "so no ratio can be formed. Try a longer period, or a "
+                                "coarser timeframe where both have data.")
+
+    rename = {"Open": "a_open", "High": "a_high", "Low": "a_low", "Close": "a_close"}
+    rename_b = {"Open": "b_open", "High": "b_high", "Low": "b_low", "Close": "b_close"}
+
+    exact = left.index.intersection(right.index)
+    smaller = min(len(left), len(right))
+    if len(exact) >= max(5, 0.5 * smaller):
+        joined = pd.concat([left.loc[exact].rename(columns=rename),
+                            right.loc[exact].rename(columns=rename_b)], axis=1).dropna()
+        notes.append(f"{len(joined)} timestamps matched exactly; "
+                     f"{len(left) - len(joined)} bars of the first and "
+                     f"{len(right) - len(joined)} of the second had no partner")
+        return joined, "; ".join(notes)
+
+    # Nearest-bar pairing, tolerance half a bar.
+    def spacing(index: pd.DatetimeIndex) -> pd.Timedelta:
+        if len(index) < 3:
+            return pd.Timedelta(days=1)
+        gaps = pd.Series(index[1:] - index[:-1])
+        return pd.Timedelta(gaps.median())
+
+    tolerance = min(spacing(left.index), spacing(right.index)) / 2
+    if tolerance <= pd.Timedelta(0):
+        tolerance = pd.Timedelta(minutes=1)
+    try:
+        merged = pd.merge_asof(
+            left.rename(columns=rename).reset_index(names="_ts"),
+            right.rename(columns=rename_b).reset_index(names="_ts"),
+            on="_ts", direction="nearest", tolerance=tolerance)
+    except Exception as exc:                                        # noqa: BLE001
+        return pd.DataFrame(), (f"These two could not be put on a common clock ({exc}). "
+                                "A coarser timeframe usually aligns them.")
+    merged = merged.dropna().set_index("_ts")
+    merged.index.name = None
+    if merged.empty:
+        return pd.DataFrame(), (
+            "These two never trade within half a bar of each other on this timeframe, so "
+            "no ratio can be formed. Markets on different sessions only line up on daily "
+            "bars or coarser — try 1d.")
+    notes.append(f"the two clocks differ, so each of {len(merged)} bars was paired with "
+                 f"the nearest bar of the other within {_pretty_delta(tolerance)}")
+    return merged, "; ".join(notes)
+
+
+def _pretty_delta(delta: pd.Timedelta) -> str:
+    """A timedelta in the words a person would use."""
+    seconds = delta.total_seconds()
+    if seconds < 90:
+        return f"{seconds:.0f} seconds"
+    if seconds < 5400:
+        return f"{seconds / 60:.0f} minutes"
+    if seconds < 86400:
+        return f"{seconds / 3600:.1f} hours"
+    return f"{seconds / 86400:.1f} days"
+
+
+def ratio_frame(joined: pd.DataFrame) -> pd.DataFrame:
+    """
+    A candle series for the ratio of two instruments.
+
+    The ratio's high is NOT the first high over the second high: that would be
+    the best case of one paired with the worst of the other, a bar that never
+    traded. Each ratio bar is built from the four pairings that can actually
+    occur, and the extremes taken from those.
+    """
+    if joined.empty:
+        return pd.DataFrame()
+    corners = pd.DataFrame({
+        "hh": joined["a_high"] / joined["b_high"],
+        "hl": joined["a_high"] / joined["b_low"],
+        "lh": joined["a_low"] / joined["b_high"],
+        "ll": joined["a_low"] / joined["b_low"],
+    })
+    return pd.DataFrame({
+        "Open": joined["a_open"] / joined["b_open"],
+        "High": corners.max(axis=1),
+        "Low": corners.min(axis=1),
+        "Close": joined["a_close"] / joined["b_close"],
+        "Volume": 0.0,
+    }, index=joined.index)
+
+
+def returns_heatmap(series: pd.Series, title: str, light: bool = False):
+    """
+    Returns laid out on the two axes that actually explain them.
+
+    Intraday, that is weekday against hour -- the shape of a session. Daily and
+    coarser, it is year against month. Picking one grid for both would leave
+    half the cells empty on one of them.
+    """
+    import plotly.graph_objects as go
+
+    values = pd.Series(series).dropna()
+    if values.empty:
+        return None, pd.DataFrame()
+    index = pd.DatetimeIndex(values.index)
+    intraday = bool(len(index) > 2 and (index[1:] - index[:-1]).min()
+                    < pd.Timedelta(hours=23))
+
+    if intraday:
+        rows = index.hour
+        cols = index.dayofweek
+        row_name, col_name = "Hour", "Weekday"
+        col_labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        grid = pd.DataFrame({"r": rows, "c": cols, "v": values.to_numpy(float)})
+        table = grid.pivot_table(index="r", columns="c", values="v", aggfunc="mean")
+        x_labels = [col_labels[c] for c in table.columns]
+        y_labels = [f"{int(h):02d}:00" for h in table.index]
+    else:
+        grid = pd.DataFrame({"r": index.year, "c": index.month,
+                             "v": values.to_numpy(float)})
+        table = grid.pivot_table(index="r", columns="c", values="v", aggfunc="sum")
+        months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+        x_labels = [months[int(c) - 1] for c in table.columns]
+        y_labels = [str(int(r)) for r in table.index]
+        row_name, col_name = "Year", "Month"
+
+    z = table.to_numpy(float)
+    limit = float(np.nanmax(np.abs(z))) if np.isfinite(z).any() else 1.0
+    limit = limit if limit > 0 else 1.0
+    figure = go.Figure(go.Heatmap(
+        z=z, x=x_labels, y=y_labels, colorscale=_DIVERGING_RETURNS,
+        zmid=0.0, zmin=-limit, zmax=limit,
+        text=np.round(z, 2), texttemplate="%{text}", textfont=dict(size=10),
+        colorbar=dict(title="%"),
+        hovertemplate=f"{col_name} %{{x}}<br>{row_name} %{{y}}<br>%{{z:.2f}}%<extra></extra>"))
+    figure.update_layout(
+        title=dict(text=title, x=0.01, xanchor="left", font=dict(size=14)),
+        height=max(260, 42 * len(y_labels) + 120),
+        margin=dict(l=70, r=20, t=50, b=40),
+        template="plotly_white" if light else None)
+    figure.update_xaxes(title_text=col_name, side="top")
+    figure.update_yaxes(title_text=row_name, autorange="reversed")
+    return figure, table
+
+
+def studio_chart(frame: pd.DataFrame, title: str, light: bool = False, height: int = 720):
+    """The big readable candle chart: everything else on this tab explains it."""
+    import plotly.graph_objects as go
+
+    figure = go.Figure(go.Candlestick(
+        x=frame.index, open=frame["Open"], high=frame["High"],
+        low=frame["Low"], close=frame["Close"], name="Price",
+        increasing_line_color=_UP, decreasing_line_color=_DOWN,
+        increasing_fillcolor=_UP, decreasing_fillcolor=_DOWN,
+        line=dict(width=1)))
+    for length, colour in ((20, "#f4a261"), (50, "#4f9df7")):
+        if len(frame) > length:
+            figure.add_trace(go.Scatter(
+                x=frame.index, y=ema(frame["Close"], length), mode="lines",
+                name=f"EMA {length}", line=dict(width=1.6, color=colour)))
+    figure.update_layout(
+        height=int(height), margin=dict(l=66, r=24, t=54, b=44),
+        title=dict(text=title, x=0.01, xanchor="left", font=dict(size=16)),
+        hovermode="x unified", dragmode="pan", xaxis_rangeslider_visible=False,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        template="plotly_white" if light else None)
+    figure.update_yaxes(showgrid=True, gridcolor="rgba(128,128,128,0.15)")
+    figure.update_xaxes(showgrid=False)
+    return figure
+
+
+def _studio_verdict(frame: pd.DataFrame, cfg: dict) -> tuple[str, str, list]:
+    """Patterns, structure and a single recommendation for one chart."""
+    ctx = mb_context(frame, min(len(frame) - 2, 150), 3, 0.5)
+    setups = []
+    if ctx is not None:
+        for _key, _label, fn in MAKE_BREAK_SETUPS:
+            try:
+                hit = fn(ctx)
+            except Exception:                                       # noqa: BLE001
+                continue
+            if hit:
+                bonus, _notes = mb_confirmations(ctx, hit["direction"])
+                plan = mb_plan(ctx, hit)
+                setups.append({"Setup": hit["setup"], "Direction": hit["direction"],
+                               "Readiness": round(min(100.0, hit["score"] + bonus), 1),
+                               "Side": plan["side"], "Entry": plan["entry"],
+                               "Stop": plan["stop"], "Target": plan["target"],
+                               "R:R": plan["rr"], "Reading": hit["reading"],
+                               "Caveat": plan.get("note", "")})
+    setups.sort(key=lambda r: -r["Readiness"])
+
+    analysis = smc_analyse(frame, 3, 3, min(len(frame) - 2, 150))
+    smc_signal = analysis.get("signal", "HOLD") if not analysis.get("error") else "HOLD"
+
+    longs = sum(1 for s in setups if s["Side"] == "LONG")
+    shorts = sum(1 for s in setups if s["Side"] == "SHORT")
+    if smc_signal == "BUY" and longs >= shorts:
+        verdict = "BUY"
+    elif smc_signal == "SELL" and shorts >= longs:
+        verdict = "SELL"
+    elif longs > shorts + 1:
+        verdict = "BUY"
+    elif shorts > longs + 1:
+        verdict = "SELL"
+    else:
+        verdict = "HOLD"
+
+    pieces = [f"structure reads **{smc_signal}** on the SMC engine"]
+    if setups:
+        top = setups[0]
+        side_word = {"LONG": "long", "SHORT": "short"}.get(top["Side"], "two-sided")
+        pieces.append(f"the best-formed pattern is **{top['Setup']}** at readiness "
+                      f"{fmt(top['Readiness'], 0)}, which is a {side_word} setup")
+        pieces.append(f"{longs} pattern(s) point up and {shorts} point down out of "
+                      f"{len(setups)} found")
+    else:
+        pieces.append("no chart pattern is currently well formed enough to name")
+    if verdict == "HOLD":
+        pieces.append("nothing agrees strongly enough to act on, so the honest call is to "
+                      "wait for the structure to resolve")
+    narrative = ", and ".join([pieces[0], "; ".join(pieces[1:])]) if len(pieces) > 1 \
+        else pieces[0]
+    return verdict, narrative[0].upper() + narrative[1:] + ".", setups
+
+
+def tab_chart_studio(cfg: dict) -> None:
+    st.subheader("Chart Studio")
+    st.caption("One instrument, read in full: the chart, what its structure says, the bar "
+               "by bar record, and how it has moved against something else.")
+
+    c1, c2, c3 = st.columns(3)
+    universe_pool = sorted({t for group in ASSET_UNIVERSE.values() for t in group.values()})
+    default_ticker = cfg.get("symbol", "^NSEI")
+    pool = sorted(set(universe_pool) | {default_ticker})
+    ticker = c1.selectbox("Ticker", pool, index=pool.index(default_ticker),
+                          key="studio_ticker")
+    custom = c1.text_input("or type any Yahoo symbol", value="", key="studio_custom",
+                           placeholder=default_ticker).strip().upper()
+    if custom:
+        ticker = custom
+    interval = c2.selectbox("Timeframe", INTERVALS,
+                            index=INTERVALS.index(cfg.get("interval", "1d"))
+                            if cfg.get("interval") in INTERVALS else INTERVALS.index("1d"),
+                            key="studio_tf")
+    period = c3.selectbox("Period", PERIODS,
+                          index=PERIODS.index("6mo") if "6mo" in PERIODS else 0,
+                          key="studio_period")
+    height = c3.number_input("Chart height (pixels)", 400, 1400, 720, 40, key="studio_height")
+
+    effective, clamp = sanitize_period(interval, period)
+    if clamp:
+        st.warning(clamp)
+
+    try:
+        frame = load_market_data(ticker, effective, interval,
+                                 freshness_seconds=120, min_bars=20).frame
+    except Exception as exc:                                        # noqa: BLE001
+        st.error(f"Could not load `{ticker}` at {interval}/{effective}: {exc}")
+        return
+
+    st.plotly_chart(studio_chart(frame, f"{ticker} · {interval} · {effective}",
+                                 light=bool(cfg.get("light_charts")), height=int(height)),
+                    width="stretch", config={"scrollZoom": True, "displaylogo": False})
+    st.caption("Scroll to zoom, drag to pan, double-click to reset.")
+
+    # ---- what the chart says ------------------------------------------------
+    st.markdown("#### What this chart is saying")
+    verdict, narrative, setups = _studio_verdict(frame, cfg)
+    tone = {"BUY": st.success, "SELL": st.error}.get(verdict, st.info)
+    tone(f"**{verdict}** — {narrative}")
+    if setups:
+        st.dataframe(pd.DataFrame(setups), width="stretch", hide_index=True)
+        # The headline levels come from the best setup that actually has levels:
+        # an undecided coil ranks high but has nothing to enter at.
+        best = next((row for row in setups if row.get("Entry") is not None), setups[0])
+        if best.get("Entry") is not None:
+            e1, e2, e3, e4 = st.columns(4)
+            e1.metric("Entry", fmt(best["Entry"]))
+            e2.metric("Stop", fmt(best["Stop"]))
+            e3.metric("Target", fmt(best["Target"]))
+            e4.metric("Reward : risk", f"{fmt(best['R:R'])} : 1" if best.get("R:R") else "--")
+            st.caption(f"These levels belong to **{best['Setup']}** "
+                       f"({best['Side'].lower()}). " + (best.get("Caveat") or ""))
+    st.caption("Patterns and structure describe what HAS happened. Nothing here is "
+               "backtested — send the ticker to the sidebar and test it before trading it.")
+
+    # ---- the bar by bar record ---------------------------------------------
+    st.markdown("#### Candle by candle")
+    table = frame.copy()
+    table["Points"] = (table["Close"] - table["Open"]).round(2)
+    table["Change %"] = ((table["Close"] / table["Open"] - 1.0) * 100.0).round(3)
+    table["Move from previous close"] = (table["Close"] - table["Close"].shift(1)).round(2)
+    table["Return %"] = (table["Close"].pct_change() * 100.0).round(3)
+    table = table.reset_index().rename(columns={table.index.name or "index": "Datetime"})
+    newest_first = st.checkbox("Newest first", value=True, key="studio_order")
+    shown = table.iloc[::-1] if newest_first else table
+
+    signed_columns = ["Points", "Change %", "Move from previous close", "Return %"]
+
+    def _ink(value):
+        """Green for a gain, red for a loss, ordinary ink for flat or missing."""
+        if value is None or (isinstance(value, float) and not np.isfinite(value)):
+            return ""
+        if value > 0:
+            return f"color: {_UP}; font-weight: 600"
+        if value < 0:
+            return f"color: {_DOWN}; font-weight: 600"
+        return ""
+
+    styled = (shown.style
+              .map(_ink, subset=signed_columns)
+              .format({"Open": "{:.2f}", "High": "{:.2f}", "Low": "{:.2f}",
+                       "Close": "{:.2f}", "Points": "{:+.2f}",
+                       "Move from previous close": "{:+.2f}",
+                       "Change %": "{:+.3f}%", "Return %": "{:+.3f}%"}, na_rep="--"))
+    st.dataframe(styled, width="stretch", hide_index=True, height=360)
+    st.caption("Points and percentage columns are green on a gain and red on a loss, "
+               "with the sign printed as well so the colour is never the only cue.")
+
+    d1, d2, d3 = st.columns(3)
+    d1.download_button("Download CSV", table.to_csv(index=False).encode("utf-8"),
+                       f"{ticker}_{interval}_{effective}.csv", "text/csv",
+                       key="studio_csv", width="stretch")
+    d2.download_button("Download Excel", _excel_bytes({"OHLC": table}),
+                       f"{ticker}_{interval}_{effective}.xlsx",
+                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                       key="studio_xlsx", width="stretch")
+    gains = table["Points"].gt(0).sum()
+    d3.metric("Up candles", f"{int(gains)} of {len(table)}",
+              f"{gains / max(len(table), 1) * 100:.0f}%")
+
+    # ---- the ratio ----------------------------------------------------------
+    st.divider()
+    st.markdown("#### Ratio against a second instrument")
+    st.caption("A ratio chart answers which of two things is winning, independently of "
+               "whether the market as a whole went up or down.")
+    r1, r2 = st.columns(2)
+    second_pool = [t for t in pool if t != ticker]
+    second = r1.selectbox("Second ticker (the denominator)", second_pool,
+                          key="studio_second")
+    second_custom = r2.text_input("or type any Yahoo symbol", value="",
+                                  key="studio_second_custom").strip().upper()
+    if second_custom:
+        second = second_custom
+
+    try:
+        other = load_market_data(second, effective, interval,
+                                 freshness_seconds=120, min_bars=20).frame
+    except Exception as exc:                                        # noqa: BLE001
+        st.warning(f"Could not load `{second}`: {exc}. The ratio section needs both legs.")
+        return
+
+    joined, note = align_two_series(frame, other)
+    if joined.empty:
+        st.warning(note)
+        return
+    st.caption(f"Alignment: {note}.")
+
+    ratio = ratio_frame(joined)
+    st.plotly_chart(studio_chart(ratio, f"{ticker} / {second} · {interval}",
+                                 light=bool(cfg.get("light_charts")),
+                                 height=max(360, int(height) - 200)),
+                    width="stretch", config={"scrollZoom": True, "displaylogo": False})
+    first_ratio, last_ratio = float(ratio["Close"].iloc[0]), float(ratio["Close"].iloc[-1])
+    drift = (last_ratio / first_ratio - 1.0) * 100.0 if first_ratio else float("nan")
+    st.caption(f"The ratio moved from {fmt(first_ratio, 4)} to {fmt(last_ratio, 4)}, "
+               f"{fmt(drift)}% over the window — "
+               f"{'the first has outperformed' if drift > 0 else 'the second has outperformed'}.")
+
+    # ---- binned returns -----------------------------------------------------
+    st.markdown("#### Returns by bin")
+    bins = st.number_input("Number of bins", 2, 50, 5, 1, key="studio_bins",
+                           help="The window is split into this many equal stretches of "
+                                "time, and each leg's return over each stretch is shown "
+                                "side by side.")
+    returns = pd.DataFrame({
+        f"{ticker} return %": joined["a_close"].pct_change() * 100.0,
+        f"{second} return %": joined["b_close"].pct_change() * 100.0,
+    }).dropna()
+    if returns.empty:
+        st.info("Not enough overlapping bars to compute returns.")
+        return
+
+    labels = pd.cut(np.arange(len(returns)), int(bins), labels=False)
+    rows = []
+    for b in range(int(bins)):
+        mask = labels == b
+        if not mask.any():
+            continue
+        chunk = returns[mask]
+        rows.append({
+            "Bin": b + 1,
+            "From": chunk.index[0], "To": chunk.index[-1], "Candles": len(chunk),
+            f"{ticker} return %": round(float(
+                (1.0 + chunk.iloc[:, 0] / 100.0).prod() - 1.0) * 100.0, 3),
+            f"{second} return %": round(float(
+                (1.0 + chunk.iloc[:, 1] / 100.0).prod() - 1.0) * 100.0, 3),
+        })
+    bin_table = pd.DataFrame(rows)
+    bin_table["Difference"] = (bin_table[f"{ticker} return %"]
+                               - bin_table[f"{second} return %"]).round(3)
+    st.dataframe(bin_table, width="stretch", hide_index=True,
+                 column_config={
+                     f"{ticker} return %": st.column_config.NumberColumn(format="%.3f%%"),
+                     f"{second} return %": st.column_config.NumberColumn(format="%.3f%%"),
+                     "Difference": st.column_config.NumberColumn(format="%.3f%%")})
+    st.caption("Each bin compounds the candle returns inside it, which is the correct way "
+               "to add returns over time — summing them overstates a run of gains and "
+               "understates a run of losses.")
+
+    b1, b2 = st.columns(2)
+    b1.download_button("Bins as CSV", bin_table.to_csv(index=False).encode("utf-8"),
+                       f"bins_{ticker}_{second}.csv", "text/csv", key="studio_bins_csv",
+                       width="stretch")
+    b2.download_button("Bins as Excel",
+                       _excel_bytes({"Bins": bin_table, "Returns": returns.reset_index()}),
+                       f"bins_{ticker}_{second}.xlsx",
+                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                       key="studio_bins_xlsx", width="stretch")
+
+    # ---- the heatmaps -------------------------------------------------------
+    st.markdown("#### Returns heatmaps")
+    for label, column in ((ticker, returns.columns[0]), (second, returns.columns[1])):
+        figure, grid = returns_heatmap(returns[column], f"{label} — returns (%)",
+                                       light=bool(cfg.get("light_charts")))
+        if figure is None:
+            st.info(f"Not enough data to build a heatmap for {label}.")
+            continue
+        st.plotly_chart(figure, width="stretch", config={"displaylogo": False})
+        with st.expander(f"{label} heatmap as a table"):
+            st.dataframe(grid.round(3), width="stretch")
+    st.caption("Red is negative and teal positive, with grey at zero — a return is signed "
+               "around zero, so the scale diverges from a neutral midpoint rather than "
+               "running light to dark. Every cell carries its own number as well.")
+
+
+def _excel_bytes(sheets: dict) -> bytes:
+    """One workbook from a dict of {sheet name: frame}, as bytes for a download."""
+    import io
+    buffer = io.BytesIO()
+    try:
+        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+            for name, frame in sheets.items():
+                safe = frame.copy()
+                # Excel cannot store a timezone-aware timestamp.
+                for column in safe.columns:
+                    if isinstance(safe[column].dtype, pd.DatetimeTZDtype):
+                        safe[column] = safe[column].dt.tz_localize(None)
+                if isinstance(safe.index, pd.DatetimeIndex) and safe.index.tz is not None:
+                    safe.index = safe.index.tz_localize(None)
+                safe.to_excel(writer, sheet_name=str(name)[:31], index=False)
+    except Exception:                                               # noqa: BLE001
+        return b""
+    return buffer.getvalue()
+
+
 def main() -> None:
     st.set_page_config(page_title="Algo Trading Platform", layout="wide",
                        initial_sidebar_state="expanded")
@@ -15240,11 +16652,11 @@ def main() -> None:
     (status.success if st.session_state.live_running else status.info)(
         "LIVE CORE: RUNNING" if st.session_state.live_running else "LIVE CORE: IDLE")
 
-    (t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12) = st.tabs(
+    (t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14) = st.tabs(
         ["Backtesting Engine Studio", "Live Sandbox Operations", "Live Trade Log Ledger",
          "Signal Screener", "Auto Screener", "Strategy Optimiser", "Signal Lab",
          "Chart Patterns", "Gamma Blast", "Momentum Pulse", "Volatility Levels",
-         "Custom Indicators"])
+         "Custom Indicators", "Make or Break", "Chart Studio"])
     panels = ((t1, tab_backtest, "Backtesting Engine Studio"),
               (t2, tab_live, "Live Sandbox Operations"),
               (t3, tab_ledger, "Live Trade Log Ledger"),
@@ -15256,7 +16668,9 @@ def main() -> None:
               (t9, tab_gamma_blast, "Gamma Blast"),
               (t10, tab_momentum_pulse, "Momentum Pulse"),
               (t11, tab_volatility_levels, "Volatility Levels"),
-              (t12, tab_custom_screener, "Custom Indicators"))
+              (t12, tab_custom_screener, "Custom Indicators"),
+              (t13, tab_make_break, "Make or Break"),
+              (t14, tab_chart_studio, "Chart Studio"))
     for holder, render, name in panels:
         with holder:
             try:
@@ -17474,6 +18888,148 @@ def _test_custom_screener_and_sector_flip():
         SECTOR_BY_TICKER.pop("X.NS", None)
 
 
+def _mb_fixture(closes, highs=None, lows=None) -> pd.DataFrame:
+    """A frame from a list of closes, plus the forming candle smc/mb both drop."""
+    c = np.array(closes, float)
+    h = np.array(highs, float) if highs is not None else c + 0.6
+    l_ = np.array(lows, float) if lows is not None else c - 0.6
+    idx = pd.date_range("2026-01-01", periods=len(c) + 1, freq="15min")
+    frame = pd.DataFrame({"Open": c, "High": h, "Low": l_, "Close": c,
+                          "Volume": np.full(len(c), 1000.0)}, index=idx[:len(c)])
+    return pd.concat([frame, frame.tail(1)]).set_axis(idx)
+
+
+def _mb_wiggle(base: float, n: int, amp: float = 6.0, period: float = 11.0) -> list:
+    return [base + amp * math.sin(i / period) for i in range(n)]
+
+
+def _test_make_break_detectors():
+    """
+    Every make-or-break detector must find its OWN shape, and must not be a
+    detector that fires on everything.
+
+    The bench builds a deliberate example of each shape and runs all fifteen
+    detectors over all of them. Two failures matter: a detector that misses its
+    own fixture is broken, and a detector that fires on most of the OTHER
+    fixtures is noise -- which is what the first versions of the multi-touch
+    and equal-high tests were, firing on ten fixtures out of ten because they
+    counted every bar inside a half-ATR band rather than actual pivots.
+    """
+    shapes: dict[str, pd.DataFrame] = {}
+    shapes["compression"] = _mb_fixture(
+        _mb_wiggle(100, 260, 18, 9) + [100 + 0.25 * math.sin(i / 4) for i in range(120)])
+    triangle = [100 + 18.0 * (1 - i / 125.0) * math.sin(i / 7) for i in range(120)]
+    shapes["triangle"] = _mb_fixture(_mb_wiggle(100, 180, 18, 9) + triangle)
+    base = _mb_wiggle(100, 220, 6, 9)
+    shapes["breakout_retest"] = _mb_fixture(
+        base + list(np.linspace(106, 118, 12)) + list(np.linspace(118, 107, 10)))
+    shapes["breakdown_retest"] = _mb_fixture(
+        base + list(np.linspace(94, 82, 12)) + list(np.linspace(82, 93, 10)))
+
+    swept = _mb_wiggle(100, 230, 6, 9)
+    lows = [x - 0.6 for x in swept]
+    highs = [x + 0.6 for x in swept]
+    swept += [99.0, 98.0, 103.0]
+    lows += [98.4, 88.0, 102.4]
+    highs += [99.6, 98.6, 103.6]
+    shapes["failed_breakdown"] = _mb_fixture(swept, highs, lows)
+
+    popped = _mb_wiggle(100, 230, 6, 9)
+    lows2 = [x - 0.6 for x in popped]
+    highs2 = [x + 0.6 for x in popped]
+    popped += [101.0, 102.0, 97.0]
+    highs2 += [101.6, 112.0, 97.6]
+    lows2 += [100.4, 101.4, 96.4]
+    shapes["failed_breakout"] = _mb_fixture(popped, highs2, lows2)
+
+    shapes["double_bottom"] = _mb_fixture(
+        _mb_wiggle(100, 170, 5, 9) + list(np.linspace(100, 86, 14))
+        + list(np.linspace(86, 104, 16)) + list(np.linspace(104, 86, 16))
+        + list(np.linspace(86, 103, 14)))
+    shapes["double_top"] = _mb_fixture(
+        _mb_wiggle(100, 170, 5, 9) + list(np.linspace(100, 114, 14))
+        + list(np.linspace(114, 96, 16)) + list(np.linspace(96, 114, 16))
+        + list(np.linspace(114, 97, 14)))
+    shapes["at_resistance"] = _mb_fixture(
+        _mb_wiggle(100, 220, 8, 9) + [106.0, 107.0, 107.8, 108.0])
+    shapes["at_support"] = _mb_fixture(
+        _mb_wiggle(100, 220, 8, 9) + [94.0, 93.0, 92.2, 92.0])
+    shapes["inverted_v"] = _mb_fixture(
+        _mb_wiggle(100, 120, 4, 9) + list(np.linspace(100, 150, 60))
+        + list(np.linspace(150, 100, 60)))
+    shapes["v_bottom"] = _mb_fixture(
+        _mb_wiggle(150, 120, 4, 9) + list(np.linspace(150, 100, 60))
+        + list(np.linspace(100, 150, 60)))
+    ladder = []
+    for _ in range(6):
+        ladder += list(np.linspace(100, 110, 10)) + list(np.linspace(110, 101, 10))
+    shapes["multi_touch"] = _mb_fixture(_mb_wiggle(100, 120, 4, 9) + ladder + [108.0, 109.0])
+    twin_high = []
+    for _ in range(3):
+        twin_high += list(np.linspace(100, 112, 12)) + list(np.linspace(112, 102, 12))
+    shapes["equal_highs"] = _mb_fixture(_mb_wiggle(100, 150, 4, 9) + twin_high + [110.0])
+    twin_low = []
+    for _ in range(3):
+        twin_low += list(np.linspace(100, 88, 12)) + list(np.linspace(88, 98, 12))
+    shapes["equal_lows"] = _mb_fixture(_mb_wiggle(100, 150, 4, 9) + twin_low + [90.0])
+
+    contexts = {name: mb_context(frame, 120, 3, 0.5) for name, frame in shapes.items()}
+    assert all(ctx is not None for ctx in contexts.values()), "a fixture was too short"
+
+    missed, noisy = [], []
+    for key, label, fn in MAKE_BREAK_SETUPS:
+        fired = []
+        for name, ctx in contexts.items():
+            hit = fn(ctx)
+            if hit:
+                fired.append(name)
+                # Every hit must carry a coherent level set.
+                assert hit["direction"] in ("UP", "DOWN", "EITHER"), (label, hit)
+                assert 0.0 <= hit["score"] <= 100.0, (label, hit["score"])
+                assert str(hit["reading"]).strip(), label
+        if key in contexts and key not in fired:
+            missed.append(key)
+        if len(fired) > len(contexts) * 0.75:
+            noisy.append((key, len(fired)))
+    assert not missed, f"detectors that miss their own shape: {missed}"
+    assert not noisy, f"detectors firing on most unrelated shapes: {noisy}"
+
+    # The six structural setups must be sharply selective, not merely present.
+    for key in ("compression", "triangle", "breakout_retest", "breakdown_retest",
+                "failed_breakdown", "failed_breakout"):
+        _label, fn = MAKE_BREAK_BY_KEY[key]
+        fired = [name for name, ctx in contexts.items() if fn(ctx)]
+        assert fired == [key], f"{key} should fire on its shape alone, got {fired}"
+
+    # A long's stop sits below its entry and the target above, and the mirror.
+    for name, ctx in contexts.items():
+        for _key, _label, fn in MAKE_BREAK_SETUPS:
+            hit = fn(ctx)
+            if not hit:
+                continue
+            plan = mb_plan(ctx, hit)
+            if plan["side"] == "LONG":
+                assert plan["stop"] < plan["entry"] < plan["target"], (name, hit["setup"], plan)
+            elif plan["side"] == "SHORT":
+                assert plan["stop"] > plan["entry"] > plan["target"], (name, hit["setup"], plan)
+            else:
+                assert plan["entry"] is None, "an undecided coil must propose no entry"
+
+    # On random walks it must stay a shortlist rather than listing everything.
+    found = 0
+    samples = 60
+    for seed in range(samples):
+        ctx = mb_context(_synthetic(400, seed=seed), 120, 3, 0.5)
+        if ctx is None:
+            continue
+        found += sum(1 for _k, _l, fn in MAKE_BREAK_SETUPS if fn(ctx))
+    per_chart = found / samples
+    assert 0.3 < per_chart < 6.0, \
+        f"{per_chart:.1f} setups per random chart is not a shortlist"
+    print(f"   make or break: {len(MAKE_BREAK_SETUPS)} detectors, each finds its own shape, "
+          f"six fire on theirs alone, {per_chart:.1f} setups per random chart  OK")
+
+
 def _test_sweep_detection_is_not_always_true():
     """
     A liquidity sweep must be an EVENT, not a constant.
@@ -17973,6 +19529,140 @@ def _test_momentum_pulse_checklist():
     finally:
         globals()["st"] = real_st
         globals().update(saved)
+
+
+def _test_chart_studio_alignment_and_bins():
+    """
+    Chart Studio has to survive two markets that do not keep the same clock.
+
+    The user flagged this directly: Indian equities come back stamped
+    Asia/Kolkata, crypto in UTC, and some series with no zone at all. Joining
+    those as they arrive either raises outright or -- far worse -- silently
+    pairs bars hours apart and calls the result a ratio. Everything is pushed
+    to UTC first, a naive index is read as UTC and SAYS so, and the join keeps
+    only the timestamps both legs actually have.
+    """
+    def _leg(n, start, step, tz, freq="1h", shift_days=0):
+        idx = pd.date_range("2024-03-04 03:00", periods=n, freq=freq, tz=tz)
+        if shift_days:
+            idx = idx + pd.Timedelta(days=shift_days)
+        close = pd.Series(start + step * np.arange(n), index=idx, dtype=float)
+        return pd.DataFrame({"Open": close.shift(1).fillna(close.iloc[0]),
+                             "High": close * 1.004, "Low": close * 0.996,
+                             "Close": close, "Volume": 1000.0}, index=idx)
+
+    # Same clock, same stamps: an exact join, and nothing invented.
+    utc_a, utc_b = _leg(40, 100.0, 0.5, "UTC"), _leg(40, 50.0, 0.1, "UTC")
+    exact, exact_note = align_two_series(utc_a, utc_b)
+    assert len(exact) == 40 and "matched exactly" in exact_note, exact_note
+    assert str(exact.index.tz) == "UTC", "the joined index must be UTC"
+
+    # Half the stamps shared: the exact join still wins, and keeps only those.
+    sparse = utc_b.iloc[::2]
+    half, half_note = align_two_series(utc_a, sparse)
+    assert len(half) == len(sparse) and "matched exactly" in half_note, half_note
+
+    # India is UTC+5:30, so hourly Indian bars land at :45 and hourly crypto
+    # bars at :00 -- the two share NO timestamp at all. An exact-only join would
+    # refuse every India-against-crypto intraday pair, so these must pair with
+    # the nearest bar within half a bar instead.
+    kolkata = _leg(40, 100.0, 0.5, "Asia/Kolkata")
+    assert len(kolkata.index.tz_convert("UTC").intersection(utc_b.index)) == 0, (
+        "this fixture is only meaningful if the two clocks never coincide")
+    joined, note = align_two_series(kolkata, utc_b)
+    assert not joined.empty, "a half-hour-offset market must still form a ratio"
+    assert str(joined.index.tz) == "UTC" and "nearest bar" in note, note
+    assert len(joined) >= 35, len(joined)
+
+    # Nearest must mean nearest: no pair may sit more than half a bar apart.
+    pairs = joined.index.tz_convert("UTC")
+    nearest_gap = max(
+        min(abs((stamp - other).total_seconds()) for other in utc_b.index)
+        for stamp in pairs)
+    assert nearest_gap <= 1800 + 1, f"paired bars drifted {nearest_gap}s apart"
+
+    naive = _leg(30, 50.0, 0.1, None)
+    _j, naive_note = align_two_series(utc_a, naive)
+    assert "without a timezone" in naive_note, naive_note
+
+    # Markets whose histories never overlap must refuse in words, not raise.
+    far = _leg(20, 10.0, 0.1, "UTC", shift_days=400)
+    empty, why = align_two_series(utc_a, far)
+    assert empty.empty and "no ratio can be formed" in why, why
+    assert align_two_series(utc_a, utc_a.iloc[0:0])[0].empty, "an empty leg must refuse"
+
+    # Daily bars on different sessions still line up, which is the advice the
+    # refusal message gives -- so it had better be true.
+    daily_in = _leg(60, 100.0, 0.4, "Asia/Kolkata", freq="1D")
+    daily_us = _leg(60, 50.0, 0.1, "UTC", freq="1D")
+    daily_join, daily_note = align_two_series(daily_in, daily_us)
+    assert len(daily_join) >= 55, (len(daily_join), daily_note)
+
+    # The ratio's extremes must be pairings that could actually trade. The high
+    # is NOT high over high -- that is the best case of one leg paired with the
+    # best of the other, a bar that never existed.
+    ratio = ratio_frame(joined)
+    naive_high = (joined["a_high"] / joined["b_high"]).to_numpy(float)
+    assert np.all(ratio["High"].to_numpy(float) >= naive_high - 1e-12)
+    assert ratio["High"].iloc[0] > naive_high[0], "high/high understates the ratio high"
+    assert (ratio["High"] >= ratio[["Open", "Close"]].max(axis=1) - 1e-9).all()
+    assert (ratio["Low"] <= ratio[["Open", "Close"]].min(axis=1) + 1e-9).all()
+    assert abs(float(ratio["Close"].iloc[-1])
+               - float(joined["a_close"].iloc[-1] / joined["b_close"].iloc[-1])) < 1e-9
+    assert ratio_frame(pd.DataFrame()).empty, "an empty join must give an empty ratio"
+
+    # Bin returns compound. +10% then -10% is -1%, never 0%.
+    swing = pd.Series([10.0, -10.0])
+    compounded = ((1.0 + swing / 100.0).prod() - 1.0) * 100.0
+    assert abs(compounded + 1.0) < 1e-9 and abs(swing.sum()) < 1e-9
+
+    # Every bar lands in exactly one bin, and no bin is lost.
+    for count in (2, 5, 13):
+        labels = pd.cut(np.arange(97), count, labels=False)
+        assert len(set(labels)) == count and len(labels) == 97
+
+    # Heatmap orientation: intraday is hour x weekday, daily and coarser is
+    # year x month. One grid for both would leave half the cells empty.
+    rng = np.random.default_rng(4)
+    hourly_fig, hourly_grid = returns_heatmap(
+        pd.Series(rng.normal(0, 1, 200),
+                  index=pd.date_range("2024-01-01 09:00", periods=200, freq="1h",
+                                      tz="UTC")), "intraday")
+    assert hourly_fig is not None
+    assert hourly_grid.index.max() <= 23 and hourly_grid.columns.max() <= 6, hourly_grid.shape
+    daily_fig, daily_grid = returns_heatmap(
+        pd.Series(rng.normal(0, 1, 400),
+                  index=pd.date_range("2023-01-01", periods=400, freq="1D",
+                                      tz="UTC")), "daily")
+    assert daily_fig is not None
+    assert set(daily_grid.columns) <= set(range(1, 13)), daily_grid.columns
+    assert set(daily_grid.index) == {2023, 2024}, daily_grid.index
+
+    # A return is signed around zero, so the scale must diverge from a neutral
+    # midpoint and be symmetric -- not a light-to-dark sequential ramp.
+    heat = daily_fig.data[0]
+    assert heat.zmid == 0.0 and abs(heat.zmin + heat.zmax) < 1e-9, (heat.zmin, heat.zmax)
+    midpoint = [stop for stop in heat.colorscale if abs(stop[0] - 0.5) < 1e-9][0][1]
+    red, green, blue = (int(midpoint[i:i + 2], 16) for i in (1, 3, 5))
+    assert max(red, green, blue) - min(red, green, blue) < 12, (
+        f"the diverging midpoint must be neutral grey, not a hue ({midpoint})")
+    assert returns_heatmap(pd.Series(dtype=float), "empty")[0] is None
+
+    # The workbook must really build, with timezones stripped -- Excel cannot
+    # store a tz-aware timestamp and raises if asked to.
+    book = _excel_bytes({"Joined": joined.reset_index(names="Datetime")})
+    assert isinstance(book, bytes) and len(book) > 1000 and book[:2] == b"PK", len(book)
+
+    frame = _synthetic(260, seed=12)
+    verdict, narrative, setups = _studio_verdict(frame, {})
+    assert verdict in {"BUY", "SELL", "HOLD"} and len(narrative) > 40, narrative
+    # "WAIT" is a legitimate side: an undecided coil knows where, not which way.
+    assert all(row["Side"] in {"LONG", "SHORT", "WAIT"} for row in setups), setups
+    assert all(row["Side"] != "WAIT" or row["Entry"] is None for row in setups), (
+        "an undecided setup must not present an entry price")
+    assert len(studio_chart(frame, "t").data) == 3, "candles plus two moving averages"
+    print(f"   chart studio: tz join {len(joined)} bars, ratio candles consistent, "
+          f"bins compound, heatmaps diverging, verdict {verdict}  OK")
 
 
 def _test_volatility_levels_and_oi_ratio():
@@ -18700,6 +20390,7 @@ def run_selftest() -> int:
         _test_drawdown_and_reward_risk_objectives()
         _test_indicator_library()
         _test_custom_screener_and_sector_flip()
+        _test_make_break_detectors()
         _test_sweep_detection_is_not_always_true()
         _test_volatility_source_routing()
         _test_dvol_and_multi_timeframe_smc()
@@ -18711,6 +20402,7 @@ def run_selftest() -> int:
         _test_dhan_previous_oi_gives_a_day_change()
         _test_gamma_blast_always_explains_itself()
         _test_gamma_blast_detail_chart()
+        _test_chart_studio_alignment_and_bins()
         _test_sweep_progress_is_visible_and_rerun_is_deferred()
         print("-- filters --")
         _test_filters()
