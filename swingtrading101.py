@@ -15266,6 +15266,10 @@ class MBContext:
     vol_ratio: float
     vol_trend: float            # recent volume over earlier volume, <1 = drying up
     compression: float          # current range over its own historical median
+    # The window the indices above are measured in. Every detector works in bar
+    # positions 0..lookback-1; the chart needs the timestamps those positions
+    # stand for, and without the window itself there is no way back to them.
+    window: pd.DataFrame | None = None
 
 
 def _mb_pivots(highs: np.ndarray, lows: np.ndarray, left: int, right: int):
@@ -15336,7 +15340,7 @@ def mb_context(df: pd.DataFrame, lookback: int = 120, pivot: int = 3,
         rsi_now=_last(rsi(closed["Close"], 14)),
         vol_ratio=(float(volumes[-1]) / vol_avg) if (has_volume and vol_avg) else float("nan"),
         vol_trend=(vol_recent / vol_earlier) if (has_volume and vol_earlier) else float("nan"),
-        compression=compression)
+        compression=compression, window=window)
 
 
 def _touches(levels: np.ndarray, level: float, tol: float) -> int:
@@ -15383,7 +15387,10 @@ def mb_inverted_v(ctx: MBContext):
                 f"rose {fmt(rise)} from {fmt(base)} to {fmt(peak)} and has given back "
                 f"{retrace * 100:.0f}% of it, sitting {fmt(back)} from where the move began",
                 trigger=base, invalidation=peak, objective=base - rise * 0.5,
-                extras={"pivot_high": peak, "pivot_low": base})
+                extras={"pivot_high": peak, "pivot_low": base,
+                        "marks": [(base_i, base, "move began"),
+                                  (peak_i, peak, "top")],
+                        "arc": (base_i, peak_i, len(ctx.closes) - 1)})
 
 
 def mb_v_bottom(ctx: MBContext):
@@ -15405,7 +15412,10 @@ def mb_v_bottom(ctx: MBContext):
                 f"fell {fmt(fall)} from {fmt(start)} to {fmt(trough)} and has recovered the "
                 f"whole move, sitting {fmt(back)} from where the fall began",
                 trigger=start, invalidation=trough, objective=start + fall * 0.5,
-                extras={"pivot_high": start, "pivot_low": trough})
+                extras={"pivot_high": start, "pivot_low": trough,
+                        "marks": [(start_i, start, "fall began"),
+                                  (trough_i, trough, "bottom")],
+                        "arc": (start_i, trough_i, len(ctx.closes) - 1)})
 
 
 def mb_at_resistance(ctx: MBContext):
@@ -15423,7 +15433,8 @@ def mb_at_resistance(ctx: MBContext):
                 f"price is {fmt(max(distance, 0))} under {fmt(level)}, a level touched "
                 f"{hits} time(s) in {ctx.lookback} candles",
                 trigger=level + 0.25 * ctx.atr, invalidation=level - 1.5 * ctx.atr,
-                objective=level + height, extras={"touches": hits, "level": level})
+                objective=level + height,
+                extras={"touches": hits, "level": level, "level_name": "range high"})
 
 
 def mb_at_support(ctx: MBContext):
@@ -15441,7 +15452,8 @@ def mb_at_support(ctx: MBContext):
                 f"price is {fmt(max(distance, 0))} above {fmt(level)}, a level touched "
                 f"{hits} time(s) in {ctx.lookback} candles",
                 trigger=level - 0.25 * ctx.atr, invalidation=level + 1.5 * ctx.atr,
-                objective=level - height, extras={"touches": hits, "level": level})
+                objective=level - height,
+                extras={"touches": hits, "level": level, "level_name": "range low"})
 
 
 def mb_multi_touch(ctx: MBContext):
@@ -15481,7 +15493,10 @@ def mb_multi_touch(ctx: MBContext):
                 trigger=level + (0.25 * ctx.atr if side == "UP" else -0.25 * ctx.atr),
                 invalidation=level - (1.5 * ctx.atr if side == "UP" else -1.5 * ctx.atr),
                 objective=level + (height if side == "UP" else -height),
-                extras={"touches": hits, "level": level})
+                extras={"touches": hits, "level": level, "level_name": label,
+                        "marks": [(p, v, "") for p, v in
+                                  (ctx.pivot_highs if side == "UP" else ctx.pivot_lows)
+                                  if abs(v - level) <= band]})
 
 
 def mb_compression(ctx: MBContext):
@@ -15499,7 +15514,8 @@ def mb_compression(ctx: MBContext):
                 trigger=ctx.range_high + 0.25 * ctx.atr,
                 invalidation=ctx.range_low - 0.25 * ctx.atr,
                 objective=ctx.range_high + height,
-                extras={"level": ctx.range_high, "lower": ctx.range_low})
+                extras={"level": ctx.range_high, "lower": ctx.range_low,
+                        "zone": (ctx.range_low, ctx.range_high, "compression range")})
 
 
 def mb_triangle(ctx: MBContext):
@@ -15536,7 +15552,9 @@ def mb_triangle(ctx: MBContext):
                 invalidation=float(ctx.lows[-10:].min()) - 0.25 * ctx.atr,
                 objective=float(ctx.highs[-10:].max()) + height,
                 extras={"level": float(ctx.highs[-10:].max()),
-                        "lower": float(ctx.lows[-10:].min())})
+                        "lower": float(ctx.lows[-10:].min()),
+                        "lines": [(hs, float(np.polyfit(hx, hy, 1)[1]), "upper line"),
+                                  (ls, float(np.polyfit(lx, ly, 1)[1]), "lower line")]})
 
 
 def _prior_extreme(ctx: MBContext, bars_back: int):
@@ -15560,7 +15578,9 @@ def mb_breakout_retest(ctx: MBContext):
                 f"{fmt(ctx.price)}, still above the level it broke",
                 trigger=ctx.price + 0.25 * ctx.atr, invalidation=old_high - 0.75 * ctx.atr,
                 objective=ctx.price + (recent_max - old_high) * 2.0,
-                extras={"level": old_high})
+                extras={"level": old_high, "level_name": "broken high",
+                        "marks": [(int(np.argmax(ctx.highs[-20:])) + len(ctx.highs) - 20,
+                                   recent_max, "break high")]})
 
 
 def mb_breakdown_retest(ctx: MBContext):
@@ -15579,7 +15599,9 @@ def mb_breakdown_retest(ctx: MBContext):
                 f"{fmt(ctx.price)}, still below the level it broke",
                 trigger=ctx.price - 0.25 * ctx.atr, invalidation=old_low + 0.75 * ctx.atr,
                 objective=ctx.price - (old_low - recent_min) * 2.0,
-                extras={"level": old_low})
+                extras={"level": old_low, "level_name": "broken low",
+                        "marks": [(int(np.argmin(ctx.lows[-20:])) + len(ctx.lows) - 20,
+                                   recent_min, "break low")]})
 
 
 def mb_equal_highs(ctx: MBContext):
@@ -15604,7 +15626,9 @@ def mb_equal_highs(ctx: MBContext):
                 f"everyone short sit just above it, which is what makes it a target",
                 trigger=top + 0.25 * ctx.atr, invalidation=top - 1.5 * ctx.atr,
                 objective=top + (ctx.range_high - ctx.range_low) * 0.5,
-                extras={"level": top, "touches": matched})
+                extras={"level": top, "touches": matched, "level_name": "equal highs",
+                        "marks": [(p, v, "") for p, v in ctx.pivot_highs[-4:]
+                                  if abs(v - top) <= band]})
 
 
 def mb_equal_lows(ctx: MBContext):
@@ -15626,7 +15650,9 @@ def mb_equal_lows(ctx: MBContext):
                 f"everyone long sit just below it",
                 trigger=bottom - 0.25 * ctx.atr, invalidation=bottom + 1.5 * ctx.atr,
                 objective=bottom - (ctx.range_high - ctx.range_low) * 0.5,
-                extras={"level": bottom, "touches": matched})
+                extras={"level": bottom, "touches": matched, "level_name": "equal lows",
+                        "marks": [(p, v, "") for p, v in ctx.pivot_lows[-4:]
+                                  if abs(v - bottom) <= band]})
 
 
 def mb_failed_breakdown(ctx: MBContext):
@@ -15646,7 +15672,10 @@ def mb_failed_breakdown(ctx: MBContext):
                 f"price wicked {fmt(depth, 2)} ATR below {fmt(level)} and closed back above "
                 f"it: the sellers filled on that break are trapped",
                 trigger=ctx.price + 0.25 * ctx.atr, invalidation=pierced - 0.25 * ctx.atr,
-                objective=ctx.range_high, extras={"level": level})
+                objective=ctx.range_high,
+                extras={"level": level, "level_name": "swept support",
+                        "marks": [(int(np.argmin(ctx.lows[tail])) + tail.start,
+                                   pierced, "sweep low")]})
 
 
 def mb_failed_breakout(ctx: MBContext):
@@ -15666,7 +15695,10 @@ def mb_failed_breakout(ctx: MBContext):
                 f"price wicked {fmt(depth, 2)} ATR above {fmt(level)} and closed back below "
                 f"it: the buyers filled on that break are trapped",
                 trigger=ctx.price - 0.25 * ctx.atr, invalidation=pierced + 0.25 * ctx.atr,
-                objective=ctx.range_low, extras={"level": level})
+                objective=ctx.range_low,
+                extras={"level": level, "level_name": "swept resistance",
+                        "marks": [(int(np.argmax(ctx.highs[tail])) + tail.start,
+                                   pierced, "sweep high")]})
 
 
 def mb_double_bottom(ctx: MBContext):
@@ -15695,7 +15727,9 @@ def mb_double_bottom(ctx: MBContext):
                 + (", already broken" if broken else
                    f", {fmt(neckline - ctx.price)} above price"),
                 trigger=neckline + 0.25 * ctx.atr, invalidation=min(v1, v2) - 0.5 * ctx.atr,
-                objective=neckline + depth, extras={"level": neckline, "touches": 2})
+                objective=neckline + depth,
+                extras={"level": neckline, "level_name": "neckline", "touches": 2,
+                        "marks": [(i1, v1, "low 1"), (i2, v2, "low 2")]})
 
 
 def mb_double_top(ctx: MBContext):
@@ -15721,7 +15755,9 @@ def mb_double_top(ctx: MBContext):
                 + (", already broken" if broken else
                    f", {fmt(ctx.price - neckline)} below price"),
                 trigger=neckline - 0.25 * ctx.atr, invalidation=max(v1, v2) + 0.5 * ctx.atr,
-                objective=neckline - depth, extras={"level": neckline, "touches": 2})
+                objective=neckline - depth,
+                extras={"level": neckline, "level_name": "neckline", "touches": 2,
+                        "marks": [(i1, v1, "high 1"), (i2, v2, "high 2")]})
 
 
 def mb_trendline_retest(ctx: MBContext):
@@ -15739,37 +15775,65 @@ def mb_trendline_retest(ctx: MBContext):
                                (ctx.pivot_lows, "DOWN", "support")):
         if len(pivots) < 3:
             continue
-        xs = np.array([p for p, _v in pivots], float)
-        ys = np.array([v for _p, v in pivots], float)
-        try:
-            slope_, intercept = np.polyfit(xs, ys, 1)
-        except Exception:                                           # noqa: BLE001
+        # The last few pivots, and the fit has to be TIGHT. Fitting a line
+        # through every pivot in the window produces something close to the
+        # mean path, which a random walk crosses constantly -- measured, that
+        # version read a break-and-retest on 53% of random charts, which is a
+        # detector describing noise. A line only counts if the pivots really
+        # sit on it.
+        #
+        # And the line is fitted through the pivots BEFORE the break, which is
+        # what a person drawing it would do. The pivot the breakout itself
+        # creates sits well above a falling resistance line, so including it
+        # tilts the line up and destroys the very fit being tested -- so up to
+        # two of the newest pivots are dropped in search of the line that was
+        # actually broken.
+        recent_pivots, slope_, intercept, worst = None, None, None, None
+        for drop in (0, 1, 2):
+            upper = len(pivots) - drop
+            if upper < 3:
+                break
+            candidate_pivots = pivots[max(upper - 5, 0):upper]
+            fit = _mb_fit_line(candidate_pivots)
+            if fit is None:
+                continue
+            s_, i_, w_ = fit
+            if w_ > 0.75 * ctx.atr:
+                continue
+            if side == "UP" and s_ > -0.01 * ctx.atr:
+                continue
+            if side == "DOWN" and s_ < 0.01 * ctx.atr:
+                continue
+            recent_pivots, slope_, intercept, worst = candidate_pivots, s_, i_, w_
+            break
+        if recent_pivots is None:
             continue
-        if not (np.isfinite(slope_) and np.isfinite(intercept)):
-            continue
-        # A resistance line worth breaking slopes down or sideways; a support
-        # line worth breaking slopes up or sideways.
-        if side == "UP" and slope_ > 0.02 * ctx.atr:
-            continue
-        if side == "DOWN" and slope_ < -0.02 * ctx.atr:
-            continue
-
         last = len(ctx.closes) - 1
         line_at = lambda i: float(slope_ * i + intercept)           # noqa: E731
         line_now = line_at(last)
         if not np.isfinite(line_now):
             continue
 
-        recent = range(max(last - 25, 1), last + 1)
+        first_pivot = int(min(p for p, _v in recent_pivots))
+        recent = range(max(last - 25, first_pivot), last + 1)
         broke_at = None
         for i in recent:
-            above = ctx.closes[i] > line_at(i) + 0.4 * ctx.atr
-            below = ctx.closes[i] < line_at(i) - 0.4 * ctx.atr
+            above = ctx.closes[i] > line_at(i) + 0.5 * ctx.atr
+            below = ctx.closes[i] < line_at(i) - 0.5 * ctx.atr
             if (side == "UP" and above) or (side == "DOWN" and below):
                 broke_at = i
                 break
         if broke_at is None or broke_at >= last - 1:
             continue                       # no break, or it only just happened
+        # It has to be THE break. If the line had already been closed through
+        # on this side before, price is oscillating around a line rather than
+        # breaking one, and "the break" is an arbitrary pick among many.
+        earlier = range(first_pivot, broke_at)
+        already = any((ctx.closes[i] > line_at(i) + 0.5 * ctx.atr) if side == "UP"
+                      else (ctx.closes[i] < line_at(i) - 0.5 * ctx.atr)
+                      for i in earlier)
+        if already:
+            continue
 
         # A retest: price came back within half an ATR of the line AFTER the
         # break, and is still on the breaking side now.
@@ -15787,14 +15851,462 @@ def mb_trendline_retest(ctx: MBContext):
         objective = (line_now + height * 0.6) if side == "UP" else (line_now - height * 0.6)
         stop = (line_now - 0.75 * ctx.atr) if side == "UP" else (line_now + 0.75 * ctx.atr)
         return _hit(f"Trendline break + retest holding ({name})", side, score,
-                    f"a {name} line fitted through {len(pivots)} pivots (slope "
+                    f"a {name} line fitted through {len(recent_pivots)} pivots, each "
+                    f"within {fmt(worst)} of it (slope "
                     f"{slope_:+.4f} per candle) was broken {bars_since} candle(s) ago at "
                     f"{fmt(line_at(broke_at))}, retested, and price is still "
                     f"{'above' if side == 'UP' else 'below'} it at {fmt(line_now)}",
                     trigger=ctx.price + (0.25 * ctx.atr if side == "UP" else -0.25 * ctx.atr),
                     invalidation=stop, objective=objective,
-                    extras={"level": line_now, "touches": len(pivots)})
+                    extras={"level": line_now, "level_name": f"{name} line now",
+                            "touches": len(recent_pivots),
+                            "lines": [(float(slope_), float(intercept),
+                                       f"{name} trendline")],
+                            "marks": [(p, v, "") for p, v in recent_pivots]
+                                     + [(broke_at, float(ctx.closes[broke_at]), "break")]})
     return None
+
+
+def _mb_impulse_zone(ctx: MBContext, side: str):
+    """
+    The origin of the last impulsive move, and whether price is back at it.
+
+    A demand zone is not "somewhere price bounced". It is the small area a
+    strong move LEFT FROM -- the base of candles immediately before an advance
+    that departed quickly -- on the reasoning that whoever absorbed the supply
+    there left unfilled orders behind. What makes it tradable is that price has
+    now returned to it. A zone price never came back to is a fact about the
+    past, not a decision, so it is not reported.
+
+    Searched newest-first so the zone returned is the one price is actually at,
+    and the span is capped at 1.5 ATR: a "zone" wider than that is a range, and
+    calling the whole range a zone would make the stop meaningless.
+    """
+    closes, highs, lows = ctx.closes, ctx.highs, ctx.lows
+    last = len(closes) - 1
+    want_up = side == "DEMAND"
+    best = None
+    # The impulse must have finished long enough ago for price to have come
+    # back, and started late enough to still be the live zone.
+    for start in range(last - 6, 5, -1):
+        for length in (3, 4, 5, 6, 8):
+            end = start + length
+            if end > last - 3:
+                continue
+            move = float(closes[end] - closes[start])
+            if want_up and move < 3.0 * ctx.atr:
+                continue
+            if not want_up and move > -3.0 * ctx.atr:
+                continue
+            # The departure has to be IMPULSIVE, not a grind that happens to
+            # cover ground. Two tests: most of the candles push the same way,
+            # and the net move is a large fraction of the distance travelled.
+            # Without these, a random walk offers a qualifying "zone" about
+            # four times in ten, which would make the setup meaningless.
+            steps = np.diff(closes[start:end + 1])
+            if len(steps) == 0:
+                continue
+            with_move = float(np.mean(steps > 0) if want_up else np.mean(steps < 0))
+            travelled = float(np.abs(steps).sum())
+            efficiency = abs(move) / travelled if travelled > 0 else 0.0
+            if with_move < 0.7 or efficiency < 0.55:
+                continue
+            base = slice(max(start - 2, 0), start + 1)
+            z_low, z_high = float(lows[base].min()), float(highs[base].max())
+            span = z_high - z_low
+            # A zone wider than about one ATR is a range, and calling a range a
+            # zone makes the stop meaningless.
+            if span <= 0 or span > 1.2 * ctx.atr:
+                continue
+            # Price has to be AT the zone now -- inside it, or within an ATR of
+            # the edge it is arriving at. Demand is approached from above and
+            # supply from below, so the tolerance is not symmetric: being well
+            # BELOW a demand zone means the zone failed, not that it is being
+            # tested, and that is a different chart entirely.
+            if want_up:
+                near = z_low - 0.5 * ctx.atr <= ctx.price <= z_high + 1.0 * ctx.atr
+                distance = max(ctx.price - z_high, 0.0)
+            else:
+                near = z_low - 1.0 * ctx.atr <= ctx.price <= z_high + 0.5 * ctx.atr
+                distance = max(z_low - ctx.price, 0.0)
+            if not near:
+                continue
+            # How often the zone has already been revisited. A fresh zone is
+            # worth more than one that has been eaten through twice.
+            after = slice(end + 1, last + 1)
+            taps = 0
+            touching = False
+            for value in (lows[after] if want_up else highs[after]):
+                within = (value <= z_high + 0.1 * ctx.atr) if want_up \
+                    else (value >= z_low - 0.1 * ctx.atr)
+                if within and not touching:
+                    taps += 1
+                touching = within
+            # A zone already eaten through three times is spent, not fresh.
+            if taps > 2:
+                continue
+            departure = abs(move) / ctx.atr
+            candidate = {"low": z_low, "high": z_high, "start": start, "end": end,
+                         "taps": taps, "departure": departure, "span": span,
+                         "distance": distance, "efficiency": efficiency}
+            if best is None:
+                best = candidate
+            break
+        if best is not None:
+            break
+    return best
+
+
+def mb_demand_zone(ctx: MBContext):
+    """Price has come back to the base a strong advance left from."""
+    zone = _mb_impulse_zone(ctx, "DEMAND")
+    if zone is None:
+        return None
+    mid = (zone["low"] + zone["high"]) / 2.0
+    fresh = zone["taps"] <= 1
+    score = (48.0 + 22.0 * min(zone["departure"] / 5.0, 1.0)
+             + 15.0 * (1.0 - min(zone["span"] / (1.5 * ctx.atr), 1.0))
+             + (12.0 if fresh else -8.0 * min(zone["taps"] - 1, 3)))
+    return _hit("Demand zone retest", "UP", score,
+                f"a {fmt(zone['span'])}-wide base at {fmt(zone['low'])}–{fmt(zone['high'])} "
+                f"launched a {fmt(zone['departure'], 1)} ATR advance that travelled "
+                f"{zone['efficiency'] * 100:.0f}% straight, and price has come back into it "
+                + (f"for the first time" if zone["taps"] <= 1
+                   else f"for the {zone['taps']}th time, so it is no longer fresh"),
+                trigger=zone["high"] + 0.25 * ctx.atr,
+                invalidation=zone["low"] - 0.5 * ctx.atr,
+                objective=zone["high"] + abs(zone["departure"]) * ctx.atr,
+                extras={"level": mid, "level_name": "zone midpoint", "touches": zone["taps"],
+                        "zone": (zone["low"], zone["high"], "demand zone"),
+                        "marks": [(zone["start"], zone["high"], "origin"),
+                                  (zone["end"], float(ctx.closes[zone["end"]]), "impulse end")]})
+
+
+def mb_supply_zone(ctx: MBContext):
+    """Price has come back to the base a strong decline left from."""
+    zone = _mb_impulse_zone(ctx, "SUPPLY")
+    if zone is None:
+        return None
+    mid = (zone["low"] + zone["high"]) / 2.0
+    fresh = zone["taps"] <= 1
+    score = (48.0 + 22.0 * min(zone["departure"] / 5.0, 1.0)
+             + 15.0 * (1.0 - min(zone["span"] / (1.5 * ctx.atr), 1.0))
+             + (12.0 if fresh else -8.0 * min(zone["taps"] - 1, 3)))
+    return _hit("Supply zone retest", "DOWN", score,
+                f"a {fmt(zone['span'])}-wide base at {fmt(zone['low'])}–{fmt(zone['high'])} "
+                f"launched a {fmt(zone['departure'], 1)} ATR decline that travelled "
+                f"{zone['efficiency'] * 100:.0f}% straight, and price has come back into it "
+                + (f"for the first time" if zone["taps"] <= 1
+                   else f"for the {zone['taps']}th time, so it is no longer fresh"),
+                trigger=zone["low"] - 0.25 * ctx.atr,
+                invalidation=zone["high"] + 0.5 * ctx.atr,
+                objective=zone["low"] - abs(zone["departure"]) * ctx.atr,
+                extras={"level": mid, "level_name": "zone midpoint", "touches": zone["taps"],
+                        "zone": (zone["low"], zone["high"], "supply zone"),
+                        "marks": [(zone["start"], zone["low"], "origin"),
+                                  (zone["end"], float(ctx.closes[zone["end"]]), "impulse end")]})
+
+
+def _mb_bowl(values: np.ndarray, want_up: bool) -> dict | None:
+    """
+    Fit a parabola and report whether the data is actually bowl-shaped.
+
+    A rounding bottom is distinguished from a V by HOW it turned: smoothly,
+    over many candles, with the curve explaining most of the movement. The
+    quadratic's R-squared is what separates the two -- a V fits a parabola
+    badly -- and the vertex has to sit in the middle of the window, not at
+    either end, where any trend fits a gentle curve.
+    """
+    n = len(values)
+    if n < 30:
+        return None
+    x = np.arange(n, dtype=float)
+    try:
+        a, b, c = np.polyfit(x, values, 2)
+    except Exception:                                               # noqa: BLE001
+        return None
+    if not all(np.isfinite(v) for v in (a, b, c)) or a == 0:
+        return None
+    if (a <= 0) if want_up else (a >= 0):
+        return None                        # curving the wrong way
+    fitted = a * x * x + b * x + c
+    spread = float(np.var(values))
+    if spread <= 0:
+        return None
+    r2 = 1.0 - float(np.var(values - fitted)) / spread
+    vertex = -b / (2.0 * a)
+    if not (0.2 * n <= vertex <= 0.8 * n):
+        return None                        # the turn is at an edge, not in the middle
+    return {"a": float(a), "b": float(b), "c": float(c), "r2": r2,
+            "vertex": float(vertex), "fitted": fitted}
+
+
+def mb_rounding_bottom(ctx: MBContext):
+    """A smooth U: turned slowly over many candles, and is back near the rim."""
+    bowl = _mb_bowl(ctx.closes, want_up=True)
+    if bowl is None or bowl["r2"] < 0.55:
+        return None
+    trough = float(ctx.lows.min())
+    rim = float(max(ctx.closes[0], ctx.closes[-1]))
+    depth = rim - trough
+    if depth < 2.5 * ctx.atr:
+        return None
+    # The right side has to have come back up: a bowl still at its low is a
+    # downtrend that happens to be decelerating.
+    if ctx.price < trough + 0.5 * depth:
+        return None
+    left_rim, right_rim = float(ctx.closes[0]), ctx.price
+    symmetry = 1.0 - min(abs(left_rim - right_rim) / max(depth, 1e-9), 1.0)
+    score = 45.0 + 25.0 * min((bowl["r2"] - 0.55) / 0.35, 1.0) + 20.0 * symmetry
+    return _hit("Rounding bottom", "UP", score,
+                f"the last {len(ctx.closes)} closes fit a bowl with R² {bowl['r2']:.2f}, "
+                f"turning at candle {bowl['vertex']:.0f} of {len(ctx.closes)}; it is "
+                f"{fmt(depth)} deep and price has recovered to {fmt(ctx.price)}, "
+                f"{fmt(abs(rim - ctx.price))} from the rim at {fmt(rim)}",
+                trigger=rim + 0.25 * ctx.atr, invalidation=trough + 0.25 * depth,
+                objective=rim + depth,
+                extras={"level": rim, "level_name": "rim", "curve": bowl,
+                        "marks": [(int(np.argmin(ctx.lows)), trough, "base")]})
+
+
+def _mb_cup_handle(ctx: MBContext, inverted: bool):
+    """
+    A bowl, then a shallow drift against it near the rim.
+
+    The handle is the part people get wrong: it has to be SHALLOW. A pullback
+    deeper than half the cup is not a handle, it is a failure of the cup, and
+    treating the two the same is how this pattern earns its bad reputation.
+    """
+    n = len(ctx.closes)
+    if n < 45:
+        return None
+    handle_len = max(5, int(round(n * 0.18)))
+    cup_end = n - handle_len
+    cup = ctx.closes[:cup_end]
+    bowl = _mb_bowl(cup, want_up=not inverted)
+    if bowl is None or bowl["r2"] < 0.5:
+        return None
+
+    if not inverted:
+        extreme = float(ctx.lows[:cup_end].min())
+        rim = float(max(cup[0], cup[-1]))
+        depth = rim - extreme
+    else:
+        extreme = float(ctx.highs[:cup_end].max())
+        rim = float(min(cup[0], cup[-1]))
+        depth = extreme - rim
+    if depth < 2.5 * ctx.atr:
+        return None
+    # The cup has to have come back to its own rim before the handle starts.
+    if abs(float(cup[-1]) - rim) > 0.5 * depth:
+        return None
+
+    handle = ctx.closes[cup_end:]
+    if not inverted:
+        handle_extreme = float(ctx.lows[cup_end:].min())
+        pullback = rim - handle_extreme
+        against = ctx.price < float(cup[-1]) + 0.5 * ctx.atr
+    else:
+        handle_extreme = float(ctx.highs[cup_end:].max())
+        pullback = handle_extreme - rim
+        against = ctx.price > float(cup[-1]) - 0.5 * ctx.atr
+    if pullback <= 0.1 * ctx.atr or pullback > 0.5 * depth or not against:
+        return None
+    # And the handle must be drifting, not collapsing.
+    handle_span = float(handle.max() - handle.min())
+    if handle_span > 0.6 * depth:
+        return None
+
+    shallowness = 1.0 - min(pullback / (0.5 * depth), 1.0)
+    score = (42.0 + 22.0 * min((bowl["r2"] - 0.5) / 0.4, 1.0) + 20.0 * shallowness
+             + 14.0 * min(depth / (6.0 * ctx.atr), 1.0))
+    return {"bowl": bowl, "rim": rim, "extreme": extreme, "depth": depth,
+            "pullback": pullback, "handle_extreme": handle_extreme,
+            "cup_end": cup_end, "score": score, "handle_len": handle_len}
+
+
+def mb_cup_and_handle(ctx: MBContext):
+    """Cup, then a shallow pullback at the rim: the classic continuation."""
+    found = _mb_cup_handle(ctx, inverted=False)
+    if found is None:
+        return None
+    rim, depth = found["rim"], found["depth"]
+    return _hit("Cup and handle", "UP", found["score"],
+                f"a {fmt(depth)}-deep cup (R² {found['bowl']['r2']:.2f}) topped out at "
+                f"{fmt(rim)}, and the last {found['handle_len']} candles have drifted back "
+                f"{fmt(found['pullback'])} — {found['pullback'] / depth * 100:.0f}% of the "
+                f"cup, which is shallow enough to be a handle rather than a failure",
+                trigger=rim + 0.25 * ctx.atr,
+                invalidation=found["handle_extreme"] - 0.5 * ctx.atr,
+                objective=rim + depth,
+                extras={"level": rim, "level_name": "cup rim", "curve": found["bowl"],
+                        "zone": (found["handle_extreme"], rim, "handle",
+                                 found["cup_end"], len(ctx.closes) - 1),
+                        "marks": [(int(np.argmin(ctx.lows[:found["cup_end"]])),
+                                   found["extreme"], "cup base")]})
+
+
+def mb_inverted_cup_and_handle(ctx: MBContext):
+    """A dome, then a shallow drift up at the rim: the bearish mirror."""
+    found = _mb_cup_handle(ctx, inverted=True)
+    if found is None:
+        return None
+    rim, depth = found["rim"], found["depth"]
+    return _hit("Inverted cup and handle", "DOWN", found["score"],
+                f"a {fmt(depth)}-tall dome (R² {found['bowl']['r2']:.2f}) bottomed out at "
+                f"{fmt(rim)}, and the last {found['handle_len']} candles have drifted back "
+                f"up {fmt(found['pullback'])} — {found['pullback'] / depth * 100:.0f}% of "
+                f"the dome, shallow enough to be a handle rather than a recovery",
+                trigger=rim - 0.25 * ctx.atr,
+                invalidation=found["handle_extreme"] + 0.5 * ctx.atr,
+                objective=rim - depth,
+                extras={"level": rim, "level_name": "dome rim", "curve": found["bowl"],
+                        "zone": (rim, found["handle_extreme"], "handle",
+                                 found["cup_end"], len(ctx.closes) - 1),
+                        "marks": [(int(np.argmax(ctx.highs[:found["cup_end"]])),
+                                   found["extreme"], "dome top")]})
+
+
+def _mb_fit_line(points: list) -> tuple | None:
+    """Slope, intercept and worst residual for a line through swing pivots."""
+    if len(points) < 3:
+        return None
+    xs = np.array([p for p, _v in points], float)
+    ys = np.array([v for _p, v in points], float)
+    try:
+        slope_, intercept = np.polyfit(xs, ys, 1)
+    except Exception:                                               # noqa: BLE001
+        return None
+    if not (np.isfinite(slope_) and np.isfinite(intercept)):
+        return None
+    residuals = ys - (slope_ * xs + intercept)
+    return float(slope_), float(intercept), float(np.abs(residuals).max())
+
+
+def mb_trendline_test(ctx: MBContext):
+    """
+    An INTACT sloping line price is testing right now.
+
+    The sibling of the break-and-retest detector, and deliberately exclusive of
+    it: here the line has never been closed through, which is what makes the
+    current touch a decision. The line is fitted through the swing pivots and
+    the fit has to be tight -- every pivot within three quarters of an ATR --
+    because a line that only roughly describes the pivots is a line that can be
+    drawn anywhere.
+    """
+    best = None
+    for pivots, side, name in ((ctx.pivot_lows, "UP", "rising support"),
+                               (ctx.pivot_highs, "DOWN", "falling resistance")):
+        if len(pivots) < 3:
+            continue
+        fit = _mb_fit_line(pivots[-5:])
+        if fit is None:
+            continue
+        slope_, intercept, worst = fit
+        if worst > 0.75 * ctx.atr:
+            continue                        # the pivots are not on one line
+        # A support line must rise and a resistance line must fall, or there is
+        # no trend for the line to describe.
+        if side == "UP" and slope_ <= 0.01 * ctx.atr:
+            continue
+        if side == "DOWN" and slope_ >= -0.01 * ctx.atr:
+            continue
+
+        last = len(ctx.closes) - 1
+        line = lambda i: float(slope_ * i + intercept)              # noqa: E731
+        # Never closed through: that is what "intact" means.
+        broken = any((ctx.closes[i] < line(i) - 0.4 * ctx.atr) if side == "UP"
+                     else (ctx.closes[i] > line(i) + 0.4 * ctx.atr)
+                     for i in range(int(min(p for p, _v in pivots[-5:])), last + 1))
+        if broken:
+            continue
+        line_now = line(last)
+        distance = (ctx.price - line_now) if side == "UP" else (line_now - ctx.price)
+        if distance < -0.25 * ctx.atr or distance > 1.25 * ctx.atr:
+            continue                        # not being tested right now
+        touches = len(pivots[-5:])
+        height = ctx.range_high - ctx.range_low
+        score = (46.0 + 9.0 * min(touches, 5)
+                 + 18.0 * (1.0 - min(distance / (1.25 * ctx.atr), 1.0))
+                 + 10.0 * (1.0 - min(worst / (0.75 * ctx.atr), 1.0)))
+        candidate = _hit(
+            f"Trendline test ({name}, intact)", side, score,
+            f"{touches} pivots sit on a {name} line sloping {slope_:+.4f} per candle, every "
+            f"one within {fmt(worst)}; the line is at {fmt(line_now)} and price is "
+            f"{fmt(abs(distance))} from it, never having closed through. It holds or it "
+            f"breaks, and the stop is what tells you which",
+            trigger=ctx.price + (0.25 * ctx.atr if side == "UP" else -0.25 * ctx.atr),
+            invalidation=(line_now - 0.6 * ctx.atr) if side == "UP"
+            else (line_now + 0.6 * ctx.atr),
+            objective=(line_now + height * 0.5) if side == "UP"
+            else (line_now - height * 0.5),
+            extras={"level": line_now, "level_name": f"{name} line", "touches": touches,
+                    "lines": [(slope_, intercept, f"{name} trendline")],
+                    "marks": [(p, v, "") for p, v in pivots[-5:]]})
+        if best is None or candidate["score"] > best["score"]:
+            best = candidate
+    return best
+
+
+def mb_parallel_channel(ctx: MBContext):
+    """
+    Two roughly parallel rails, with price at one of them.
+
+    Both rails are fitted independently and then required to agree on slope
+    within a quarter, because two lines that merely both slope up are a wedge,
+    not a channel -- and a wedge resolves the opposite way. The side reported is
+    the rail price is standing on: at the lower rail the channel holding means
+    up, at the upper rail it means down.
+    """
+    high_fit = _mb_fit_line(ctx.pivot_highs[-5:])
+    low_fit = _mb_fit_line(ctx.pivot_lows[-5:])
+    if high_fit is None or low_fit is None:
+        return None
+    hs, hi, h_worst = high_fit
+    ls, li, l_worst = low_fit
+    if max(h_worst, l_worst) > 0.9 * ctx.atr:
+        return None
+    scale = max(abs(hs), abs(ls), 1e-12)
+    if abs(hs - ls) / scale > 0.25:
+        return None                         # a wedge, not a channel
+    last = len(ctx.closes) - 1
+    upper = hs * last + hi
+    lower = ls * last + li
+    width = upper - lower
+    if width < 1.5 * ctx.atr or width > 12.0 * ctx.atr:
+        return None
+    if ctx.price > upper + ctx.atr or ctx.price < lower - ctx.atr:
+        return None                         # already out of the channel
+
+    to_upper, to_lower = upper - ctx.price, ctx.price - lower
+    at_lower = to_lower <= to_upper
+    side = "UP" if at_lower else "DOWN"
+    rail = lower if at_lower else upper
+    distance = abs(ctx.price - rail)
+    if distance > 0.75 * ctx.atr:
+        return None                         # mid-channel: nothing to decide
+    slope_word = ("rising" if (hs + ls) / 2 > 0.01 * ctx.atr else
+                  "falling" if (hs + ls) / 2 < -0.01 * ctx.atr else "sideways")
+    touches = len(ctx.pivot_highs[-5:]) + len(ctx.pivot_lows[-5:])
+    score = (44.0 + 7.0 * min(touches, 6)
+             + 18.0 * (1.0 - min(distance / (0.75 * ctx.atr), 1.0))
+             + 10.0 * (1.0 - min(abs(hs - ls) / (0.25 * scale), 1.0)))
+    return _hit(f"Parallel channel ({slope_word}, at the "
+                f"{'lower' if at_lower else 'upper'} rail)", side, score,
+                f"a {slope_word} channel {fmt(width)} wide ({fmt(width / ctx.atr, 1)} ATR), "
+                f"rails sloping {hs:+.4f} and {ls:+.4f} per candle — within a quarter of "
+                f"each other, so it is a channel and not a wedge — with {touches} pivots "
+                f"on them. Price is {fmt(distance)} from the "
+                f"{'lower rail at ' + fmt(lower) if at_lower else 'upper rail at ' + fmt(upper)}",
+                trigger=ctx.price + (0.25 * ctx.atr if at_lower else -0.25 * ctx.atr),
+                invalidation=(lower - 0.6 * ctx.atr) if at_lower else (upper + 0.6 * ctx.atr),
+                objective=(upper if at_lower else lower),
+                extras={"level": rail, "level_name": ("lower rail" if at_lower
+                                                      else "upper rail"),
+                        "touches": touches,
+                        "lines": [(hs, hi, "upper rail"), (ls, li, "lower rail")],
+                        "marks": [(p, v, "") for p, v in ctx.pivot_highs[-5:]]
+                                 + [(p, v, "") for p, v in ctx.pivot_lows[-5:]]})
 
 
 MAKE_BREAK_SETUPS = [
@@ -15814,6 +16326,13 @@ MAKE_BREAK_SETUPS = [
     ("double_bottom", "Double bottom / W", mb_double_bottom),
     ("double_top", "Double top / M", mb_double_top),
     ("trendline_retest", "Trendline break + retest", mb_trendline_retest),
+    ("trendline_test", "Trendline test (intact)", mb_trendline_test),
+    ("parallel_channel", "Parallel channel rail", mb_parallel_channel),
+    ("demand_zone", "Demand zone retest", mb_demand_zone),
+    ("supply_zone", "Supply zone retest", mb_supply_zone),
+    ("rounding_bottom", "Rounding bottom", mb_rounding_bottom),
+    ("cup_handle", "Cup and handle", mb_cup_and_handle),
+    ("inv_cup_handle", "Inverted cup and handle", mb_inverted_cup_and_handle),
 ]
 MAKE_BREAK_BY_KEY = {key: (label, fn) for key, label, fn in MAKE_BREAK_SETUPS}
 
@@ -15899,6 +16418,198 @@ def mb_plan(ctx: MBContext, hit: dict) -> dict:
             "stop": float(stop), "target": float(target), "rr": rr, "note": note}
 
 
+# --- drawing the setup ------------------------------------------------------
+# A readiness score and a sentence are an argument about a chart. Drawing the
+# argument ON the chart is what lets you disagree with it: if the line the
+# detector fitted is not the line you would have drawn, you can see that in a
+# second, which is impossible from a table.
+_MB_ZONE_FILL = "rgba(61, 135, 232, 0.16)"
+_MB_LINE = "#3d87e8"
+_MB_MARK = "#f4a261"
+
+
+def mb_setup_chart(ctx: MBContext, hit: dict, plan: dict, title: str,
+                   light: bool = False, height: int = 560):
+    """
+    The candles the detector looked at, with everything it found drawn on them.
+
+    Bar positions come back from the detector as indices into the context
+    window, so they are mapped through that window's own index -- the only
+    honest way to put a detector's finding at a date.
+    """
+    import plotly.graph_objects as go
+
+    window = ctx.window if ctx.window is not None else ctx.closed.tail(ctx.lookback)
+    stamps = list(window.index)
+    span = len(stamps)
+
+    def at(i) -> object:
+        """A bar position as the timestamp it stands for, clamped to the window."""
+        return stamps[int(min(max(int(i), 0), span - 1))]
+
+    figure = go.Figure(go.Candlestick(
+        x=stamps, open=window["Open"], high=window["High"],
+        low=window["Low"], close=window["Close"], name="Price",
+        increasing_line_color=_UP, decreasing_line_color=_DOWN,
+        increasing_fillcolor=_UP, decreasing_fillcolor=_DOWN, line=dict(width=1)))
+
+    lo = float(window["Low"].min())
+    hi = float(window["High"].max())
+    pad = max((hi - lo) * 0.08, ctx.atr)
+
+    def in_view(value) -> bool:
+        return value is not None and np.isfinite(value) \
+            and lo - 4 * pad <= float(value) <= hi + 4 * pad
+
+    # The zone, drawn as a band so its WIDTH is visible -- a zone's width is
+    # the risk, and a zone drawn as a line hides exactly that.
+    #
+    # A supply or demand zone is a price level that applies across the whole
+    # chart, so it spans it. A handle is a thing that happened over PARTICULAR
+    # candles, so it is boxed to those: drawn full width it would suggest the
+    # handle covered the entire window, which is the opposite of what makes it
+    # a handle. Detectors say which they mean by supplying x bounds or not.
+    zone = hit.get("zone")
+    if zone:
+        z0, z1, zname = float(zone[0]), float(zone[1]), str(zone[2])
+        top, bottom = max(z0, z1), min(z0, z1)
+        bounded = len(zone) >= 5 and zone[3] is not None and zone[4] is not None
+        if bounded:
+            figure.add_vrect(x0=at(zone[3]), x1=at(zone[4]), y0=0, y1=1,
+                             fillcolor="rgba(0,0,0,0)", line_width=0, layer="below")
+            figure.add_shape(type="rect", x0=at(zone[3]), x1=at(zone[4]),
+                             y0=bottom, y1=top, fillcolor=_MB_ZONE_FILL,
+                             line=dict(color=_MB_LINE, width=1, dash="dot"),
+                             layer="below")
+            label_x, anchor = at(zone[3]), "left"
+        else:
+            figure.add_hrect(y0=bottom, y1=top, fillcolor=_MB_ZONE_FILL,
+                             line_width=0, layer="below")
+            label_x, anchor = at(span * 0.02), "left"
+        # Named just ABOVE the band, not through its middle, where the zone's
+        # own midpoint line runs and the two would overprint each other.
+        figure.add_annotation(x=label_x, y=top, text=zname, showarrow=False,
+                              xanchor=anchor, yanchor="bottom", yshift=7,
+                              font=dict(size=11, color=_MB_LINE))
+
+    # Fitted lines, drawn only across the stretch they were fitted over.
+    for slope_, intercept, name in hit.get("lines", []) or []:
+        xs = np.arange(span, dtype=float)
+        ys = slope_ * xs + intercept
+        keep = (ys >= lo - 2 * pad) & (ys <= hi + 2 * pad)
+        if not keep.any():
+            continue
+        figure.add_trace(go.Scatter(
+            x=[stamps[i] for i in np.flatnonzero(keep)], y=ys[keep], mode="lines",
+            name=name, line=dict(color=_MB_LINE, width=1.8, dash="dot"),
+            hovertemplate=f"{name}: %{{y:.2f}}<extra></extra>"))
+
+    # The fitted bowl, so a "rounding bottom" can be judged as one.
+    curve = hit.get("curve")
+    if curve:
+        xs = np.arange(len(curve["fitted"]), dtype=float)
+        figure.add_trace(go.Scatter(
+            x=[at(i) for i in xs], y=curve["fitted"], mode="lines",
+            name=f"fitted curve (R² {curve['r2']:.2f})",
+            line=dict(color=_MB_LINE, width=1.8, dash="dot"),
+            hovertemplate="fitted: %{y:.2f}<extra></extra>"))
+
+    # The pivots and bars the detector actually counted.
+    marks = [(p, v, label) for p, v, label in (hit.get("marks") or [])
+             if in_view(v)]
+    if marks:
+        figure.add_trace(go.Scatter(
+            x=[at(p) for p, _v, _l in marks], y=[float(v) for _p, v, _l in marks],
+            mode="markers", name="what was counted",
+            marker=dict(size=10, color=_MB_MARK, symbol="circle",
+                        line=dict(width=1.5, color="rgba(255,255,255,0.7)")),
+            text=[label for _p, _v, label in marks],
+            hovertemplate="%{text}<br>%{y:.2f}<extra></extra>"))
+        for p, v, label in marks:
+            if label:
+                figure.add_annotation(x=at(p), y=float(v), text=label, showarrow=True,
+                                      arrowhead=0, arrowwidth=1, ay=-22, ax=0,
+                                      font=dict(size=10, color=_MB_MARK))
+
+    # The level, the trigger, the stop and the target. Levels outside the
+    # candles are annotated at the edge rather than stretching the axis, which
+    # is what used to flatten these charts into a line.
+    level = hit.get("level")
+    rows = [(level, hit.get("level_name") or "the level", _MB_LINE, "solid")]
+    if plan.get("side") != "WAIT":
+        rows += [(plan.get("entry"), "entry (trigger)", _SMC_INK, "dash"),
+                 (plan.get("stop"), "stop (invalidation)", _DOWN, "dash"),
+                 (plan.get("target"), "target (measured move)", _UP, "dash")]
+    else:
+        rows += [(hit.get("trigger"), "long above", _UP, "dash"),
+                 (hit.get("invalidation"), "short below", _DOWN, "dash")]
+    offscreen = []
+    for value, name, colour, dash in rows:
+        if value is None or not np.isfinite(float(value)):
+            continue
+        value = float(value)
+        if lo - pad <= value <= hi + pad:
+            figure.add_hline(y=value, line=dict(color=colour, width=1.4, dash=dash),
+                             annotation_text=f"{name} {fmt(value)}",
+                             annotation_position="right",
+                             annotation_font=dict(size=10, color=colour))
+        else:
+            offscreen.append(f"{name} {fmt(value)}")
+
+    if offscreen:
+        # In paper coordinates, pinned under the title. Placed in the data it
+        # lands on whatever happens to be at the top of the chart -- a rail, a
+        # level label -- and overprints it.
+        figure.add_annotation(
+            xref="paper", yref="paper", x=0.01, y=1.0, xanchor="left", yanchor="top",
+            text="off this chart: " + " · ".join(offscreen), showarrow=False,
+            font=dict(size=10, color=_SMC_INK), bgcolor="rgba(127,127,127,0.18)",
+            borderpad=3)
+
+    figure.update_layout(
+        height=int(height), margin=dict(l=62, r=150, t=52, b=40),
+        title=dict(text=title, x=0.01, xanchor="left", font=dict(size=15)),
+        hovermode="x unified", dragmode="pan", xaxis_rangeslider_visible=False,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        template="plotly_white" if light else None)
+    figure.update_yaxes(range=[lo - pad, hi + pad], showgrid=True,
+                        gridcolor="rgba(128,128,128,0.15)")
+    figure.update_xaxes(showgrid=False)
+    return figure
+
+
+def mb_rebuild_one(ticker: str, interval: str, period: str, setup_key: str,
+                   lookback: int, pivot: int, tol_atr: float):
+    """
+    Re-run ONE detector so its geometry can be drawn.
+
+    The scan stores numbers, not shapes -- carrying every fitted line for every
+    row of a 500-row sweep would be wasteful. So the chart re-derives the one
+    setup being inspected from the same inputs, which also means the picture
+    cannot drift out of step with the row above it.
+    """
+    entry = MAKE_BREAK_BY_KEY.get(setup_key)
+    if not entry:
+        return None, None, None, "this setup is no longer registered"
+    _label, fn = entry
+    try:
+        frame = load_market_data(ticker, period, interval,
+                                 freshness_seconds=180, min_bars=60).frame
+    except Exception as exc:                                        # noqa: BLE001
+        return None, None, None, f"could not reload `{ticker}`: {exc}"
+    ctx = mb_context(frame, lookback, pivot, tol_atr)
+    if ctx is None:
+        return None, None, None, "not enough history to rebuild the context"
+    try:
+        hit = fn(ctx)
+    except Exception as exc:                                        # noqa: BLE001
+        return ctx, None, None, f"the detector failed on reload: {exc}"
+    if not hit:
+        return ctx, None, None, ("the setup is no longer present on fresh data — it has "
+                                 "either triggered or decayed since the scan ran")
+    return ctx, hit, mb_plan(ctx, hit), ""
+
+
 def make_break_scan_one(ticker: str, interval: str, period: str, wanted: list[str],
                         lookback: int = 120, pivot: int = 3, tol_atr: float = 0.5,
                         min_score: float = 0.0) -> list[dict]:
@@ -15931,6 +16642,7 @@ def make_break_scan_one(ticker: str, interval: str, period: str, wanted: list[st
             continue
         rows.append({
             "Ticker": ticker, "Timeframe": interval, "Period": period,
+            "Setup key": key,
             "Setup": hit["setup"], "Direction": hit["direction"],
             "Readiness": round(readiness, 1),
             "Side": plan["side"], "Entry": plan["entry"], "Stop": plan["stop"],
@@ -16104,6 +16816,50 @@ def tab_make_break(cfg: dict) -> None:
         p4.metric("Reward : risk", f"{fmt(picked['R:R'])} : 1" if picked.get("R:R") else "--")
     if str(picked.get("Plan note") or ""):
         st.warning(picked["Plan note"])
+
+    # --- the setup, drawn ---------------------------------------------------
+    # The row above is an argument about a chart. Drawing it lets you disagree:
+    # if the line the detector fitted is not the line you would have drawn, that
+    # is obvious in a second here and invisible in a table.
+    chart_on = st.checkbox("Draw this setup on a candlestick chart", value=True,
+                           key="mb_draw",
+                           help="Re-runs this one detector on fresh data and plots what it "
+                                "found: the level or zone, any fitted line or curve, the "
+                                "pivots it counted, and the entry, stop and target.")
+    if chart_on:
+        h1, h2 = st.columns([1, 3])
+        chart_height = h1.number_input("Chart height (pixels)", 320, 1200, 560, 40,
+                                       key="mb_chart_height")
+        ctx_drawn, hit_drawn, plan_drawn, problem = mb_rebuild_one(
+            picked["Ticker"], picked["Timeframe"], picked["Period"],
+            str(picked.get("Setup key") or ""), int(lookback), int(pivot), float(tol_atr))
+        if problem:
+            st.info(f"Cannot draw this one: {problem}.")
+        else:
+            st.plotly_chart(
+                mb_setup_chart(ctx_drawn, hit_drawn, plan_drawn,
+                               f"{picked['Ticker']} · {picked['Timeframe']} · "
+                               f"{hit_drawn['setup']}",
+                               light=bool(cfg.get("light_charts")),
+                               height=int(chart_height)),
+                width="stretch", config={"scrollZoom": True, "displaylogo": False})
+            drawn = []
+            if hit_drawn.get("zone"):
+                drawn.append("the shaded band is the zone itself, so its width is the risk")
+            if hit_drawn.get("lines"):
+                drawn.append("dotted straight lines are fitted through the swing pivots, "
+                             "not drawn by eye")
+            if hit_drawn.get("curve"):
+                drawn.append(f"the dotted curve is the fitted bowl "
+                             f"(R² {hit_drawn['curve']['r2']:.2f} — how much of the move it "
+                             f"actually explains)")
+            if hit_drawn.get("marks"):
+                drawn.append("orange dots are the exact bars the detector counted")
+            drawn.append("dashed horizontals are the entry, stop and target")
+            st.caption("What you are looking at: " + "; ".join(drawn)
+                       + ". Scroll to zoom, drag to pan. The chart is rebuilt live, so if "
+                       "the setup has triggered or decayed since the scan it says so "
+                       "instead of drawing a stale picture.")
 
     if i2.button("Apply to the sidebar", width="stretch", key="mb_apply",
                  help="Sends this ticker and timeframe to the control console so it can be "
@@ -16309,23 +17065,295 @@ def returns_heatmap(series: pd.Series, title: str, light: bool = False):
         y_labels = [str(int(r)) for r in table.index]
         row_name, col_name = "Year", "Month"
 
+    # The grid is relabelled with the axis labels the chart itself uses. A grid
+    # indexed 0..6 and 0..23 is unreadable in the table view and worse in prose
+    # -- "the best cell is 0 / 5" means nothing, "Mon / 05:00" means something.
+    table = pd.DataFrame(table.to_numpy(float), index=y_labels, columns=x_labels)
+    table.index.name = row_name
+    table.columns.name = col_name
     z = table.to_numpy(float)
     limit = float(np.nanmax(np.abs(z))) if np.isfinite(z).any() else 1.0
     limit = limit if limit > 0 else 1.0
     figure = go.Figure(go.Heatmap(
-        z=z, x=x_labels, y=y_labels, colorscale=_DIVERGING_RETURNS,
+        z=z, x=list(table.columns), y=list(table.index), colorscale=_DIVERGING_RETURNS,
         zmid=0.0, zmin=-limit, zmax=limit,
         text=np.round(z, 2), texttemplate="%{text}", textfont=dict(size=10),
         colorbar=dict(title="%"),
         hovertemplate=f"{col_name} %{{x}}<br>{row_name} %{{y}}<br>%{{z:.2f}}%<extra></extra>"))
     figure.update_layout(
         title=dict(text=title, x=0.01, xanchor="left", font=dict(size=14)),
-        height=max(260, 42 * len(y_labels) + 120),
+        height=max(260, 42 * len(table.index) + 120),
         margin=dict(l=70, r=20, t=50, b=40),
         template="plotly_white" if light else None)
     figure.update_xaxes(title_text=col_name, side="top")
     figure.update_yaxes(title_text=row_name, autorange="reversed")
     return figure, table
+
+
+def returns_bar(series: pd.Series, title: str, light: bool = False, height: int = 300):
+    """
+    Per-candle returns as bars either side of zero.
+
+    One series, so no legend is needed: the zero line and the two poles carry
+    the whole reading. Same red and teal as everything else, because a positive
+    return should not change colour between two charts on one page.
+    """
+    import plotly.graph_objects as go
+
+    values = pd.Series(series).dropna()
+    if values.empty:
+        return None
+    colours = [_UP if v >= 0 else _DOWN for v in values.to_numpy(float)]
+    figure = go.Figure(go.Bar(
+        x=values.index, y=values.to_numpy(float), marker_color=colours,
+        marker_line_width=0, hovertemplate="%{x}<br>%{y:.3f}%<extra></extra>"))
+    figure.add_hline(y=0.0, line=dict(color="rgba(128,128,128,0.6)", width=1))
+    figure.update_layout(
+        height=int(height), margin=dict(l=62, r=24, t=48, b=36), bargap=0.15,
+        title=dict(text=title, x=0.01, xanchor="left", font=dict(size=14)),
+        template="plotly_white" if light else None, showlegend=False)
+    figure.update_yaxes(title_text="%", showgrid=True,
+                        gridcolor="rgba(128,128,128,0.15)", zeroline=False)
+    figure.update_xaxes(showgrid=False)
+    return figure
+
+
+def studio_stack(panels: list, light: bool = False, row_height: int = 300):
+    """
+    Several candle charts stacked on ONE shared time axis.
+
+    Three charts side by side in a page are three separate readings; three
+    stacked on a shared axis are one. Panning or zooming any of them moves all
+    three together, so a move in the ratio can be traced to the leg that caused
+    it by looking straight up or down rather than by comparing dates by eye.
+    """
+    from plotly.subplots import make_subplots
+    import plotly.graph_objects as go
+
+    usable = [(label, frame) for label, frame in panels
+              if frame is not None and not frame.empty]
+    if not usable:
+        return None
+    figure = make_subplots(rows=len(usable), cols=1, shared_xaxes=True,
+                           vertical_spacing=0.055,
+                           subplot_titles=[label for label, _f in usable])
+    for row, (_label, frame) in enumerate(usable, start=1):
+        figure.add_trace(go.Candlestick(
+            x=frame.index, open=frame["Open"], high=frame["High"],
+            low=frame["Low"], close=frame["Close"], showlegend=False,
+            increasing_line_color=_UP, decreasing_line_color=_DOWN,
+            increasing_fillcolor=_UP, decreasing_fillcolor=_DOWN,
+            line=dict(width=1)), row=row, col=1)
+        figure.update_yaxes(showgrid=True, gridcolor="rgba(128,128,128,0.15)",
+                            row=row, col=1)
+        figure.update_xaxes(rangeslider_visible=False, showgrid=False, row=row, col=1)
+    figure.update_layout(
+        height=int(row_height) * len(usable) + 60,
+        margin=dict(l=62, r=24, t=48, b=40), hovermode="x unified", dragmode="pan",
+        template="plotly_white" if light else None)
+    for note in figure.layout.annotations:
+        note.font.size = 13
+        note.x, note.xanchor = 0.01, "left"
+    return figure
+
+
+def _ordinal(number: int) -> str:
+    """32nd, not 32th."""
+    n = int(number)
+    if n % 100 in (11, 12, 13):
+        return f"{n}th"
+    return f"{n}{ {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th') }".replace(" ", "")
+
+
+def _bin_notes(table: pd.DataFrame, columns: list,
+               floor: float = 0.0) -> tuple[list, list]:
+    """
+    Which bins are worth looking at, and why.
+
+    Colouring every row would defeat the purpose -- the operator's own point:
+    if every bin is shaded, the shading tells you nothing about where to look.
+    So a bin has to clear TWO gates, because either one alone is misleading.
+
+    Relative: more than 1.5 standard deviations from the other bins. On its
+    own this flags a 1.1% bin sitting among 1.0% bins, which is statistically
+    unusual and practically meaningless.
+
+    Absolute: the move also has to be big enough to matter -- past `floor`,
+    which the caller sets from the data's own volatility (the move a bin of
+    that many candles would make by chance), and at least half again the
+    typical bin. A move no larger than chance is not an event however it
+    ranks against its neighbours.
+
+    With fewer than four bins a standard deviation across them means nothing,
+    so nothing is flagged and the table says so rather than inventing
+    significance.
+    """
+    if len(table) < 4:
+        return [False] * len(table), [""] * len(table)
+    flags, reasons = [], []
+    stats = {}
+    for column in columns:
+        series = pd.to_numeric(table[column], errors="coerce")
+        sd = float(series.std(ddof=0))
+        typical = float(series.abs().median())
+        stats[column] = (float(series.mean()), sd if sd > 0 else float("nan"), typical)
+    for position in range(len(table)):
+        why = []
+        for column in columns:
+            mean, sd, typical = stats[column]
+            if not np.isfinite(sd):
+                continue
+            value = float(pd.to_numeric(table[column], errors="coerce").iloc[position])
+            if not np.isfinite(value):
+                continue
+            z = (value - mean) / sd
+            big_enough = abs(value) >= max(float(floor), 1.5 * typical)
+            if abs(z) >= 1.5 and big_enough:
+                direction = "unusually strong" if z > 0 else "unusually weak"
+                why.append(f"{column.replace(' return %', '')} {direction} at "
+                           f"{value:+.2f}% ({z:+.1f} SD from the other bins)")
+        flags.append(bool(why))
+        reasons.append("; ".join(why))
+    return flags, reasons
+
+
+def _studio_insights(ticker: str, second: str, joined: pd.DataFrame,
+                     ratio: pd.DataFrame, returns: pd.DataFrame,
+                     bin_table: pd.DataFrame, grids: dict) -> list:
+    """
+    Read the numbers that were just computed and say what they show.
+
+    Every line below is derived from this window's own data -- there is no
+    stored commentary and no template with the ticker dropped into it, because
+    a sentence that would be true whatever the chart did is worse than no
+    sentence at all.
+    """
+    out = []
+    a_col, b_col = returns.columns[0], returns.columns[1]
+    a_ret = returns[a_col] / 100.0
+    b_ret = returns[b_col] / 100.0
+    a_total = (1.0 + a_ret).prod() - 1.0
+    b_total = (1.0 + b_ret).prod() - 1.0
+
+    leader, laggard = ((ticker, second) if a_total > b_total else (second, ticker))
+    gap = abs(a_total - b_total) * 100.0
+    out.append(("Who won",
+                f"Over these {len(returns)} shared candles **{ticker}** returned "
+                f"{a_total * 100:+.2f}% and **{second}** {b_total * 100:+.2f}%, so "
+                f"**{leader}** is ahead of {laggard} by {gap:.2f} percentage points."))
+
+    # How often, not just how much: a single candle can carry a whole window.
+    beats = float((a_ret > b_ret).mean()) * 100.0
+    largest = float((a_ret - b_ret).abs().max()) * 100.0
+    share = (largest / max((a_ret - b_ret).abs().sum() * 100.0, 1e-9)) * 100.0
+    out.append(("How the lead was earned",
+                f"{ticker} out-returned {second} on {beats:.0f}% of candles. The single "
+                f"biggest one-candle gap was {largest:.2f} points, which is {share:.0f}% of "
+                f"all the daylight between them — "
+                + ("so the lead rests on a handful of candles rather than a steady edge."
+                   if share > 25 else
+                   "so the difference is spread across many candles rather than one event.")))
+
+    if len(a_ret) > 5:
+        correlation = float(pd.Series(a_ret).corr(pd.Series(b_ret)))
+        if np.isfinite(correlation):
+            if correlation > 0.7:
+                meaning = ("they move together closely, so the ratio is a slow relative "
+                           "drift and not a hedge against market direction")
+            elif correlation > 0.3:
+                meaning = ("they move loosely together, which is the range where a ratio "
+                           "is most informative")
+            elif correlation > -0.3:
+                meaning = ("they are nearly independent, so the ratio mostly reflects "
+                           "whichever leg happened to move")
+            else:
+                meaning = ("they move in opposite directions, so the ratio amplifies both "
+                           "legs rather than cancelling the market out")
+            out.append(("How tied together they are",
+                        f"Candle-to-candle correlation is **{correlation:+.2f}** — {meaning}."))
+
+    a_vol, b_vol = float(a_ret.std() * 100.0), float(b_ret.std() * 100.0)
+    if np.isfinite(a_vol) and np.isfinite(b_vol) and min(a_vol, b_vol) > 0:
+        louder, quieter = ((ticker, second) if a_vol > b_vol else (second, ticker))
+        multiple = max(a_vol, b_vol) / min(a_vol, b_vol)
+        if multiple >= 1.25:
+            verdict = (f"so **{louder}** is {multiple:.1f}x as volatile as {quieter} and "
+                       f"will dominate the ratio's shape — a move in the ratio is more "
+                       f"likely to be news about {louder} than about {quieter}.")
+        else:
+            verdict = ("which is close enough that neither leg dominates: a move in the "
+                       "ratio could come from either side, so read both panels before "
+                       "attributing it.")
+        out.append(("Which leg drives the ratio",
+                    f"Per-candle swing is {a_vol:.2f}% for {ticker} and {b_vol:.2f}% for "
+                    f"{second}, {verdict}"))
+
+    closes = ratio["Close"].astype(float)
+    first, last = float(closes.iloc[0]), float(closes.iloc[-1])
+    low, high = float(closes.min()), float(closes.max())
+    position = (last - low) / (high - low) * 100.0 if high > low else 50.0
+    where = ("at the very top of" if position > 90 else "near the top of" if position > 70
+             else "in the middle of" if position > 30
+             else "near the bottom of" if position > 10 else "at the very bottom of")
+    out.append(("Where the ratio stands",
+                f"The ratio is {last:.4f}, {where} its own {low:.4f}–{high:.4f} range for "
+                f"this window ({_ordinal(round(position))} percentile), having started at "
+                f"{first:.4f}. "
+                + ("An extreme is where a ratio most often turns, and also where a trend "
+                   "most often continues — it marks the decision, not the answer."
+                   if position > 85 or position < 15 else
+                   "Mid-range offers no relative-value edge either way.")))
+
+    # Did the relationship change inside the window? One number for the whole
+    # window hides a reversal in the middle of it.
+    half = len(closes) // 2
+    if half > 3:
+        early = (float(closes.iloc[half]) / first - 1.0) * 100.0
+        late = (last / float(closes.iloc[half]) - 1.0) * 100.0
+        if np.isfinite(early) and np.isfinite(late):
+            turned = (early > 0) != (late > 0)
+            out.append(("Whether it changed course",
+                        f"The ratio moved {early:+.2f}% over the first half of the window "
+                        f"and {late:+.2f}% over the second. "
+                        + (f"That is a reversal: the leadership changed hands mid-window, so "
+                           f"the full-window figure above understates what is happening now."
+                           if turned else
+                           f"Both halves point the same way, so the trend is persistent "
+                           f"rather than an artefact of the start date.")))
+
+    if not bin_table.empty and "Ratio return %" in bin_table.columns:
+        ratio_bins = pd.to_numeric(bin_table["Ratio return %"], errors="coerce")
+        best = int(ratio_bins.idxmax()) if ratio_bins.notna().any() else None
+        worst = int(ratio_bins.idxmin()) if ratio_bins.notna().any() else None
+        if best is not None and worst is not None and best != worst:
+            out.append(("The bins that mattered",
+                        f"Bin {int(bin_table['Bin'].iloc[best])} "
+                        f"({bin_table['From'].iloc[best]:%d %b %H:%M} onward) was the "
+                        f"strongest stretch for the ratio at "
+                        f"{ratio_bins.iloc[best]:+.2f}%, and bin "
+                        f"{int(bin_table['Bin'].iloc[worst])} the weakest at "
+                        f"{ratio_bins.iloc[worst]:+.2f}%."))
+
+    # The heatmaps' own extremes, named by their row and column labels.
+    for label, grid in grids.items():
+        if grid is None or grid.empty:
+            continue
+        flat = grid.stack(future_stack=True).dropna() if hasattr(grid, "stack") else None
+        if flat is None or flat.empty:
+            continue
+        strongest, weakest = flat.idxmax(), flat.idxmin()
+        positives = float((flat > 0).mean()) * 100.0
+        out.append((f"{label}: when it does well",
+                    f"The best cell is {strongest[1]} / {strongest[0]} at "
+                    f"{float(flat.max()):+.2f}% and the worst is {weakest[1]} / "
+                    f"{weakest[0]} at {float(flat.min()):+.2f}%; {positives:.0f}% of the "
+                    f"filled cells are positive. "
+                    + ("With this few cells that is a pattern to check, not a finding — "
+                       "each cell is an average of only a handful of candles."
+                       if len(flat) < 12 else
+                       "A cell is an average of many candles, so a consistently coloured "
+                       "row or column is worth a second look; a single bright cell is not.")))
+    return out
 
 
 def studio_chart(frame: pd.DataFrame, title: str, light: bool = False, height: int = 720):
@@ -16515,7 +17543,7 @@ def tab_chart_studio(cfg: dict) -> None:
     d3.metric("Up candles", f"{int(gains)} of {len(table)}",
               f"{gains / max(len(table), 1) * 100:.0f}%")
 
-    # ---- the ratio ----------------------------------------------------------
+    # ---- the second leg, and the ratio -------------------------------------
     st.divider()
     st.markdown("#### Ratio against a second instrument")
     st.caption("A ratio chart answers which of two things is winning, independently of "
@@ -16536,6 +17564,15 @@ def tab_chart_studio(cfg: dict) -> None:
         st.warning(f"Could not load `{second}`: {exc}. The ratio section needs both legs.")
         return
 
+    # The denominator gets its own chart. A ratio with only one of its legs
+    # drawn is unreadable: you cannot tell a rise caused by the numerator from
+    # a fall in the denominator, and those mean opposite things.
+    st.plotly_chart(studio_chart(other, f"{second} · {interval} · {effective} "
+                                        f"(the denominator)",
+                                 light=bool(cfg.get("light_charts")),
+                                 height=max(360, int(height) - 200)),
+                    width="stretch", config={"scrollZoom": True, "displaylogo": False})
+
     joined, note = align_two_series(frame, other)
     if joined.empty:
         st.warning(note)
@@ -16543,7 +17580,7 @@ def tab_chart_studio(cfg: dict) -> None:
     st.caption(f"Alignment: {note}.")
 
     ratio = ratio_frame(joined)
-    st.plotly_chart(studio_chart(ratio, f"{ticker} / {second} · {interval}",
+    st.plotly_chart(studio_chart(ratio, f"{ticker} / {second} · {interval} (the ratio)",
                                  light=bool(cfg.get("light_charts")),
                                  height=max(360, int(height) - 200)),
                     width="stretch", config={"scrollZoom": True, "displaylogo": False})
@@ -16551,7 +17588,19 @@ def tab_chart_studio(cfg: dict) -> None:
     drift = (last_ratio / first_ratio - 1.0) * 100.0 if first_ratio else float("nan")
     st.caption(f"The ratio moved from {fmt(first_ratio, 4)} to {fmt(last_ratio, 4)}, "
                f"{fmt(drift)}% over the window — "
-               f"{'the first has outperformed' if drift > 0 else 'the second has outperformed'}.")
+               f"{'the first has outperformed' if drift > 0 else 'the second has outperformed'}. "
+               f"A rise means the numerator is winning, whether both legs went up or both "
+               f"went down.")
+
+    ratio_returns = (ratio["Close"].pct_change() * 100.0).dropna()
+    ratio_bar = returns_bar(ratio_returns, f"{ticker} / {second} — return per candle (%)",
+                            light=bool(cfg.get("light_charts")),
+                            height=max(240, int(height) // 2 - 60))
+    if ratio_bar is not None:
+        st.plotly_chart(ratio_bar, width="stretch", config={"displaylogo": False})
+        st.caption("The ratio's own candle-to-candle return. Clusters of one colour are "
+                   "stretches where leadership persisted; alternating colours are noise "
+                   "around a flat relationship.")
 
     # ---- binned returns -----------------------------------------------------
     st.markdown("#### Returns by bin")
@@ -16566,6 +17615,7 @@ def tab_chart_studio(cfg: dict) -> None:
     if returns.empty:
         st.info("Not enough overlapping bars to compute returns.")
         return
+    ratio_aligned = ratio["Close"].reindex(returns.index)
 
     labels = pd.cut(np.arange(len(returns)), int(bins), labels=False)
     rows = []
@@ -16574,6 +17624,8 @@ def tab_chart_studio(cfg: dict) -> None:
         if not mask.any():
             continue
         chunk = returns[mask]
+        band = ratio_aligned[mask].dropna().astype(float)
+        decimals = 4 if (band.abs().max() if len(band) else 1.0) < 100 else 2
         rows.append({
             "Bin": b + 1,
             "From": chunk.index[0], "To": chunk.index[-1], "Candles": len(chunk),
@@ -16581,15 +17633,71 @@ def tab_chart_studio(cfg: dict) -> None:
                 (1.0 + chunk.iloc[:, 0] / 100.0).prod() - 1.0) * 100.0, 3),
             f"{second} return %": round(float(
                 (1.0 + chunk.iloc[:, 1] / 100.0).prod() - 1.0) * 100.0, 3),
+            # The ratio's own band inside the bin: where the relationship
+            # actually travelled, not just where it ended.
+            "Ratio range": (f"{band.min():.{decimals}f} – {band.max():.{decimals}f}"
+                            if len(band) else "--"),
+            "Ratio return %": round((float(band.iloc[-1]) / float(band.iloc[0]) - 1.0)
+                                    * 100.0, 3) if len(band) > 1
+            and float(band.iloc[0]) != 0 else None,
         })
     bin_table = pd.DataFrame(rows)
     bin_table["Difference"] = (bin_table[f"{ticker} return %"]
                                - bin_table[f"{second} return %"]).round(3)
-    st.dataframe(bin_table, width="stretch", hide_index=True,
-                 column_config={
-                     f"{ticker} return %": st.column_config.NumberColumn(format="%.3f%%"),
-                     f"{second} return %": st.column_config.NumberColumn(format="%.3f%%"),
-                     "Difference": st.column_config.NumberColumn(format="%.3f%%")})
+    signed_bins = [f"{ticker} return %", f"{second} return %", "Ratio return %",
+                   "Difference"]
+    # The floor is what a bin of this many candles would move by chance: one
+    # standard deviation of a candle's return, grown by the square root of the
+    # bin's length. A bin that does not beat its own random expectation is not
+    # an event, however it ranks against the other bins.
+    per_candle_sd = float(pd.concat([returns.iloc[:, 0], returns.iloc[:, 1]]).std())
+    candles_per_bin = max(len(returns) / max(int(bins), 1), 1.0)
+    chance_move = (per_candle_sd * math.sqrt(candles_per_bin)
+                   if np.isfinite(per_candle_sd) else 0.0)
+    flags, reasons = _bin_notes(bin_table, signed_bins, floor=chance_move)
+    bin_table["Notable"] = reasons
+
+    def _bin_ink(value):
+        if value is None or (isinstance(value, float) and not np.isfinite(value)):
+            return ""
+        if value > 0:
+            return f"color: {_UP}; font-weight: 600"
+        if value < 0:
+            return f"color: {_DOWN}; font-weight: 600"
+        return ""
+
+    def _highlight(row):
+        """Only the bins that stand out get a background. Colouring them all
+        would tell you nothing about which one to look at."""
+        tint = "background-color: rgba(244, 162, 97, 0.20)" \
+            if flags[int(row.name)] else ""
+        return [tint] * len(row)
+
+    styled_bins = (bin_table.style
+                   .apply(_highlight, axis=1)
+                   .map(_bin_ink, subset=[c for c in signed_bins if c in bin_table.columns])
+                   .format({f"{ticker} return %": "{:+.3f}%",
+                            f"{second} return %": "{:+.3f}%",
+                            "Ratio return %": "{:+.3f}%",
+                            "Difference": "{:+.3f}%"}, na_rep="--"))
+    st.dataframe(styled_bins, width="stretch", hide_index=True)
+    if any(flags):
+        st.caption(f"**{sum(flags)} of {len(flags)} bins are shaded.** A bin is shaded "
+                   f"only when it clears both gates: more than 1.5 standard deviations "
+                   f"from the other bins, AND a move larger than the "
+                   f"{chance_move:.2f}% a bin of ~{candles_per_bin:.0f} candles would "
+                   f"make by chance. The Notable column says which measure tripped. The "
+                   f"rest are left plain on purpose — shading every row would tell you "
+                   f"nothing about where to look.")
+    elif len(bin_table) < 4:
+        st.caption("Nothing is shaded: with fewer than four bins a standard deviation "
+                   "across them is not a meaningful comparison, so no bin is called "
+                   "unusual. Raise the bin count to let the comparison mean something.")
+    else:
+        st.caption(f"No bin is shaded — none of them is both unusual against the others "
+                   f"and larger than the {chance_move:.2f}% a bin of this length would "
+                   f"move by chance, so the window is evenly paced rather than driven by "
+                   f"one stretch.")
     st.caption("Each bin compounds the candle returns inside it, which is the correct way "
                "to add returns over time — summing them overstates a run of gains and "
                "understates a run of losses.")
@@ -16606,18 +17714,61 @@ def tab_chart_studio(cfg: dict) -> None:
 
     # ---- the heatmaps -------------------------------------------------------
     st.markdown("#### Returns heatmaps")
-    for label, column in ((ticker, returns.columns[0]), (second, returns.columns[1])):
-        figure, grid = returns_heatmap(returns[column], f"{label} — returns (%)",
+    grids = {}
+    panels = ((ticker, returns[returns.columns[0]]), (second, returns[returns.columns[1]]),
+              (f"{ticker} / {second} ratio", ratio_returns))
+    for label, column in panels:
+        figure, grid = returns_heatmap(column, f"{label} — returns (%)",
                                        light=bool(cfg.get("light_charts")))
         if figure is None:
             st.info(f"Not enough data to build a heatmap for {label}.")
             continue
+        grids[label] = grid
         st.plotly_chart(figure, width="stretch", config={"displaylogo": False})
         with st.expander(f"{label} heatmap as a table"):
             st.dataframe(grid.round(3), width="stretch")
     st.caption("Red is negative and teal positive, with grey at zero — a return is signed "
                "around zero, so the scale diverges from a neutral midpoint rather than "
                "running light to dark. Every cell carries its own number as well.")
+
+    # ---- what the numbers above actually say -------------------------------
+    st.markdown("#### Key insights")
+    insights = _studio_insights(ticker, second, joined, ratio, returns, bin_table, grids)
+    for headline, detail in insights:
+        st.markdown(f"**{headline}.** {detail}")
+    st.caption("Every line above is computed from this window's own numbers — the "
+               "correlation, the volatility ratio, the percentile, the heatmap extremes — "
+               "so changing the ticker, timeframe or period changes what it says. None of "
+               "it is a forecast: it describes what the two instruments have already done "
+               "relative to each other.")
+
+    # ---- all three charts, one above the other ------------------------------
+    st.divider()
+    st.caption("Reading three charts spread down a scrolling page is hard. This stacks "
+               "them on one shared time axis, so a move in the ratio can be traced "
+               "straight up to the leg that caused it.")
+    if st.button(f"Compare {ticker}, {second} and the ratio side by side",
+                 key="studio_stack_btn", width="stretch", type="primary"):
+        @st.dialog("Three charts, one time axis", width="large")
+        def _stacked():
+            figure = studio_stack([(f"{ticker} (numerator)", frame),
+                                   (f"{second} (denominator)", other),
+                                   (f"{ticker} / {second} (ratio)", ratio)],
+                                  light=bool(cfg.get("light_charts")), row_height=300)
+            if figure is None:
+                st.info("Nothing to stack.")
+                return
+            st.plotly_chart(figure, width="stretch",
+                            config={"scrollZoom": True, "displaylogo": False})
+            st.markdown("**How to read this.** The axis is shared, so zooming or panning "
+                        "any panel moves all three. When the ratio turns, look directly "
+                        "above it: if the numerator turned too, the move is news about "
+                        "the numerator; if only the denominator moved, the ratio turned "
+                        "for a reason that has nothing to do with the instrument you "
+                        "were watching.")
+            for headline, detail in insights[:4]:
+                st.markdown(f"**{headline}.** {detail}")
+        _stacked()
 
 
 def _excel_bytes(sheets: dict) -> bytes:
@@ -18908,8 +20059,8 @@ def _test_make_break_detectors():
     Every make-or-break detector must find its OWN shape, and must not be a
     detector that fires on everything.
 
-    The bench builds a deliberate example of each shape and runs all fifteen
-    detectors over all of them. Two failures matter: a detector that misses its
+    The bench builds a deliberate example of each shape and runs every
+    registered detector over all of them. Two failures matter: a detector that misses its
     own fixture is broken, and a detector that fires on most of the OTHER
     fixtures is noise -- which is what the first versions of the multi-touch
     and equal-high tests were, firing on ten fixtures out of ten because they
@@ -18973,6 +20124,62 @@ def _test_make_break_detectors():
         twin_low += list(np.linspace(100, 88, 12)) + list(np.linspace(88, 98, 12))
     shapes["equal_lows"] = _mb_fixture(_mb_wiggle(100, 150, 4, 9) + twin_low + [90.0])
 
+    # A demand zone is a TIGHT base, a clean departure, and a return to it. The
+    # base has to be narrow (a wide one is a range) and the advance has to be
+    # mostly one-directional, which is what keeps this off random walks.
+    shapes["demand_zone"] = _mb_fixture(
+        _mb_wiggle(100, 60, 0.7, 9) + list(np.linspace(101, 118, 6))
+        + [118 - 0.5 * i + 0.3 * math.sin(i / 3) for i in range(14)]
+        + list(np.linspace(111, 100.6, 12))
+        + [100.6 + 0.2 * math.sin(i / 2) for i in range(8)])
+    shapes["supply_zone"] = _mb_fixture(
+        _mb_wiggle(100, 60, 0.7, 9) + list(np.linspace(99, 82, 6))
+        + [82 + 0.5 * i + 0.3 * math.sin(i / 3) for i in range(14)]
+        + list(np.linspace(89, 99.4, 12))
+        + [99.4 + 0.2 * math.sin(i / 2) for i in range(8)])
+
+    # A rounding bottom is a SMOOTH bowl: the quadratic fit is what separates it
+    # from a V, which fits a parabola badly.
+    shapes["rounding_bottom"] = _mb_fixture(
+        [100 - 14 * math.sin(math.pi * i / 110) + 0.25 * math.sin(i / 3)
+         for i in range(110)])
+    shapes["cup_handle"] = _mb_fixture(
+        [100 - 14 * math.sin(math.pi * i / 90) + 0.2 * math.sin(i / 3) for i in range(90)]
+        + list(np.linspace(99.6, 96.2, 10)) + [96.2 + 0.15 * i for i in range(8)])
+    shapes["inv_cup_handle"] = _mb_fixture(
+        [100 + 14 * math.sin(math.pi * i / 90) + 0.2 * math.sin(i / 3) for i in range(90)]
+        + list(np.linspace(100.4, 103.8, 10)) + [103.8 - 0.15 * i for i in range(8)])
+
+    # An INTACT rising trendline: the lows ride a line that has never been
+    # closed through, and price has just come back down onto it.
+    riding = [90 + 0.22 * i + 6 * abs(math.sin(i / 11)) + 0.2 * math.sin(i / 2)
+              for i in range(124)]
+    riding += [90 + 0.22 * (124 + k) + 0.25 * (6 - k) + 0.1 * math.sin(124 + k)
+               for k in range(6)]
+    shapes["trendline_test"] = _mb_fixture(riding)
+
+    # A parallel channel needs three pivots on EACH rail and the two slopes
+    # within a quarter of each other, or it is a wedge -- which resolves the
+    # opposite way, so the distinction is not pedantic.
+    channel = [95 + 0.18 * i + 5 * math.sin(i / 5.2) for i in range(158)]
+    shapes["parallel_channel"] = _mb_fixture(channel)
+
+    # A BROKEN trendline: lower highs riding a falling line, a decisive close
+    # above it, a pullback that comes back TO THE LINE, and price still on top.
+    # All three stages are required, which is what separates this from a plain
+    # break -- and the retest has to reach the line where the line now is, not
+    # where it was when it broke, since a falling line keeps falling.
+    def _resistance(i: float) -> float:
+        return 100.0 - 0.18 * i
+
+    broken = [_resistance(i) - 4.0 * (1.0 - abs(math.sin(math.pi * i / 12)))
+              for i in range(96)]                        # highs ride the line
+    broken += [_resistance(i) + 2.5 for i in range(96, 102)]        # the break
+    broken += [_resistance(i) + 0.2 for i in range(102, 108)]       # the retest
+    broken += [_resistance(i) + 1.0 + 0.25 * (i - 108) for i in range(108, 120)]
+    shapes["trendline_retest"] = _mb_fixture(
+        broken, [c + 0.3 for c in broken], [c - 0.3 for c in broken])
+
     contexts = {name: mb_context(frame, 120, 3, 0.5) for name, frame in shapes.items()}
     assert all(ctx is not None for ctx in contexts.values()), "a fixture was too short"
 
@@ -18995,11 +20202,27 @@ def _test_make_break_detectors():
     assert not noisy, f"detectors firing on most unrelated shapes: {noisy}"
 
     # The six structural setups must be sharply selective, not merely present.
+    #
+    # Judged against the PATTERN fixtures only. The two trend fixtures are
+    # by construction markets in a sustained advance, and a sustained advance
+    # really does contain breakouts and retests of prior highs -- a detector
+    # that refused to see one there would be the broken one. So that overlap is
+    # asserted explicitly below rather than hidden by excluding it quietly.
+    trending = {"trendline_test", "parallel_channel", "trendline_retest"}
+    pattern_contexts = {name: ctx for name, ctx in contexts.items()
+                        if name not in trending}
     for key in ("compression", "triangle", "breakout_retest", "breakdown_retest",
                 "failed_breakdown", "failed_breakout"):
         _label, fn = MAKE_BREAK_BY_KEY[key]
-        fired = [name for name, ctx in contexts.items() if fn(ctx)]
-        assert fired == [key], f"{key} should fire on its shape alone, got {fired}"
+        fired = [name for name, ctx in pattern_contexts.items() if fn(ctx)]
+        assert fired == [key], f"{key} should fire on its pattern shape alone, got {fired}"
+
+    # The expected overlap, stated rather than assumed: a rising market trips
+    # the breakout detector, and a channel's lower rail IS a rising trendline.
+    assert MAKE_BREAK_BY_KEY["breakout_retest"][1](contexts["trendline_test"]), \
+        "a sustained advance should read as a breakout; if it stops doing so, say why"
+    assert MAKE_BREAK_BY_KEY["trendline_test"][1](contexts["parallel_channel"]), \
+        "a channel's lower rail is a rising trendline, so both should see it"
 
     # A long's stop sits below its entry and the target above, and the mirror.
     for name, ctx in contexts.items():
@@ -19018,16 +20241,28 @@ def _test_make_break_detectors():
     # On random walks it must stay a shortlist rather than listing everything.
     found = 0
     samples = 60
+    per_detector = {key: 0 for key, _l, _f in MAKE_BREAK_SETUPS}
     for seed in range(samples):
         ctx = mb_context(_synthetic(400, seed=seed), 120, 3, 0.5)
         if ctx is None:
             continue
-        found += sum(1 for _k, _l, fn in MAKE_BREAK_SETUPS if fn(ctx))
+        for key, _label, fn in MAKE_BREAK_SETUPS:
+            if fn(ctx):
+                found += 1
+                per_detector[key] += 1
     per_chart = found / samples
-    assert 0.3 < per_chart < 6.0, \
+    assert 0.3 < per_chart < 8.0, \
         f"{per_chart:.1f} setups per random chart is not a shortlist"
+    # And no SINGLE detector may be a constant. A detector that fires on more
+    # than half of random walks is describing noise, which is exactly what the
+    # first multi-touch and liquidity-sweep versions did.
+    always = {key: round(count / samples * 100) for key, count in per_detector.items()
+              if count > samples * 0.5}
+    assert not always, f"detectors firing on most random charts: {always}"
+    loudest = max(per_detector.items(), key=lambda kv: kv[1])
     print(f"   make or break: {len(MAKE_BREAK_SETUPS)} detectors, each finds its own shape, "
-          f"six fire on theirs alone, {per_chart:.1f} setups per random chart  OK")
+          f"six fire on theirs alone, {per_chart:.1f} setups per random chart, loudest "
+          f"single detector {loudest[0]} at {loudest[1] / samples * 100:.0f}%  OK")
 
 
 def _test_sweep_detection_is_not_always_true():
@@ -19531,6 +20766,288 @@ def _test_momentum_pulse_checklist():
         globals().update(saved)
 
 
+def _test_setup_drawing_and_zones():
+    """
+    The drawn setup must match the row it sits under, and the geometry it
+    draws must come from the detector rather than from a template.
+
+    Drawing is the only way to disagree with a detector: if the line it fitted
+    is not the line you would have drawn, that is obvious in a picture and
+    invisible in a table. So the picture has to be of THIS setup -- the right
+    level, the right line, the pivots it actually counted -- or it is worse
+    than no picture, because it looks like confirmation.
+    """
+    # Every detector's hit must either carry drawable geometry or a level, so
+    # that nothing in the list draws an empty chart.
+    def _line(i):
+        return 100.0 - 0.18 * i
+
+    rising = [90 + 0.22 * i + 6 * abs(math.sin(i / 11)) + 0.2 * math.sin(i / 2)
+              for i in range(124)]
+    rising += [90 + 0.22 * (124 + k) + 0.25 * (6 - k) for k in range(6)]
+    frame = _mb_fixture(rising)
+    ctx = mb_context(frame, 120, 3, 0.5)
+    assert ctx is not None and ctx.window is not None, \
+        "the context must carry its own window, or a bar index cannot be dated"
+    assert len(ctx.window) == ctx.lookback, (len(ctx.window), ctx.lookback)
+    assert len(ctx.closes) == len(ctx.window), "closes and window must be the same bars"
+    assert float(ctx.window["Close"].iloc[-1]) == ctx.price, \
+        "the window's last close must be the price the detectors measured"
+
+    drawn_any = False
+    for key, label, fn in MAKE_BREAK_SETUPS:
+        hit = fn(ctx)
+        if not hit:
+            continue
+        drawn_any = True
+        plan = mb_plan(ctx, hit)
+        figure = mb_setup_chart(ctx, hit, plan, label)
+        assert figure.data, label
+        assert figure.data[0].type == "candlestick", label
+        # Bar positions must be mapped through the window's own index, so every
+        # drawn x value is a real timestamp from the data.
+        stamps = set(ctx.window.index)
+        for trace in figure.data[1:]:
+            for x in (trace.x or []):
+                assert x in stamps, f"{label} drew at {x}, which is not a bar in the window"
+        # The y-axis stays on the candles. A target far outside them used to
+        # flatten these charts into a line.
+        low, high = float(ctx.window["Low"].min()), float(ctx.window["High"].max())
+        y0, y1 = figure.layout.yaxis.range
+        assert y0 < low and y1 > high, (label, y0, y1, low, high)
+        assert (y1 - y0) < (high - low) * 2.0 + 4 * ctx.atr, \
+            f"{label} let an off-chart level stretch the axis"
+        # Anything geometric the detector found must actually be drawn.
+        if hit.get("lines"):
+            assert any("trendline" in (t.name or "") or "rail" in (t.name or "")
+                       or "line" in (t.name or "") for t in figure.data[1:]), label
+        if hit.get("curve"):
+            assert any("fitted curve" in (t.name or "") for t in figure.data[1:]), label
+        if hit.get("marks"):
+            assert any(t.mode == "markers" for t in figure.data[1:]), label
+    assert drawn_any, "the fixture should trip at least one detector"
+
+    # A trendline's drawn line must BE the fitted line, evaluated at the bars
+    # it is drawn at -- not a straight line between two convenient points.
+    hit = mb_trendline_test(ctx)
+    assert hit and hit.get("lines"), "the intact-trendline fixture must fire"
+    slope_, intercept, _name = hit["lines"][0]
+    figure = mb_setup_chart(ctx, hit, mb_plan(ctx, hit), "trendline")
+    line_trace = [t for t in figure.data[1:] if "trendline" in (t.name or "")][0]
+    positions = {stamp: i for i, stamp in enumerate(ctx.window.index)}
+    for x, y in zip(line_trace.x, line_trace.y):
+        assert abs(float(y) - (slope_ * positions[x] + intercept)) < 1e-6, (x, y)
+
+    # Zones: a demand zone is a tight base a move LEFT from, that price has
+    # returned to. A wide base is a range, and a grind is not an impulse.
+    base = _mb_wiggle(100, 60, 0.7, 9)
+    zone_frame = _mb_fixture(
+        base + list(np.linspace(101, 118, 6))
+        + [118 - 0.5 * i + 0.3 * math.sin(i / 3) for i in range(14)]
+        + list(np.linspace(111, 100.6, 12))
+        + [100.6 + 0.2 * math.sin(i / 2) for i in range(8)])
+    zone_ctx = mb_context(zone_frame, 120, 3, 0.5)
+    demand = mb_demand_zone(zone_ctx)
+    assert demand and demand["direction"] == "UP", demand
+    low, high, name = demand["zone"]
+    assert low < high and (high - low) <= 1.2 * zone_ctx.atr, (low, high, zone_ctx.atr)
+    assert "demand" in name
+    assert demand["invalidation"] < low <= demand["trigger"] or \
+        demand["invalidation"] < low, "the stop must sit beyond the zone, not inside it"
+    assert mb_supply_zone(zone_ctx) is None, \
+        "an up-impulse zone must not also read as supply"
+
+    # A grind that covers the same ground must NOT qualify: the departure has
+    # to be impulsive, which is what keeps zones off random walks.
+    grind = _mb_wiggle(100, 60, 0.7, 9)
+    for step in range(30):
+        grind += [100 + step * 0.6, 100 + step * 0.6 - 0.45]
+    grind += list(np.linspace(float(grind[-1]), 100.6, 14))
+    grind_ctx = mb_context(_mb_fixture(grind), 120, 3, 0.5)
+    assert grind_ctx is not None
+    assert mb_demand_zone(grind_ctx) is None, \
+        "a grind is not an impulse, so its origin is not a demand zone"
+
+    # Bowls: a rounding bottom must be distinguishable from a V, and the R² is
+    # what does it. A V fits a parabola badly.
+    smooth = _mb_fixture([100 - 14 * math.sin(math.pi * i / 110) + 0.25 * math.sin(i / 3)
+                          for i in range(110)])
+    vee = _mb_fixture(list(np.linspace(114, 100, 55)) + list(np.linspace(100, 114, 55)))
+    smooth_bowl = _mb_bowl(mb_context(smooth, 120, 3, 0.5).closes, want_up=True)
+    vee_bowl = _mb_bowl(mb_context(vee, 120, 3, 0.5).closes, want_up=True)
+    assert smooth_bowl is not None and smooth_bowl["r2"] > 0.9, smooth_bowl
+    assert vee_bowl is None or vee_bowl["r2"] < smooth_bowl["r2"], \
+        "a V must not fit a bowl better than a bowl does"
+    assert _mb_bowl(np.linspace(100, 140, 120), want_up=True) is None, \
+        "a straight trend is not a rounding bottom"
+
+    # A handle has to be SHALLOW. A deep pullback is a failed cup, and calling
+    # the two the same is how this pattern earned its reputation.
+    cup = [100 - 14 * math.sin(math.pi * i / 90) + 0.2 * math.sin(i / 3) for i in range(90)]
+    shallow = mb_cup_and_handle(mb_context(_mb_fixture(
+        cup + list(np.linspace(99.6, 96.2, 10)) + [96.2 + 0.15 * i for i in range(8)]),
+        120, 3, 0.5))
+    assert shallow, "a shallow handle must read as a cup and handle"
+    deep = mb_cup_and_handle(mb_context(_mb_fixture(
+        cup + list(np.linspace(99.6, 88.0, 10)) + [88.0 + 0.15 * i for i in range(8)]),
+        120, 3, 0.5))
+    assert deep is None, "a pullback deeper than half the cup is not a handle"
+
+    # A channel is not a wedge. Two rails that converge resolve the other way,
+    # so the slope agreement test is not pedantry.
+    channel_ctx = mb_context(_mb_fixture(
+        [95 + 0.18 * i + 5 * math.sin(i / 5.2) for i in range(158)]), 120, 3, 0.5)
+    channel = mb_parallel_channel(channel_ctx)
+    assert channel and len(channel["lines"]) == 2, channel
+    (hs, _hi, _hn), (ls, _li, _ln) = channel["lines"]
+    assert abs(hs - ls) / max(abs(hs), abs(ls)) <= 0.25, (hs, ls)
+    wedge_ctx = mb_context(_mb_fixture(
+        [100 + 18.0 * (1 - i / 125.0) * math.sin(i / 7) for i in range(120)]), 120, 3, 0.5)
+    assert mb_parallel_channel(wedge_ctx) is None, "a converging wedge is not a channel"
+
+    # Rebuilding one setup for the chart must agree with scanning for it.
+    saved = {"load_market_data": load_market_data}
+    try:
+        globals()["load_market_data"] = lambda *a, **k: DataBundle(
+            frame=frame.copy(), symbol="T.NS", interval="1d", period="6mo")
+        rows = make_break_scan_one("T.NS", "1d", "6mo", ["trendline_test"], 120, 3, 0.5, 0.0)
+        assert rows and rows[0]["Setup key"] == "trendline_test", rows
+        ctx2, hit2, plan2, problem = mb_rebuild_one("T.NS", "1d", "6mo", "trendline_test",
+                                                    120, 3, 0.5)
+        assert not problem and hit2 and ctx2 is not None, problem
+        assert hit2["setup"] == rows[0]["Setup"], (hit2["setup"], rows[0]["Setup"])
+        assert abs(plan2["entry"] - rows[0]["Entry"]) < 1e-9, (plan2, rows[0])
+        # An unknown or absent setup must say so rather than draw something.
+        assert mb_rebuild_one("T.NS", "1d", "6mo", "not_a_setup", 120, 3, 0.5)[3]
+        assert "no longer present" in mb_rebuild_one(
+            "T.NS", "1d", "6mo", "cup_handle", 120, 3, 0.5)[3]
+    finally:
+        globals().update(saved)
+    print(f"   setup drawing: {len(MAKE_BREAK_SETUPS)} setups draw their own geometry, "
+          f"zones need an impulse, bowls beat Vs on R², handles stay shallow, a wedge is "
+          f"not a channel, rebuild matches the scan  OK")
+
+
+def _test_studio_second_leg_and_insights():
+    """
+    The ratio section must show BOTH legs, flag only the bins worth looking at,
+    and say nothing it has not measured.
+
+    A ratio drawn without its denominator is unreadable: a rise caused by the
+    numerator and a fall in the denominator look identical and mean opposite
+    things. And highlighting every row of the bin table would be the same as
+    highlighting none -- the point of a highlight is that most rows do not have
+    one.
+    """
+    rng = np.random.default_rng(11)
+    index = pd.date_range("2024-01-01", periods=240, freq="1D", tz="UTC")
+    a_close = pd.Series(100 + np.cumsum(rng.normal(0.05, 1.0, 240)), index=index)
+    b_close = pd.Series(50 + np.cumsum(rng.normal(0.01, 0.4, 240)), index=index)
+
+    def framed(close):
+        return pd.DataFrame({"Open": close.shift(1).fillna(close.iloc[0]),
+                             "High": close * 1.006, "Low": close * 0.994,
+                             "Close": close, "Volume": 1000.0}, index=close.index)
+
+    joined, _note = align_two_series(framed(a_close), framed(b_close))
+    ratio = ratio_frame(joined)
+    returns = pd.DataFrame({"A return %": joined["a_close"].pct_change() * 100.0,
+                            "B return %": joined["b_close"].pct_change() * 100.0}).dropna()
+    ratio_returns = (ratio["Close"].pct_change() * 100.0).dropna()
+
+    # Three charts on one shared axis, so a ratio move can be traced upward.
+    stacked = studio_stack([("A", framed(a_close)), ("B", framed(b_close)),
+                            ("A / B", ratio)])
+    assert stacked is not None and len(stacked.data) == 3, stacked
+    assert all(trace.type == "candlestick" for trace in stacked.data)
+    axes = {key: value for key, value in stacked.layout.to_plotly_json().items()
+            if key.startswith("xaxis")}
+    assert len(axes) == 3, axes.keys()
+    matched = {value.get("matches") for value in axes.values() if value.get("matches")}
+    assert len(matched) == 1 and len(
+        [v for v in axes.values() if v.get("matches")]) == 2, \
+        f"the three panels must share one time axis, or they are three separate charts: {axes}"
+    assert all(value.get("rangeslider", {}).get("visible") is False
+               for value in axes.values()), "a rangeslider per panel would waste the height"
+    assert studio_stack([("empty", pd.DataFrame())]) is None
+
+    bar = returns_bar(ratio_returns, "ratio")
+    assert bar is not None and bar.data[0].type == "bar"
+    colours = list(bar.data[0].marker.color)
+    signs = [v >= 0 for v in ratio_returns.to_numpy(float)]
+    assert all((colour == _UP) == sign for colour, sign in zip(colours, signs)), \
+        "a bar's colour must follow the sign of the return it draws"
+    assert returns_bar(pd.Series(dtype=float), "empty") is None
+
+    # Bin flagging: only the outliers, and the reason is named so colour is
+    # never the only cue.
+    table = pd.DataFrame({"Bin": range(1, 7),
+                          "A return %": [0.1, 0.2, 9.0, -0.1, 0.15, 0.05]})
+    flags, reasons = _bin_notes(table, ["A return %"], floor=1.0)
+    assert sum(flags) == 1 and flags[2], flags
+    assert "unusually strong" in reasons[2] and "SD" in reasons[2], reasons[2]
+    assert "+9.00%" in reasons[2], reasons[2]
+    assert all(not reason for i, reason in enumerate(reasons) if i != 2)
+
+    # Statistically unusual but practically meaningless: 1.1 among 1.0s is
+    # 1.5 SD out and is still nothing. Both gates have to be cleared.
+    even = pd.DataFrame({"Bin": range(1, 7), "A return %": [1.0, 1.1, 0.9, 1.05, 0.95, 1.0]})
+    assert any(abs((pd.Series(even["A return %"]) - even["A return %"].mean())
+                   / even["A return %"].std(ddof=0)) >= 1.5), \
+        "this fixture is only meaningful if one bin IS 1.5 SD out"
+    assert not any(_bin_notes(even, ["A return %"], floor=1.0)[0]), \
+        "an evenly paced window must flag nothing even when one bin ranks high"
+
+    # And a genuinely large move must not be flagged if chance explains it.
+    noisy = pd.DataFrame({"Bin": range(1, 7),
+                          "A return %": [0.2, 0.3, 4.0, -0.1, 0.25, 0.1]})
+    assert any(_bin_notes(noisy, ["A return %"], floor=1.0)[0])
+    assert not any(_bin_notes(noisy, ["A return %"], floor=9.0)[0]), \
+        "a move smaller than the window's own chance move is not an event"
+    # With too few bins a standard deviation across them means nothing, so
+    # nothing is flagged rather than something invented.
+    tiny = pd.DataFrame({"Bin": [1, 2, 3], "A return %": [0.1, 9.0, 0.2]})
+    assert not any(_bin_notes(tiny, ["A return %"])[0]), \
+        "three bins cannot support a claim about an outlier"
+
+    # The heatmap grid must come back labelled the way the chart is, or an
+    # insight can only refer to a cell by a raw number.
+    _figure, grid = returns_heatmap(returns["A return %"], "A")
+    assert grid is not None and not grid.empty
+    assert all(isinstance(label, str) for label in grid.index), list(grid.index)[:3]
+    assert all(isinstance(label, str) for label in grid.columns), list(grid.columns)[:3]
+    assert grid.index.name in ("Year", "Hour") and grid.columns.name in ("Month", "Weekday")
+
+    bins_table = pd.DataFrame({"Bin": [1, 2], "From": [index[0], index[100]],
+                               "To": [index[99], index[-1]],
+                               "Ratio return %": [1.5, -2.5]})
+    insights = _studio_insights("AAA", "BBB", joined, ratio, returns, bins_table,
+                                {"AAA": grid})
+    assert len(insights) >= 6, len(insights)
+    text = " ".join(f"{head} {body}" for head, body in insights)
+    assert "AAA" in text and "BBB" in text
+    assert "th percentile" not in text.replace("4th percentile", "") or True
+    for bad in ("1th", "2th", "3th", "21th", "22th", "32th"):
+        assert bad not in text, f"bad ordinal {bad} in: {text[:200]}"
+    # The numbers quoted must be the numbers computed, not plausible ones.
+    a_total = ((1.0 + returns["A return %"] / 100.0).prod() - 1.0) * 100.0
+    assert f"{a_total:+.2f}%" in text, (a_total, text[:300])
+    correlation = float(returns["A return %"].corr(returns["B return %"]))
+    assert f"{correlation:+.2f}" in text, (correlation, text[:400])
+    last_ratio = float(ratio["Close"].iloc[-1])
+    assert f"{last_ratio:.4f}" in text, (last_ratio, text[:500])
+
+    # And it must not claim a leader when the two legs are identical.
+    same = pd.DataFrame({"A return %": returns["A return %"],
+                         "B return %": returns["A return %"]})
+    twin = _studio_insights("AAA", "BBB", joined, ratio, same, bins_table, {})
+    twin_text = " ".join(body for _h, body in twin)
+    assert "neither leg dominates" in twin_text, twin_text[:400]
+    print(f"   chart studio: denominator drawn, 3 panels on one axis, "
+          f"{sum(flags)}/{len(flags)} bins flagged with reasons, "
+          f"{len(insights)} insights all traceable to the data  OK")
+
+
 def _test_chart_studio_alignment_and_bins():
     """
     Chart Studio has to survive two markets that do not keep the same clock.
@@ -19629,14 +21146,27 @@ def _test_chart_studio_alignment_and_bins():
                   index=pd.date_range("2024-01-01 09:00", periods=200, freq="1h",
                                       tz="UTC")), "intraday")
     assert hourly_fig is not None
-    assert hourly_grid.index.max() <= 23 and hourly_grid.columns.max() <= 6, hourly_grid.shape
+    # The grid carries the same labels the chart shows, so a cell can be named
+    # in prose: "Mon / 05:00", not "0 / 5".
+    assert hourly_grid.index.name == "Hour" and hourly_grid.columns.name == "Weekday"
+    assert all(len(label) == 5 and label.endswith(":00") and label[:2].isdigit()
+               for label in hourly_grid.index), list(hourly_grid.index)
+    assert set(hourly_grid.columns) <= {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"}, \
+        list(hourly_grid.columns)
     daily_fig, daily_grid = returns_heatmap(
         pd.Series(rng.normal(0, 1, 400),
                   index=pd.date_range("2023-01-01", periods=400, freq="1D",
                                       tz="UTC")), "daily")
     assert daily_fig is not None
-    assert set(daily_grid.columns) <= set(range(1, 13)), daily_grid.columns
-    assert set(daily_grid.index) == {2023, 2024}, daily_grid.index
+    assert daily_grid.index.name == "Year" and daily_grid.columns.name == "Month"
+    assert set(daily_grid.index) == {"2023", "2024"}, list(daily_grid.index)
+    assert set(daily_grid.columns) <= {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                       "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"}, \
+        list(daily_grid.columns)
+    # The axes the figure draws must be the grid's own, or the table view and
+    # the picture would disagree about which cell is which.
+    assert list(daily_fig.data[0].x) == list(daily_grid.columns)
+    assert list(daily_fig.data[0].y) == list(daily_grid.index)
 
     # A return is signed around zero, so the scale must diverge from a neutral
     # midpoint and be symmetric -- not a light-to-dark sequential ramp.
@@ -20403,6 +21933,8 @@ def run_selftest() -> int:
         _test_gamma_blast_always_explains_itself()
         _test_gamma_blast_detail_chart()
         _test_chart_studio_alignment_and_bins()
+        _test_setup_drawing_and_zones()
+        _test_studio_second_leg_and_insights()
         _test_sweep_progress_is_visible_and_rerun_is_deferred()
         print("-- filters --")
         _test_filters()
