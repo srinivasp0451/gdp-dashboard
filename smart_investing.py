@@ -12290,8 +12290,50 @@ def tab_gamma_blast(cfg: dict) -> None:
 # A count is not a signal. Four of four means four conditions are true at this
 # instant, which is a reason to look at a chart, not an instruction to trade.
 
-PULSE_BULL = ["Breakout", "Volume", "PDH", "Range"]
-PULSE_BEAR = ["Breakout", "VWAP", "DL", "PDL"]
+PULSE_CORE = [
+    # key            bullish label        bearish label
+    ("Breakout",     "Breakout",          "Breakdown"),
+    ("PD",           "PDH",               "PDL"),
+    ("PW",           "PWH",               "PWL"),
+    ("PM",           "PMH",               "PML"),
+    ("Day",          "Day high",          "Day low"),
+    ("Week",         "Week high",         "Week low"),
+    ("Month",        "Month high",        "Month low"),
+    ("VWAP",         "VWAP",              "VWAP"),
+    ("CHoCH",        "CHoCH",             "CHoCH"),
+    ("Volume",       "Volume",            "Volume"),
+    ("Range",        "Range",             "Range"),
+]
+PULSE_BULL = [bull for _key, bull, _bear in PULSE_CORE]
+PULSE_BEAR = [bear for _key, _bull, bear in PULSE_CORE]
+
+# The optional layer. Every one of these is OFF until switched on, and each is
+# priced honestly: the daily moving averages need a second download per ticker,
+# which is the single most expensive thing this screener can be asked to do.
+PULSE_EXTRAS = [
+    ("sma20",  "Above / below the 20 DMA",   "daily",   "20-day simple moving average"),
+    ("sma50",  "Above / below the 50 DMA",   "daily",   "50-day simple moving average"),
+    ("sma100", "Above / below the 100 DMA",  "daily",   "100-day simple moving average"),
+    ("sma200", "Above / below the 200 DMA",  "daily",   "200-day simple moving average"),
+    ("ema9",   "Above / below the 9 EMA",    "daily",   "9-day exponential moving average"),
+    ("ema21",  "Above / below the 21 EMA",   "daily",   "21-day exponential moving average"),
+    ("ema63",  "Above / below the 63 EMA",   "daily",   "63-day exponential moving average "
+                                                        "(a quarter of trading days)"),
+    ("rsi",    "RSI above 60 / below 40",    "intraday", "14-period RSI on this timeframe"),
+    ("macd",   "MACD histogram sign",        "intraday", "12/26/9 histogram above or below "
+                                                         "zero on this timeframe"),
+    ("supert", "SuperTrend direction",       "intraday", "10/3 SuperTrend flip on this "
+                                                         "timeframe"),
+    ("adx",    "ADX > 20 with DI agreeing",  "intraday", "trend strength, plus which "
+                                                         "directional index is on top"),
+    ("open",   "Above / below the open",     "intraday", "against this session's opening "
+                                                         "price"),
+    ("pdc",    "Above / below yesterday's close", "intraday",
+                                                        "against the previous session's "
+                                                        "closing price"),
+]
+PULSE_EXTRA_BY_KEY = {key: (label, cost, blurb) for key, label, cost, blurb in PULSE_EXTRAS}
+PULSE_DAILY_EXTRAS = {key for key, _l, cost, _b in PULSE_EXTRAS if cost == "daily"}
 
 
 def previous_session_levels(frame: pd.DataFrame) -> tuple[float, float, float]:
@@ -12313,13 +12355,126 @@ def previous_session_levels(frame: pd.DataFrame) -> tuple[float, float, float]:
             float(previous["Close"].iloc[-1]))
 
 
+def _period_extremes(frame: pd.DataFrame, rule: str) -> tuple[float, float, float, float]:
+    """
+    This period's high and low, and the previous period's, for a calendar rule.
+
+    Returns (current high, current low, previous high, previous low). Built by
+    grouping the candles already downloaded rather than fetching weekly and
+    monthly series, because every extra request is a second of wall clock
+    multiplied by the size of the universe.
+
+    A previous week or month that is not fully inside the downloaded window is
+    returned as not-a-number rather than as a partial figure. A "previous month
+    high" computed from four days of that month is not a previous month high,
+    and quietly serving one would be worse than serving nothing.
+    """
+    if frame.empty:
+        return (float("nan"),) * 4
+    index = pd.DatetimeIndex(frame.index)
+    # Bucketing by calendar week or month does not care about the timezone,
+    # and pandas warns when it drops one, so it is dropped deliberately here.
+    buckets = (index.tz_localize(None) if index.tz is not None else index).to_period(rule)
+    unique = list(dict.fromkeys(buckets.tolist()))
+    current = frame[buckets == unique[-1]]
+    now_high = float(current["High"].max()) if len(current) else float("nan")
+    now_low = float(current["Low"].min()) if len(current) else float("nan")
+    if len(unique) < 2:
+        return now_high, now_low, float("nan"), float("nan")
+    previous = frame[buckets == unique[-2]]
+    if previous.empty:
+        return now_high, now_low, float("nan"), float("nan")
+    # Only trust the previous bucket if the data starts before it does.
+    starts_inside = index[0] > previous.index[0]
+    if starts_inside:
+        return now_high, now_low, float("nan"), float("nan")
+    return (now_high, now_low,
+            float(previous["High"].max()), float(previous["Low"].min()))
+
+
+def _near(price: float, level: float, pct: float) -> bool:
+    """Is price sitting at a level, within a percentage of it?"""
+    if not (np.isfinite(price) and np.isfinite(level)) or level <= 0:
+        return False
+    return abs(price - level) <= abs(level) * pct
+
+
+def pulse_extra_checks(frame: pd.DataFrame, daily: pd.DataFrame | None, price: float,
+                       session_open: float, pdc: float, wanted: list) -> dict:
+    """
+    The opt-in confluences, each as a (bullish, bearish) pair.
+
+    A check whose data is missing returns (False, False) rather than guessing.
+    A 200-day average on a ticker with ninety days of history is not zero and
+    is not infinite -- it does not exist, and the row says so instead of
+    quietly counting it as a failure in one direction.
+    """
+    out: dict = {}
+    closes = frame["Close"]
+
+    def put(key: str, bullish, bearish):
+        out[key] = (bool(bullish), bool(bearish))
+
+    daily_close = daily["Close"] if (daily is not None and not daily.empty) else None
+    moving = {"sma20": ("sma", 20), "sma50": ("sma", 50), "sma100": ("sma", 100),
+              "sma200": ("sma", 200), "ema9": ("ema", 9), "ema21": ("ema", 21),
+              "ema63": ("ema", 63)}
+    for key, (kind, length) in moving.items():
+        if key not in wanted:
+            continue
+        if daily_close is None or len(daily_close) < length:
+            put(key, False, False)
+            continue
+        line = (sma if kind == "sma" else ema)(daily_close, length)
+        value = float(line.iloc[-1]) if len(line) else float("nan")
+        if not np.isfinite(value):
+            put(key, False, False)
+            continue
+        out[f"{key} value"] = round(value, 2)
+        put(key, price > value, price < value)
+
+    if "rsi" in wanted:
+        value = _last(rsi(closes, 14))
+        out["rsi value"] = round(value, 1) if np.isfinite(value) else None
+        put("rsi", np.isfinite(value) and value > 60.0,
+            np.isfinite(value) and value < 40.0)
+
+    if "macd" in wanted:
+        _line, _signal, hist = macd(closes)
+        value = _last(hist)
+        out["macd value"] = round(value, 4) if np.isfinite(value) else None
+        put("macd", np.isfinite(value) and value > 0, np.isfinite(value) and value < 0)
+
+    if "supert" in wanted:
+        direction, _upper, _lower = supertrend(frame["High"], frame["Low"], closes)
+        value = _last(direction)
+        put("supert", value > 0, value < 0)
+
+    if "adx" in wanted:
+        adx_line, plus_di, minus_di = adx(frame["High"], frame["Low"], closes, 14)
+        strength = _last(adx_line)
+        plus, minus = _last(plus_di), _last(minus_di)
+        out["adx value"] = round(strength, 1) if np.isfinite(strength) else None
+        trending = bool(np.isfinite(strength) and strength > 20.0)
+        put("adx", trending and plus > minus, trending and minus > plus)
+
+    if "open" in wanted:
+        ok = np.isfinite(session_open) and session_open > 0
+        put("open", ok and price > session_open, ok and price < session_open)
+
+    if "pdc" in wanted:
+        ok = np.isfinite(pdc) and pdc > 0
+        put("pdc", ok and price > pdc, ok and price < pdc)
+    return out
+
+
 def momentum_pulse_scan_one(ticker: str, interval: str, pcfg: dict) -> dict:
     """
     Score one ticker on both checklists. ALWAYS returns a row.
 
     Returning a row even when nothing is true is deliberate: a screener that
     silently drops the quiet names cannot be told apart from one that is
-    broken, and the counts are the whole point -- 0/4 is information.
+    broken, and the counts are the whole point -- 0 of 11 is information.
     """
     period, _ = lab_period_for(interval, 200)
     bundle = load_market_data(ticker, period, interval, freshness_seconds=120, min_bars=30)
@@ -12332,6 +12487,9 @@ def momentum_pulse_scan_one(ticker: str, interval: str, pcfg: dict) -> dict:
     price = float(frame["Close"].iloc[-1])
     pdh, pdl, pdc = previous_session_levels(frame)
     day_high, day_low = float(today["High"].max()), float(today["Low"].min())
+    session_open = float(today["Open"].iloc[0]) if len(today) else float("nan")
+    week_high, week_low, pwh, pwl = _period_extremes(frame, "W")
+    month_high, month_low, pmh, pml = _period_extremes(frame, "M")
 
     # Opening range: the first N candles of the current session.
     or_bars = int(pcfg.get("or_bars", 3))
@@ -12346,7 +12504,7 @@ def momentum_pulse_scan_one(ticker: str, interval: str, pcfg: dict) -> dict:
     vol_now = float(frame["Volume"].iloc[-1])
     vol_avg = float(sma(frame["Volume"], vol_len).iloc[-1] or 0.0)
     vol_ratio = (vol_now / vol_avg) if (has_volume and vol_avg) else float("nan")
-    vol_ok = bool(np.isfinite(vol_ratio) and vol_ratio >= float(pcfg.get("vol_mult", 1.5)))
+    heavy = bool(np.isfinite(vol_ratio) and vol_ratio >= float(pcfg.get("vol_mult", 1.5)))
 
     # Range expansion: today's range so far against the average session range.
     day_range = day_high - day_low
@@ -12360,26 +12518,81 @@ def momentum_pulse_scan_one(ticker: str, interval: str, pcfg: dict) -> dict:
         avg_range = float("nan")
     range_ratio = (day_range / avg_range) if (np.isfinite(avg_range) and avg_range > 0) \
         else float("nan")
-    range_ok = bool(np.isfinite(range_ratio)
+    expanded = bool(np.isfinite(range_ratio)
                     and range_ratio >= float(pcfg.get("range_mult", 1.0)))
 
     series, volume_backed = vwap(frame, True)
     vwap_now = float(series.iloc[-1]) if len(series) else float("nan")
 
+    # Change of character: the structure's own last break, from the shared
+    # engine the rest of the application uses, so this tab cannot disagree
+    # with the Chart Patterns tab about what the structure did.
+    try:
+        bos, _sh, _sl = market_structure(frame, 3, 3)
+        structure = int(bos.iloc[-1]) if len(bos) else 0
+    except Exception:                                               # noqa: BLE001
+        structure = 0
+
+    # Volume and range are direction-NEUTRAL events, so on their own they would
+    # count for both sides at once. Here they are made directional by asking
+    # where in the candle's own range the close landed: heavy volume closing in
+    # the top third is buying, heavy volume closing in the bottom third is
+    # selling. That is the difference between a confluence and a coin flip.
+    last = frame.iloc[-1]
+    bar_span = float(last["High"] - last["Low"])
+    position = ((price - float(last["Low"])) / bar_span) if bar_span > 0 else 0.5
+    closed_strong, closed_weak = position >= 0.6, position <= 0.4
+    day_span = day_high - day_low
+    day_position = ((price - day_low) / day_span) if day_span > 0 else 0.5
+
     near_pct = float(pcfg.get("near_pct", 0.25)) / 100.0
     bull = {
         "Breakout": bool(np.isfinite(or_high) and price > or_high),
-        "Volume": vol_ok,
         "PDH": bool(np.isfinite(pdh) and price > pdh),
-        "Range": range_ok,
+        "PWH": bool(np.isfinite(pwh) and price > pwh),
+        "PMH": bool(np.isfinite(pmh) and price > pmh),
+        "Day high": _near(price, day_high, near_pct),
+        "Week high": _near(price, week_high, near_pct),
+        "Month high": _near(price, month_high, near_pct),
+        "VWAP": bool(np.isfinite(vwap_now) and price > vwap_now),
+        "CHoCH": structure > 0,
+        "Volume": bool(heavy and closed_strong),
+        "Range": bool(expanded and day_position >= 0.6),
     }
     bear = {
-        "Breakout": bool(np.isfinite(or_low) and price < or_low),
-        "VWAP": bool(np.isfinite(vwap_now) and price < vwap_now),
-        "DL": bool(np.isfinite(day_low) and day_low > 0
-                   and (price - day_low) <= day_low * near_pct),
+        "Breakdown": bool(np.isfinite(or_low) and price < or_low),
         "PDL": bool(np.isfinite(pdl) and price < pdl),
+        "PWL": bool(np.isfinite(pwl) and price < pwl),
+        "PML": bool(np.isfinite(pml) and price < pml),
+        "Day low": _near(price, day_low, near_pct),
+        "Week low": _near(price, week_low, near_pct),
+        "Month low": _near(price, month_low, near_pct),
+        "VWAP": bool(np.isfinite(vwap_now) and price < vwap_now),
+        "CHoCH": structure < 0,
+        "Volume": bool(heavy and closed_weak),
+        "Range": bool(expanded and day_position <= 0.4),
     }
+
+    extras_wanted = list(pcfg.get("extras") or [])
+    extra_results: dict = {}
+    if extras_wanted:
+        daily_frame = None
+        if any(key in PULSE_DAILY_EXTRAS for key in extras_wanted):
+            try:
+                daily_frame = load_market_data(ticker, "2y", "1d",
+                                               freshness_seconds=3600, min_bars=30).frame
+            except Exception:                                       # noqa: BLE001
+                daily_frame = None
+        extra_results = pulse_extra_checks(frame, daily_frame, price, session_open,
+                                           pdc, extras_wanted)
+
+    bull_extra = {PULSE_EXTRA_BY_KEY[k][0]: v[0] for k, v in extra_results.items()
+                  if k in PULSE_EXTRA_BY_KEY}
+    bear_extra = {PULSE_EXTRA_BY_KEY[k][0]: v[1] for k, v in extra_results.items()
+                  if k in PULSE_EXTRA_BY_KEY}
+    bull_total, bear_total = len(bull) + len(bull_extra), len(bear) + len(bear_extra)
+    bull_score = sum(bull.values()) + sum(bull_extra.values())
+    bear_score = sum(bear.values()) + sum(bear_extra.values())
     change_pct = ((price - pdc) / pdc * 100.0) if (np.isfinite(pdc) and pdc) else float("nan")
 
     row = {
@@ -12387,19 +12600,34 @@ def momentum_pulse_scan_one(ticker: str, interval: str, pcfg: dict) -> dict:
         "Sector": SECTOR_BY_TICKER.get(ticker, "--"),
         "Price": round(price, 2),
         "Change %": round(change_pct, 2) if np.isfinite(change_pct) else None,
-        "Bullish": f"{sum(bull.values())}/4", "Bearish": f"{sum(bear.values())}/4",
-        "Bull count": sum(bull.values()), "Bear count": sum(bear.values()),
-        "Bias": ("BULLISH" if sum(bull.values()) > sum(bear.values())
-                 else "BEARISH" if sum(bear.values()) > sum(bull.values()) else "MIXED"),
+        "Bullish": f"{bull_score}/{bull_total}", "Bearish": f"{bear_score}/{bear_total}",
+        "Bull count": bull_score, "Bear count": bear_score,
+        "Bull of": bull_total, "Bear of": bear_total,
+        "Bull %": round(bull_score / bull_total * 100.0, 1) if bull_total else None,
+        "Bear %": round(bear_score / bear_total * 100.0, 1) if bear_total else None,
+        "Bias": ("BULLISH" if bull_score > bear_score
+                 else "BEARISH" if bear_score > bull_score else "MIXED"),
         "OR High": round(or_high, 2) if np.isfinite(or_high) else None,
         "OR Low": round(or_low, 2) if np.isfinite(or_low) else None,
         "PDH": round(pdh, 2) if np.isfinite(pdh) else None,
         "PDL": round(pdl, 2) if np.isfinite(pdl) else None,
+        "PWH": round(pwh, 2) if np.isfinite(pwh) else None,
+        "PWL": round(pwl, 2) if np.isfinite(pwl) else None,
+        "PMH": round(pmh, 2) if np.isfinite(pmh) else None,
+        "PML": round(pml, 2) if np.isfinite(pml) else None,
         "Day High": round(day_high, 2), "Day Low": round(day_low, 2),
+        "Week High": round(week_high, 2) if np.isfinite(week_high) else None,
+        "Week Low": round(week_low, 2) if np.isfinite(week_low) else None,
+        "Month High": round(month_high, 2) if np.isfinite(month_high) else None,
+        "Month Low": round(month_low, 2) if np.isfinite(month_low) else None,
         "VWAP": round(vwap_now, 2) if np.isfinite(vwap_now) else None,
         "VWAP is real": "yes" if volume_backed else "no (zero-volume feed, TWAP)",
+        "Structure": ("bullish BOS" if structure > 0 else
+                      "bearish BOS" if structure < 0 else "none yet"),
         "Volume x": round(vol_ratio, 2) if np.isfinite(vol_ratio) else None,
         "Volume needed": float(pcfg.get("vol_mult", 1.5)),
+        "Close in bar %": round(position * 100.0, 0),
+        "Close in day %": round(day_position * 100.0, 0),
         "Range x": round(range_ratio, 2) if np.isfinite(range_ratio) else None,
         "Range needed": float(pcfg.get("range_mult", 1.0)),
         "Checked at": pd.Timestamp.now(),
@@ -12408,35 +12636,69 @@ def momentum_pulse_scan_one(ticker: str, interval: str, pcfg: dict) -> dict:
         row[f"B:{name}"] = "YES" if passed else "NO"
     for name, passed in bear.items():
         row[f"S:{name}"] = "YES" if passed else "NO"
+    for name, passed in bull_extra.items():
+        row[f"B+:{name}"] = "YES" if passed else "NO"
+    for name, passed in bear_extra.items():
+        row[f"S+:{name}"] = "YES" if passed else "NO"
+    for key, value in extra_results.items():
+        if key.endswith(" value"):
+            row[key] = value
+    row["_bull_names"] = list(bull.keys())
+    row["_bear_names"] = list(bear.keys())
+    row["_bull_extra"] = list(bull_extra.keys())
+    row["_bear_extra"] = list(bear_extra.keys())
     return row
 
 
 def _pulse_checklist(row: dict) -> None:
-    """The two four-row checklists, as the operator's reference screen shows them."""
+    """The two checklists, core first and the opt-in layer under a rule."""
+    bull_names = list(row.get("_bull_names") or PULSE_BULL)
+    bear_names = list(row.get("_bear_names") or PULSE_BEAR)
+    bull_extra = list(row.get("_bull_extra") or [])
+    bear_extra = list(row.get("_bear_extra") or [])
+
+    def line(prefix: str, name: str) -> None:
+        passed = str(row.get(f"{prefix}{name}")) == "YES"
+        st.markdown(f"{name} &nbsp; {':green[**YES**]' if passed else ':red[**NO**]'}",
+                    unsafe_allow_html=True)
+
     left, right = st.columns(2)
     with left:
         st.markdown(f"**BULLISH {row.get('Bullish', '--')}**")
-        for name in PULSE_BULL:
-            passed = str(row.get(f"B:{name}")) == "YES"
-            st.markdown(f"{name} &nbsp; {':green[**YES**]' if passed else ':red[**NO**]'}",
-                        unsafe_allow_html=True)
+        for name in bull_names:
+            line("B:", name)
+        if bull_extra:
+            st.markdown("---")
+            st.caption("additional confluences")
+            for name in bull_extra:
+                line("B+:", name)
     with right:
         st.markdown(f"**BEARISH {row.get('Bearish', '--')}**")
-        for name in PULSE_BEAR:
-            passed = str(row.get(f"S:{name}")) == "YES"
-            st.markdown(f"{name} &nbsp; {':green[**YES**]' if passed else ':red[**NO**]'}",
-                        unsafe_allow_html=True)
-    st.caption("Not a buy/sell signal. These are four conditions being true at this instant, "
-               "which is a reason to open a chart, not an instruction to trade.")
+        for name in bear_names:
+            line("S:", name)
+        if bear_extra:
+            st.markdown("---")
+            st.caption("additional confluences")
+            for name in bear_extra:
+                line("S+:", name)
+    st.caption("Not a buy/sell signal. These are conditions being true at this instant, "
+               "which is a reason to open a chart, not an instruction to trade. More "
+               "confluences ticked does not mean a better trade: several of them measure "
+               "the same thing (price above VWAP, above the open and above yesterday's "
+               "close are mostly one fact counted three times), so a high count is partly "
+               "a count of how much they overlap.")
 
 
 def tab_momentum_pulse(cfg: dict) -> None:
     st.subheader("Momentum Pulse \u2014 intraday condition screener")
     st.warning(
         "**A condition count is not a strategy, and this tab does not backtest anything.** "
-        "It reports which of four bullish and four bearish conditions are true right now. "
-        "Nothing here has been tested for whether 4/4 makes money -- to find that out, apply a "
-        "name to the sidebar and run it through the Backtesting tab or the Signal Lab.")
+        "It reports which of eleven bullish and eleven bearish conditions are true right "
+        "now, plus any additional ones you switch on. Nothing here has been tested for "
+        "whether a high count makes money — to find that out, apply a name to the sidebar "
+        "and run it through the Backtesting tab or the Signal Lab. Adding confluences "
+        "makes the picture richer; it does not make it predictive, and several of these "
+        "measure overlapping facts, so counts are not independent evidence.")
 
     c1, c2, c3 = st.columns(3)
     universe = c1.selectbox("Universe", SCREENER_UNIVERSES, key="pulse_universe")
@@ -12448,7 +12710,8 @@ def tab_momentum_pulse(cfg: dict) -> None:
              "an intraday breakout screen: fast enough to catch a move, slow enough that the "
              "opening-range and volume tests are not pure noise. 15m is the steadier option.")
     bias_filter = c3.selectbox("Show", ["Everything", "Bullish only", "Bearish only",
-                                        "4/4 only"], key="pulse_bias")
+                                        "Full house only", "At least 70% one way"],
+                               key="pulse_bias")
 
     custom_text = ""
     if universe.startswith("Custom"):
@@ -12462,21 +12725,33 @@ def tab_momentum_pulse(cfg: dict) -> None:
     with st.expander("What each condition means, and its threshold", expanded=False):
         st.markdown(
             "| Condition | Bullish test | Bearish test |\n|---|---|---|\n"
-            "| **Breakout** | above the opening-range high | below the opening-range low |\n"
-            "| **Volume** | current volume >= N x its average | the same test |\n"
-            "| **PDH / PDL** | above the PREVIOUS day's high | below the previous day's low |\n"
-            "| **Range** | today's range has expanded past its average | -- |\n"
-            "| **VWAP** | -- | trading below session VWAP |\n"
-            "| **DL** | -- | sitting at or near today's low |\n")
-        st.caption("These are the standard readings of the abbreviations; the source screen "
-                   "publishes no definitions. Every number below is yours to change.")
+            "| **Breakout / Breakdown** | above the opening-range high | below the "
+            "opening-range low |\n"
+            "| **PDH / PDL** | above the previous day's high | below its low |\n"
+            "| **PWH / PWL** | above the previous week's high | below its low |\n"
+            "| **PMH / PML** | above the previous month's high | below its low |\n"
+            "| **Day high / low** | sitting at today's high | at today's low |\n"
+            "| **Week high / low** | at this week's high | at this week's low |\n"
+            "| **Month high / low** | at this month's high | at this month's low |\n"
+            "| **VWAP** | above session VWAP | below it |\n"
+            "| **CHoCH** | the last break of structure was up | it was down |\n"
+            "| **Volume** | heavy volume closing in the top 40% of the candle | heavy "
+            "volume closing in the bottom 40% |\n"
+            "| **Range** | range expanded, price in the top 40% of the day | expanded, "
+            "price in the bottom 40% |\n")
         st.info(
-            "**Volume and Range are direction-neutral.** They appear only on the bullish "
-            "checklist, exactly as the reference screen has them, but a hard sell-off also "
-            "has heavy volume and an expanded range. So a falling stock can legitimately "
-            "read **2/4 bullish** alongside **4/4 bearish** — the two counts are not "
-            "opposites and do not sum to four. The directional tests are Breakout and "
-            "PDH/PDL; those are the ones that disagree with each other.")
+            "**Volume and range are direction-neutral events, and are made directional "
+            "here.** A hard sell-off has heavy volume and a wide range just as a breakout "
+            "does, so counting either on its own would hand the same tick to both sides. "
+            "Each is therefore paired with WHERE the close landed: heavy volume closing in "
+            "the top of its candle is buying, the same volume closing at the bottom is "
+            "selling. The two counts still do not sum to eleven — a quiet, mid-range name "
+            "scores low on both, which is the correct answer.")
+        st.caption("A previous week or month that is not fully inside the downloaded "
+                   "window is reported as blank rather than as a partial figure: a month "
+                   "high computed from four days of that month is not a month high. On "
+                   "short intraday periods the PWH/PWL and PMH/PML rows will therefore "
+                   "often be blank — lengthen the timeframe to fill them.")
         p1, p2, p3 = st.columns(3)
         or_bars = p1.number_input("Opening range (candles)", 1, 24, 3, 1, key="pulse_or")
         vol_mult = p2.number_input("Volume multiple", 1.0, 10.0, 1.5, 0.1, key="pulse_vol")
@@ -12488,8 +12763,48 @@ def tab_momentum_pulse(cfg: dict) -> None:
         near_pct = q3.number_input("\"At the low\" tolerance (%)", 0.0, 5.0, 0.25, 0.05,
                                    key="pulse_near")
 
+    # ---- the opt-in layer --------------------------------------------------
+    extras: list = []
+    with st.container(border=True):
+        use_extras = st.checkbox(
+            "Include additional confluences", value=False, key="pulse_use_extras",
+            help="Off by default. These are reference confluences layered on top of the "
+                 "core eleven; switching them on changes the denominator of both counts, "
+                 "so a 6/11 becomes a 6/14 rather than quietly inflating.")
+        if use_extras:
+            st.caption("Pick the ones you want. Each adds one row to BOTH checklists — the "
+                       "bullish side asks whether price is above the line, the bearish side "
+                       "whether it is below.")
+            daily_keys = [k for k, _l, cost, _b in PULSE_EXTRAS if cost == "daily"]
+            intraday_keys = [k for k, _l, cost, _b in PULSE_EXTRAS if cost != "daily"]
+            st.markdown("**Daily moving averages** — these need a second download per "
+                        "ticker, so they roughly double the scan time.")
+            columns = st.columns(4)
+            for i, key in enumerate(daily_keys):
+                label, _cost, blurb = PULSE_EXTRA_BY_KEY[key]
+                if columns[i % 4].checkbox(label, value=False, key=f"pulse_x_{key}",
+                                           help=blurb):
+                    extras.append(key)
+            st.markdown("**On the selected timeframe** — free, computed from the candles "
+                        "already downloaded.")
+            columns = st.columns(3)
+            for i, key in enumerate(intraday_keys):
+                label, _cost, blurb = PULSE_EXTRA_BY_KEY[key]
+                if columns[i % 3].checkbox(label, value=False, key=f"pulse_x_{key}",
+                                           help=blurb):
+                    extras.append(key)
+            chosen_daily = [k for k in extras if k in PULSE_DAILY_EXTRAS]
+            if chosen_daily:
+                st.warning(f"{len(chosen_daily)} daily average(s) selected. Every ticker "
+                           f"now needs a daily download as well as its intraday one, so "
+                           f"expect the scan to take about twice as long.")
+            if extras:
+                st.caption(f"{len(extras)} additional confluence(s) on. Both counts will "
+                           f"be out of {11 + len(extras)}.")
+
     pcfg = {"or_bars": or_bars, "vol_mult": vol_mult, "range_mult": range_mult,
-            "vol_len": vol_len, "range_len": range_len, "near_pct": near_pct}
+            "vol_len": vol_len, "range_len": range_len, "near_pct": near_pct,
+            "extras": extras}
 
     def _worker(ticker):
         try:
@@ -12497,7 +12812,9 @@ def tab_momentum_pulse(cfg: dict) -> None:
         except Exception as exc:                                    # noqa: BLE001
             return [], [{"Ticker": ticker, "Problem": str(exc)[:140]}]
 
-    scan_cost_notice(len(chosen), per_job_hint=1.5, prefix="pulse")
+    scan_cost_notice(len(chosen),
+                     per_job_hint=3.0 if any(k in PULSE_DAILY_EXTRAS for k in extras)
+                     else 1.5, prefix="pulse")
     rows, errs, _done = chunked_sweep("pulse", list(chosen), _worker,
                                       _auto_slice_seconds(), "tickers")
 
@@ -12515,28 +12832,40 @@ def tab_momentum_pulse(cfg: dict) -> None:
     a_bear = frame[frame["Bias"] == "BEARISH"]
     b.metric("Leaning bullish", len(a_bull))
     c.metric("Leaning bearish", len(a_bear))
-    d.metric("4 of 4 either way",
-             int(((frame["Bull count"] == 4) | (frame["Bear count"] == 4)).sum()))
+    full_bull = frame["Bull count"] >= frame["Bull of"]
+    full_bear = frame["Bear count"] >= frame["Bear of"]
+    d.metric("Full house either way", int((full_bull | full_bear).sum()),
+             f"out of {int(frame['Bull of'].max() or 0)} conditions")
 
     view = frame
     if bias_filter == "Bullish only":
         view = frame[frame["Bias"] == "BULLISH"]
     elif bias_filter == "Bearish only":
         view = frame[frame["Bias"] == "BEARISH"]
-    elif bias_filter == "4/4 only":
-        view = frame[(frame["Bull count"] == 4) | (frame["Bear count"] == 4)]
+    elif bias_filter == "Full house only":
+        view = frame[full_bull | full_bear]
+    elif bias_filter == "At least 70% one way":
+        view = frame[(frame["Bull %"].fillna(0) >= 70.0)
+                     | (frame["Bear %"].fillna(0) >= 70.0)]
 
     if view.empty:
         st.info("Nothing matches that filter. Switch **Show** back to Everything to see the "
                 "full scan and how close each name came.")
         return
 
-    order = [c for c in ["Ticker", "Sector", "Price", "Change %", "Bias", "Bullish", "Bearish",
-                         "B:Breakout", "B:Volume", "B:PDH", "B:Range",
-                         "S:Breakout", "S:VWAP", "S:DL", "S:PDL",
-                         "Volume x", "Volume needed", "Range x", "Range needed",
-                         "OR High", "OR Low", "PDH", "PDL", "Day High", "Day Low",
-                         "VWAP", "VWAP is real", "Timeframe", "Checked at"]
+    checklist_columns = ([f"B:{name}" for name in PULSE_BULL]
+                         + [f"S:{name}" for name in PULSE_BEAR]
+                         + [c for c in view.columns if str(c).startswith(("B+:", "S+:"))])
+    order = [c for c in (["Ticker", "Sector", "Price", "Change %", "Bias",
+                          "Bullish", "Bearish", "Bull %", "Bear %"]
+                         + checklist_columns
+                         + ["Structure", "Volume x", "Volume needed", "Close in bar %",
+                            "Range x", "Range needed", "Close in day %",
+                            "OR High", "OR Low", "PDH", "PDL", "PWH", "PWL", "PMH", "PML",
+                            "Day High", "Day Low", "Week High", "Week Low",
+                            "Month High", "Month Low", "VWAP", "VWAP is real",
+                            "Timeframe", "Checked at"]
+                         + [c for c in view.columns if str(c).endswith(" value")])
              if c in view.columns]
     st.dataframe(
         view.sort_values(["Bull count", "Bear count", "Change %"],
@@ -15350,11 +15679,35 @@ def _touches(levels: np.ndarray, level: float, tol: float) -> int:
     return int(np.sum(np.abs(levels - level) <= tol))
 
 
+def _mb_bars_ago(flags) -> int:
+    """
+    How many candles ago the setup's defining condition became true.
+
+    Given a true/false reading per bar, this is the length of the run ending at
+    the last bar, minus one: a condition that first became true on this candle
+    is nought candles old, one that has held for twelve is eleven.
+
+    This is what separates a signal from a fact about the past. The operator's
+    complaint was exact -- an inverted V that completed twelve candles ago is
+    not something to act on now, and a screener that lists it alongside one
+    that completed this candle is hiding the only thing that matters.
+    """
+    flags = np.asarray(flags, dtype=bool)
+    if flags.size == 0 or not bool(flags[-1]):
+        return 0
+    run = 0
+    for value in flags[::-1]:
+        if not value:
+            break
+        run += 1
+    return int(max(run - 1, 0))
+
+
 def _hit(setup, direction, score, reading, trigger=None, invalidation=None,
-         objective=None, extras=None) -> dict:
+         objective=None, extras=None, bars_ago=0) -> dict:
     out = {"setup": setup, "direction": direction, "score": float(max(0.0, min(100.0, score))),
            "reading": reading, "trigger": trigger, "invalidation": invalidation,
-           "objective": objective}
+           "objective": objective, "bars_ago": int(max(0, bars_ago))}
     out.update(extras or {})
     return out
 
@@ -15387,6 +15740,7 @@ def mb_inverted_v(ctx: MBContext):
                 f"rose {fmt(rise)} from {fmt(base)} to {fmt(peak)} and has given back "
                 f"{retrace * 100:.0f}% of it, sitting {fmt(back)} from where the move began",
                 trigger=base, invalidation=peak, objective=base - rise * 0.5,
+                bars_ago=_mb_bars_ago(np.abs(ctx.closes - base) <= 1.5 * ctx.atr),
                 extras={"pivot_high": peak, "pivot_low": base,
                         "marks": [(base_i, base, "move began"),
                                   (peak_i, peak, "top")],
@@ -15412,6 +15766,7 @@ def mb_v_bottom(ctx: MBContext):
                 f"fell {fmt(fall)} from {fmt(start)} to {fmt(trough)} and has recovered the "
                 f"whole move, sitting {fmt(back)} from where the fall began",
                 trigger=start, invalidation=trough, objective=start + fall * 0.5,
+                bars_ago=_mb_bars_ago(np.abs(ctx.closes - start) <= 1.5 * ctx.atr),
                 extras={"pivot_high": start, "pivot_low": trough,
                         "marks": [(start_i, start, "fall began"),
                                   (trough_i, trough, "bottom")],
@@ -15434,6 +15789,8 @@ def mb_at_resistance(ctx: MBContext):
                 f"{hits} time(s) in {ctx.lookback} candles",
                 trigger=level + 0.25 * ctx.atr, invalidation=level - 1.5 * ctx.atr,
                 objective=level + height,
+                bars_ago=_mb_bars_ago((level - ctx.closes >= -ctx.tol)
+                                      & (level - ctx.closes <= 1.5 * ctx.atr)),
                 extras={"touches": hits, "level": level, "level_name": "range high"})
 
 
@@ -15453,6 +15810,8 @@ def mb_at_support(ctx: MBContext):
                 f"{hits} time(s) in {ctx.lookback} candles",
                 trigger=level - 0.25 * ctx.atr, invalidation=level + 1.5 * ctx.atr,
                 objective=level - height,
+                bars_ago=_mb_bars_ago((ctx.closes - level >= -ctx.tol)
+                                      & (ctx.closes - level <= 1.5 * ctx.atr)),
                 extras={"touches": hits, "level": level, "level_name": "range low"})
 
 
@@ -15493,6 +15852,9 @@ def mb_multi_touch(ctx: MBContext):
                 trigger=level + (0.25 * ctx.atr if side == "UP" else -0.25 * ctx.atr),
                 invalidation=level - (1.5 * ctx.atr if side == "UP" else -1.5 * ctx.atr),
                 objective=level + (height if side == "UP" else -height),
+                bars_ago=(len(ctx.closes) - 1 - max(
+                    [p for p, v in (ctx.pivot_highs if side == "UP" else ctx.pivot_lows)
+                     if abs(v - level) <= band] or [len(ctx.closes) - 1])),
                 extras={"touches": hits, "level": level, "level_name": label,
                         "marks": [(p, v, "") for p, v in
                                   (ctx.pivot_highs if side == "UP" else ctx.pivot_lows)
@@ -15514,6 +15876,9 @@ def mb_compression(ctx: MBContext):
                 trigger=ctx.range_high + 0.25 * ctx.atr,
                 invalidation=ctx.range_low - 0.25 * ctx.atr,
                 objective=ctx.range_high + height,
+                # A coil is a state, not an event: it is true right now, and
+                # has been for as long as price has stayed inside the range.
+                bars_ago=0,
                 extras={"level": ctx.range_high, "lower": ctx.range_low,
                         "zone": (ctx.range_low, ctx.range_high, "compression range")})
 
@@ -15551,6 +15916,7 @@ def mb_triangle(ctx: MBContext):
                 trigger=float(ctx.highs[-10:].max()) + 0.25 * ctx.atr,
                 invalidation=float(ctx.lows[-10:].min()) - 0.25 * ctx.atr,
                 objective=float(ctx.highs[-10:].max()) + height,
+                bars_ago=0,                       # the apex is where it is now
                 extras={"level": float(ctx.highs[-10:].max()),
                         "lower": float(ctx.lows[-10:].min()),
                         "lines": [(hs, float(np.polyfit(hx, hy, 1)[1]), "upper line"),
@@ -15578,6 +15944,8 @@ def mb_breakout_retest(ctx: MBContext):
                 f"{fmt(ctx.price)}, still above the level it broke",
                 trigger=ctx.price + 0.25 * ctx.atr, invalidation=old_high - 0.75 * ctx.atr,
                 objective=ctx.price + (recent_max - old_high) * 2.0,
+                bars_ago=_mb_bars_ago((ctx.closes >= old_high - 0.5 * ctx.atr)
+                                      & (ctx.closes <= old_high + 2.0 * ctx.atr)),
                 extras={"level": old_high, "level_name": "broken high",
                         "marks": [(int(np.argmax(ctx.highs[-20:])) + len(ctx.highs) - 20,
                                    recent_max, "break high")]})
@@ -15599,6 +15967,8 @@ def mb_breakdown_retest(ctx: MBContext):
                 f"{fmt(ctx.price)}, still below the level it broke",
                 trigger=ctx.price - 0.25 * ctx.atr, invalidation=old_low + 0.75 * ctx.atr,
                 objective=ctx.price - (old_low - recent_min) * 2.0,
+                bars_ago=_mb_bars_ago((ctx.closes <= old_low + 0.5 * ctx.atr)
+                                      & (ctx.closes >= old_low - 2.0 * ctx.atr)),
                 extras={"level": old_low, "level_name": "broken low",
                         "marks": [(int(np.argmin(ctx.lows[-20:])) + len(ctx.lows) - 20,
                                    recent_min, "break low")]})
@@ -15626,6 +15996,9 @@ def mb_equal_highs(ctx: MBContext):
                 f"everyone short sit just above it, which is what makes it a target",
                 trigger=top + 0.25 * ctx.atr, invalidation=top - 1.5 * ctx.atr,
                 objective=top + (ctx.range_high - ctx.range_low) * 0.5,
+                bars_ago=(len(ctx.closes) - 1 - max(
+                    [p for p, v in ctx.pivot_highs[-4:] if abs(v - top) <= band]
+                    or [len(ctx.closes) - 1])),
                 extras={"level": top, "touches": matched, "level_name": "equal highs",
                         "marks": [(p, v, "") for p, v in ctx.pivot_highs[-4:]
                                   if abs(v - top) <= band]})
@@ -15650,6 +16023,9 @@ def mb_equal_lows(ctx: MBContext):
                 f"everyone long sit just below it",
                 trigger=bottom - 0.25 * ctx.atr, invalidation=bottom + 1.5 * ctx.atr,
                 objective=bottom - (ctx.range_high - ctx.range_low) * 0.5,
+                bars_ago=(len(ctx.closes) - 1 - max(
+                    [p for p, v in ctx.pivot_lows[-4:] if abs(v - bottom) <= band]
+                    or [len(ctx.closes) - 1])),
                 extras={"level": bottom, "touches": matched, "level_name": "equal lows",
                         "marks": [(p, v, "") for p, v in ctx.pivot_lows[-4:]
                                   if abs(v - bottom) <= band]})
@@ -15673,6 +16049,8 @@ def mb_failed_breakdown(ctx: MBContext):
                 f"it: the sellers filled on that break are trapped",
                 trigger=ctx.price + 0.25 * ctx.atr, invalidation=pierced - 0.25 * ctx.atr,
                 objective=ctx.range_high,
+                bars_ago=len(ctx.lows) - 1 - (int(np.argmin(ctx.lows[tail]))
+                                              + tail.start),
                 extras={"level": level, "level_name": "swept support",
                         "marks": [(int(np.argmin(ctx.lows[tail])) + tail.start,
                                    pierced, "sweep low")]})
@@ -15696,6 +16074,8 @@ def mb_failed_breakout(ctx: MBContext):
                 f"it: the buyers filled on that break are trapped",
                 trigger=ctx.price - 0.25 * ctx.atr, invalidation=pierced + 0.25 * ctx.atr,
                 objective=ctx.range_low,
+                bars_ago=len(ctx.highs) - 1 - (int(np.argmax(ctx.highs[tail]))
+                                               + tail.start),
                 extras={"level": level, "level_name": "swept resistance",
                         "marks": [(int(np.argmax(ctx.highs[tail])) + tail.start,
                                    pierced, "sweep high")]})
@@ -15728,6 +16108,8 @@ def mb_double_bottom(ctx: MBContext):
                    f", {fmt(neckline - ctx.price)} above price"),
                 trigger=neckline + 0.25 * ctx.atr, invalidation=min(v1, v2) - 0.5 * ctx.atr,
                 objective=neckline + depth,
+                bars_ago=(_mb_bars_ago(ctx.closes > neckline) if broken
+                          else len(ctx.closes) - 1 - i2),
                 extras={"level": neckline, "level_name": "neckline", "touches": 2,
                         "marks": [(i1, v1, "low 1"), (i2, v2, "low 2")]})
 
@@ -15756,6 +16138,8 @@ def mb_double_top(ctx: MBContext):
                    f", {fmt(ctx.price - neckline)} below price"),
                 trigger=neckline - 0.25 * ctx.atr, invalidation=max(v1, v2) + 0.5 * ctx.atr,
                 objective=neckline - depth,
+                bars_ago=(_mb_bars_ago(ctx.closes < neckline) if broken
+                          else len(ctx.closes) - 1 - i2),
                 extras={"level": neckline, "level_name": "neckline", "touches": 2,
                         "marks": [(i1, v1, "high 1"), (i2, v2, "high 2")]})
 
@@ -15857,7 +16241,7 @@ def mb_trendline_retest(ctx: MBContext):
                     f"{fmt(line_at(broke_at))}, retested, and price is still "
                     f"{'above' if side == 'UP' else 'below'} it at {fmt(line_now)}",
                     trigger=ctx.price + (0.25 * ctx.atr if side == "UP" else -0.25 * ctx.atr),
-                    invalidation=stop, objective=objective,
+                    invalidation=stop, objective=objective, bars_ago=bars_since,
                     extras={"level": line_now, "level_name": f"{name} line now",
                             "touches": len(recent_pivots),
                             "lines": [(float(slope_), float(intercept),
@@ -15976,6 +16360,9 @@ def mb_demand_zone(ctx: MBContext):
                 trigger=zone["high"] + 0.25 * ctx.atr,
                 invalidation=zone["low"] - 0.5 * ctx.atr,
                 objective=zone["high"] + abs(zone["departure"]) * ctx.atr,
+                bars_ago=_mb_bars_ago(
+                    (ctx.closes >= zone["low"] - 0.5 * ctx.atr)
+                    & (ctx.closes <= zone["high"] + 1.0 * ctx.atr)),
                 extras={"level": mid, "level_name": "zone midpoint", "touches": zone["taps"],
                         "zone": (zone["low"], zone["high"], "demand zone"),
                         "marks": [(zone["start"], zone["high"], "origin"),
@@ -16001,6 +16388,9 @@ def mb_supply_zone(ctx: MBContext):
                 trigger=zone["low"] - 0.25 * ctx.atr,
                 invalidation=zone["high"] + 0.5 * ctx.atr,
                 objective=zone["low"] - abs(zone["departure"]) * ctx.atr,
+                bars_ago=_mb_bars_ago(
+                    (ctx.closes >= zone["low"] - 1.0 * ctx.atr)
+                    & (ctx.closes <= zone["high"] + 0.5 * ctx.atr)),
                 extras={"level": mid, "level_name": "zone midpoint", "touches": zone["taps"],
                         "zone": (zone["low"], zone["high"], "supply zone"),
                         "marks": [(zone["start"], zone["low"], "origin"),
@@ -16065,6 +16455,7 @@ def mb_rounding_bottom(ctx: MBContext):
                 f"{fmt(abs(rim - ctx.price))} from the rim at {fmt(rim)}",
                 trigger=rim + 0.25 * ctx.atr, invalidation=trough + 0.25 * depth,
                 objective=rim + depth,
+                bars_ago=_mb_bars_ago(ctx.closes >= trough + 0.5 * depth),
                 extras={"level": rim, "level_name": "rim", "curve": bowl,
                         "marks": [(int(np.argmin(ctx.lows)), trough, "base")]})
 
@@ -16139,6 +16530,8 @@ def mb_cup_and_handle(ctx: MBContext):
                 trigger=rim + 0.25 * ctx.atr,
                 invalidation=found["handle_extreme"] - 0.5 * ctx.atr,
                 objective=rim + depth,
+                bars_ago=len(ctx.closes) - 1 - int(np.argmin(ctx.lows[found["cup_end"]:])
+                                                   + found["cup_end"]),
                 extras={"level": rim, "level_name": "cup rim", "curve": found["bowl"],
                         "zone": (found["handle_extreme"], rim, "handle",
                                  found["cup_end"], len(ctx.closes) - 1),
@@ -16160,6 +16553,8 @@ def mb_inverted_cup_and_handle(ctx: MBContext):
                 trigger=rim - 0.25 * ctx.atr,
                 invalidation=found["handle_extreme"] + 0.5 * ctx.atr,
                 objective=rim - depth,
+                bars_ago=len(ctx.closes) - 1 - int(np.argmax(ctx.highs[found["cup_end"]:])
+                                                   + found["cup_end"]),
                 extras={"level": rim, "level_name": "dome rim", "curve": found["bowl"],
                         "zone": (rim, found["handle_extreme"], "handle",
                                  found["cup_end"], len(ctx.closes) - 1),
@@ -16240,6 +16635,10 @@ def mb_trendline_test(ctx: MBContext):
             else (line_now + 0.6 * ctx.atr),
             objective=(line_now + height * 0.5) if side == "UP"
             else (line_now - height * 0.5),
+            bars_ago=_mb_bars_ago([
+                -0.25 * ctx.atr <= ((ctx.closes[i] - line(i)) if side == "UP"
+                                    else (line(i) - ctx.closes[i])) <= 1.25 * ctx.atr
+                for i in range(len(ctx.closes))]),
             extras={"level": line_now, "level_name": f"{name} line", "touches": touches,
                     "lines": [(slope_, intercept, f"{name} trendline")],
                     "marks": [(p, v, "") for p, v in pivots[-5:]]})
@@ -16301,6 +16700,9 @@ def mb_parallel_channel(ctx: MBContext):
                 trigger=ctx.price + (0.25 * ctx.atr if at_lower else -0.25 * ctx.atr),
                 invalidation=(lower - 0.6 * ctx.atr) if at_lower else (upper + 0.6 * ctx.atr),
                 objective=(upper if at_lower else lower),
+                bars_ago=_mb_bars_ago([
+                    abs(ctx.closes[i] - ((ls * i + li) if at_lower else (hs * i + hi)))
+                    <= 0.75 * ctx.atr for i in range(len(ctx.closes))]),
                 extras={"level": rail, "level_name": ("lower rail" if at_lower
                                                       else "upper rail"),
                         "touches": touches,
@@ -16433,9 +16835,11 @@ def mb_setup_chart(ctx: MBContext, hit: dict, plan: dict, title: str,
     """
     The candles the detector looked at, with everything it found drawn on them.
 
-    Bar positions come back from the detector as indices into the context
-    window, so they are mapped through that window's own index -- the only
-    honest way to put a detector's finding at a date.
+    The detector works in bar positions, and so does the chart: candles are
+    drawn at positions with the dates written underneath (see gapless_axis).
+    That keeps a detector's finding on exactly the candle it was found on, and
+    keeps an intraday chart free of the overnight whitespace that used to break
+    a fitted trendline into disconnected steps.
     """
     import plotly.graph_objects as go
 
@@ -16443,15 +16847,11 @@ def mb_setup_chart(ctx: MBContext, hit: dict, plan: dict, title: str,
     stamps = list(window.index)
     span = len(stamps)
 
-    def at(i) -> object:
-        """A bar position as the timestamp it stands for, clamped to the window."""
-        return stamps[int(min(max(int(i), 0), span - 1))]
+    def at(i) -> int:
+        """A detector's bar position, clamped to the window."""
+        return int(min(max(int(i), 0), span - 1))
 
-    figure = go.Figure(go.Candlestick(
-        x=stamps, open=window["Open"], high=window["High"],
-        low=window["Low"], close=window["Close"], name="Price",
-        increasing_line_color=_UP, decreasing_line_color=_DOWN,
-        increasing_fillcolor=_UP, decreasing_fillcolor=_DOWN, line=dict(width=1)))
+    figure = go.Figure(candle_trace(window))
 
     lo = float(window["Low"].min())
     hi = float(window["High"].max())
@@ -16492,24 +16892,25 @@ def mb_setup_chart(ctx: MBContext, hit: dict, plan: dict, title: str,
                               xanchor=anchor, yanchor="bottom", yshift=7,
                               font=dict(size=11, color=_MB_LINE))
 
-    # Fitted lines, drawn only across the stretch they were fitted over.
+    # Fitted lines. The part that runs off the top or bottom of the chart is
+    # blanked rather than dropped: dropping it and joining what is left draws a
+    # line between two points the fit never passed through.
     for slope_, intercept, name in hit.get("lines", []) or []:
         xs = np.arange(span, dtype=float)
         ys = slope_ * xs + intercept
-        keep = (ys >= lo - 2 * pad) & (ys <= hi + 2 * pad)
-        if not keep.any():
+        visible = np.where((ys >= lo - 2 * pad) & (ys <= hi + 2 * pad), ys, np.nan)
+        if not np.isfinite(visible).any():
             continue
         figure.add_trace(go.Scatter(
-            x=[stamps[i] for i in np.flatnonzero(keep)], y=ys[keep], mode="lines",
+            x=list(range(span)), y=visible, mode="lines", connectgaps=False,
             name=name, line=dict(color=_MB_LINE, width=1.8, dash="dot"),
             hovertemplate=f"{name}: %{{y:.2f}}<extra></extra>"))
 
     # The fitted bowl, so a "rounding bottom" can be judged as one.
     curve = hit.get("curve")
     if curve:
-        xs = np.arange(len(curve["fitted"]), dtype=float)
         figure.add_trace(go.Scatter(
-            x=[at(i) for i in xs], y=curve["fitted"], mode="lines",
+            x=list(range(len(curve["fitted"]))), y=curve["fitted"], mode="lines",
             name=f"fitted curve (R² {curve['r2']:.2f})",
             line=dict(color=_MB_LINE, width=1.8, dash="dot"),
             hovertemplate="fitted: %{y:.2f}<extra></extra>"))
@@ -16574,7 +16975,7 @@ def mb_setup_chart(ctx: MBContext, hit: dict, plan: dict, title: str,
         template="plotly_white" if light else None)
     figure.update_yaxes(range=[lo - pad, hi + pad], showgrid=True,
                         gridcolor="rgba(128,128,128,0.15)")
-    figure.update_xaxes(showgrid=False)
+    gapless_axis(window.index, figure)
     return figure
 
 
@@ -16612,8 +17013,16 @@ def mb_rebuild_one(ticker: str, interval: str, period: str, setup_key: str,
 
 def make_break_scan_one(ticker: str, interval: str, period: str, wanted: list[str],
                         lookback: int = 120, pivot: int = 3, tol_atr: float = 0.5,
-                        min_score: float = 0.0) -> list[dict]:
-    """Every selected setup that is currently present on one ticker/timeframe."""
+                        min_score: float = 0.0, max_age: int | None = None) -> list[dict]:
+    """
+    Every selected setup currently present on one ticker/timeframe.
+
+    `max_age` is the freshness limit in candles. A setup that completed twenty
+    candles ago is still visible on the chart and will still be found, but it
+    is not a signal any more -- the move it was pointing at has had twenty
+    candles to happen. Leaving it out of the list is the difference between a
+    screener and an archive.
+    """
     frame = load_market_data(ticker, period, interval,
                              freshness_seconds=180, min_bars=60).frame
     ctx = mb_context(frame, lookback, pivot, tol_atr)
@@ -16640,11 +17049,14 @@ def make_break_scan_one(ticker: str, interval: str, period: str, wanted: list[st
         readiness = max(0.0, min(100.0, hit["score"] + bonus))
         if readiness < float(min_score):
             continue
+        age = int(hit.get("bars_ago", 0))
+        if max_age is not None and age > int(max_age):
+            continue
         rows.append({
             "Ticker": ticker, "Timeframe": interval, "Period": period,
             "Setup key": key,
             "Setup": hit["setup"], "Direction": hit["direction"],
-            "Readiness": round(readiness, 1),
+            "Readiness": round(readiness, 1), "Bars ago": age,
             "Side": plan["side"], "Entry": plan["entry"], "Stop": plan["stop"],
             "Target": plan["target"], "R:R": plan["rr"],
             "Price": round(ctx.price, 2),
@@ -16677,6 +17089,19 @@ def tab_make_break(cfg: dict) -> None:
     min_score = c2.number_input("Minimum readiness", 0, 100, 55, 5, key="mb_minscore",
                                 help="Setups below this are not listed. 55 keeps the "
                                      "reasonably formed ones; raise it to shortlist harder.")
+    f1, f2 = st.columns([1, 2])
+    max_age = f1.number_input("Fired within the last N candles", 0, 200, 3, 1,
+                              key="mb_maxage",
+                              help="How recently the setup must have completed. A pattern "
+                                   "that finished twenty candles ago is still on the chart "
+                                   "but is no longer a signal — the move it pointed at has "
+                                   "had twenty candles to happen. 0 means this candle only.")
+    f2.caption("**Why this matters.** Standing setups — a coil, a triangle at the apex, "
+               "price pressed against resistance — are true right now and report an age of "
+               "0 only while they are fresh; the longer price has sat there, the older they "
+               "read. Event setups — a sweep, a neckline break, a return to the origin of a "
+               "move — are dated from the candle the event happened on. Raise the limit to "
+               "see what has been forming; keep it low to see what just fired.")
 
     custom_text = ""
     if universe.startswith("Custom"):
@@ -16737,7 +17162,7 @@ def tab_make_break(cfg: dict) -> None:
             effective, _clamp = sanitize_period(interval, period)
             rows = make_break_scan_one(ticker, interval, effective, wanted,
                                        int(lookback), int(pivot), float(tol_atr),
-                                       float(min_score))
+                                       float(min_score), int(max_age))
             return rows, []
         except Exception as exc:                                    # noqa: BLE001
             return [], [{"Ticker": ticker, "Timeframe": interval, "Period": period,
@@ -16756,7 +17181,10 @@ def tab_make_break(cfg: dict) -> None:
                 st.dataframe(pd.DataFrame(errs), width="stretch", hide_index=True)
         return
 
-    frame = frame.sort_values("Readiness", ascending=False).reset_index(drop=True)
+    # Freshest first, then best formed. A screener sorted on readiness alone
+    # puts a beautiful twenty-candle-old pattern above one that fired this bar.
+    frame = frame.sort_values(["Bars ago", "Readiness"],
+                              ascending=[True, False]).reset_index(drop=True)
     frame.insert(0, "Rank", range(1, len(frame) + 1))
 
     a, b, c, d = st.columns(4)
@@ -16782,27 +17210,40 @@ def tab_make_break(cfg: dict) -> None:
         return
 
     order = [c for c in ["Rank", "Ticker", "Timeframe", "Period", "Setup", "Direction",
-                         "Readiness", "Side", "Price", "Entry", "Stop", "Target", "R:R",
+                         "Readiness", "Bars ago", "Side", "Price", "Entry", "Stop",
+                         "Target", "R:R",
                          "Distance to trigger", "Touches", "Volume x", "RSI", "Compression",
                          "Reading", "Confirmations", "Plan note", "Checked at"]
              if c in view.columns]
     st.dataframe(view[order], width="stretch", hide_index=True,
-                 column_config={"Readiness": st.column_config.ProgressColumn(
-                     "Readiness", min_value=0, max_value=100, format="%.0f")})
+                 column_config={
+                     "Readiness": st.column_config.ProgressColumn(
+                         "Readiness", min_value=0, max_value=100, format="%.0f"),
+                     "Bars ago": st.column_config.NumberColumn(
+                         "Bars ago", format="%d",
+                         help="Candles since the setup completed. 0 is this candle.")})
     st.download_button("Download the scan (CSV)", view[order].to_csv(index=False).encode(),
                        f"make_or_break_{pd.Timestamp.now():%Y%m%d_%H%M}.csv", "text/csv",
                        key="mb_dl")
 
     st.markdown("#### Inspect and apply")
-    labels = [f"#{r['Rank']}  {r['Ticker']} · {r['Timeframe']} · {r['Setup']}"
-              for _i, r in view.iterrows()]
+    def _age_words(bars: int) -> str:
+        bars = int(bars)
+        if bars == 0:
+            return "this candle"
+        return f"{bars} candle ago" if bars == 1 else f"{bars} candles ago"
+
+    labels = [f"#{row['Rank']}  {row['Ticker']} · {row['Timeframe']} · {row['Setup']}"
+              f"  ({_age_words(row['Bars ago'])})"
+              for _i, row in view.iterrows()]
     i1, i2 = st.columns([3, 1])
     picked_label = i1.selectbox("Ranked setup", labels, key="mb_pick")
     picked = view.iloc[labels.index(picked_label)].to_dict()
 
     tone = {"LONG": st.success, "SHORT": st.error}.get(picked["Side"], st.info)
     tone(f"**{picked['Setup']}** on `{picked['Ticker']}` ({picked['Timeframe']}) — "
-         f"readiness {fmt(picked['Readiness'], 0)} / 100, side **{picked['Side']}**")
+         f"readiness {fmt(picked['Readiness'], 0)} / 100, side **{picked['Side']}**, "
+         f"completed **{_age_words(picked['Bars ago'])}**")
     st.markdown(f"**What the chart shows.** {picked['Reading']}.")
     st.markdown(f"**Secondary evidence.** {picked['Confirmations']}.")
 
@@ -16883,6 +17324,116 @@ def tab_make_break(cfg: dict) -> None:
         with st.expander(f"Jobs that failed ({len(errs)})"):
             st.dataframe(pd.DataFrame(errs), width="stretch", hide_index=True)
     render_analyst_panel("mb", "these make-or-break candidates", _frame_context(frame))
+
+
+# =============================================================================
+# SECTION 19l-0 -- THE GAPLESS CANDLE AXIS
+# =============================================================================
+# Plotly puts a datetime axis on a real calendar, so an overnight close, a
+# weekend and a holiday all become empty space. On a 15-minute Indian equity
+# that is catastrophic: twenty-five candles of trading sit inside twenty-four
+# hours of wall clock, so roughly nine tenths of the chart is whitespace and
+# the candles are squeezed into unreadable clumps -- which is exactly what the
+# operator was looking at.
+#
+# TradingView does not have this problem because it does not plot on a
+# calendar. It plots bar 1, bar 2, bar 3, and writes dates underneath. That is
+# what this does: candles are drawn at integer positions and the tick labels
+# carry the real timestamps, so a 15-minute chart of ten sessions looks like
+# ten sessions of candles rather than ten thin slivers in a field of white.
+#
+# The alternative -- declaring rangebreaks for nights, weekends and holidays --
+# needs to know each instrument's session, which varies by exchange, by
+# instrument and by holiday calendar, and silently mangles the chart whenever
+# the guess is wrong. Positions need to know nothing.
+
+
+def _tick_every(count: int) -> int:
+    """Roughly a dozen labels, on a round number of bars."""
+    target = max(1, count // 12)
+    for step in (1, 2, 5, 10, 15, 20, 25, 50, 75, 100, 150, 200, 250, 500, 1000):
+        if step >= target:
+            return step
+    return target
+
+
+def _stamp_text(stamps, intraday: bool) -> list:
+    """Tick labels that say as much as they need to and no more."""
+    out, last_day = [], None
+    for stamp in stamps:
+        moment = pd.Timestamp(stamp)
+        if not intraday:
+            out.append(moment.strftime("%d %b %y"))
+            continue
+        day = moment.date()
+        # The date only when it changes, the clock time otherwise: repeating
+        # the date on every label of a session is noise.
+        out.append(moment.strftime("%d %b %H:%M") if day != last_day
+                   else moment.strftime("%H:%M"))
+        last_day = day
+    return out
+
+
+def gapless_axis(index, figure, row: int | None = None, col: int | None = None) -> dict:
+    """
+    Put a figure's x-axis on bar positions and label it with real dates.
+
+    Returns the mapping back, so anything else that needs to draw at a date --
+    a level, a fitted line, a marker on a particular candle -- can find the
+    position for it.
+    """
+    stamps = list(index)
+    count = len(stamps)
+    if count == 0:
+        return {}
+    intraday = False
+    if count > 2:
+        try:
+            gaps = pd.DatetimeIndex(stamps)[1:] - pd.DatetimeIndex(stamps)[:-1]
+            intraday = bool(pd.Timedelta(gaps.min()) < pd.Timedelta(hours=23))
+        except Exception:                                           # noqa: BLE001
+            intraday = False
+    step = _tick_every(count)
+    positions = list(range(0, count, step))
+    if positions and positions[-1] != count - 1 and count - 1 - positions[-1] > step // 2:
+        positions.append(count - 1)
+    # zeroline OFF: the x values are bar numbers now, so Plotly would draw its
+    # "x = 0" rule straight down the first candle of every chart.
+    settings = dict(tickmode="array", tickvals=positions,
+                    ticktext=_stamp_text([stamps[p] for p in positions], intraday),
+                    showgrid=False, zeroline=False, range=[-1, count])
+    if row is not None:
+        figure.update_xaxes(row=row, col=col or 1, **settings)
+    else:
+        figure.update_xaxes(**settings)
+    return {stamp: i for i, stamp in enumerate(stamps)}
+
+
+def _hover_dates(index) -> np.ndarray:
+    """The real timestamp for each bar, for the hover box."""
+    try:
+        return np.array([pd.Timestamp(s).strftime("%d %b %Y %H:%M") for s in index])
+    except Exception:                                               # noqa: BLE001
+        return np.array([str(s) for s in index])
+
+
+def candle_trace(frame: pd.DataFrame, name: str = "Price", showlegend: bool = True):
+    """
+    One candlestick series drawn at bar positions rather than on a calendar.
+
+    The real timestamp rides along in customdata so the hover box still says
+    what day and time a candle is, which is the only thing the calendar axis
+    was doing for us.
+    """
+    import plotly.graph_objects as go
+
+    return go.Candlestick(
+        x=list(range(len(frame))), open=frame["Open"], high=frame["High"],
+        low=frame["Low"], close=frame["Close"], name=name, showlegend=showlegend,
+        increasing_line_color=_UP, decreasing_line_color=_DOWN,
+        increasing_fillcolor=_UP, decreasing_fillcolor=_DOWN, line=dict(width=1),
+        customdata=_hover_dates(frame.index),
+        hovertext=_hover_dates(frame.index))
 
 
 # =============================================================================
@@ -17029,13 +17580,32 @@ def ratio_frame(joined: pd.DataFrame) -> pd.DataFrame:
     }, index=joined.index)
 
 
+def _compound(values) -> float:
+    """
+    Chain a run of percentage returns into the one return they add up to.
+
+    Percentage returns do NOT add. +10% then -10% is -1%, not 0%, and summing a
+    month of daily returns overstates a run of gains and understates a run of
+    losses -- which is precisely the error that made these cells read wrong.
+    """
+    series = pd.Series(values, dtype=float).dropna()
+    if series.empty:
+        return float("nan")
+    return float((1.0 + series / 100.0).prod() - 1.0) * 100.0
+
+
 def returns_heatmap(series: pd.Series, title: str, light: bool = False):
     """
     Returns laid out on the two axes that actually explain them.
 
-    Intraday, that is weekday against hour -- the shape of a session. Daily and
-    coarser, it is year against month. Picking one grid for both would leave
-    half the cells empty on one of them.
+    Intraday, that is weekday against hour -- the shape of a session, where a
+    cell is the AVERAGE return of the candles that landed in that slot, because
+    the question is what a typical Tuesday 11:00 does.
+
+    Daily and coarser, it is year against month, where a cell is the COMPOUNDED
+    return of that month -- the number you would actually have made. These two
+    are different questions and need different arithmetic; using one grid and
+    one aggregation for both is what made the figures wrong.
     """
     import plotly.graph_objects as go
 
@@ -17047,41 +17617,58 @@ def returns_heatmap(series: pd.Series, title: str, light: bool = False):
                     < pd.Timedelta(hours=23))
 
     if intraday:
-        rows = index.hour
-        cols = index.dayofweek
         row_name, col_name = "Hour", "Weekday"
         col_labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-        grid = pd.DataFrame({"r": rows, "c": cols, "v": values.to_numpy(float)})
+        grid = pd.DataFrame({"r": index.hour, "c": index.dayofweek,
+                             "v": values.to_numpy(float)})
         table = grid.pivot_table(index="r", columns="c", values="v", aggfunc="mean")
+        counts = grid.pivot_table(index="r", columns="c", values="v", aggfunc="count")
         x_labels = [col_labels[c] for c in table.columns]
         y_labels = [f"{int(h):02d}:00" for h in table.index]
+        cell_meaning = "average return of the candles in this slot"
     else:
         grid = pd.DataFrame({"r": index.year, "c": index.month,
                              "v": values.to_numpy(float)})
-        table = grid.pivot_table(index="r", columns="c", values="v", aggfunc="sum")
+        table = grid.pivot_table(index="r", columns="c", values="v",
+                                 aggfunc=_compound)
+        counts = grid.pivot_table(index="r", columns="c", values="v", aggfunc="count")
         months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
                   "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
         x_labels = [months[int(c) - 1] for c in table.columns]
         y_labels = [str(int(r)) for r in table.index]
         row_name, col_name = "Year", "Month"
+        cell_meaning = "compounded return over the month"
 
     # The grid is relabelled with the axis labels the chart itself uses. A grid
     # indexed 0..6 and 0..23 is unreadable in the table view and worse in prose
     # -- "the best cell is 0 / 5" means nothing, "Mon / 05:00" means something.
+    # Counts are relabelled ALONGSIDE the values, from the same pivot, so the
+    # two stay aligned. Reindexing them afterwards against the new string
+    # labels silently matched nothing and left every sample size blank.
+    counts = pd.DataFrame(
+        counts.reindex(index=table.index, columns=table.columns).to_numpy(float),
+        index=y_labels, columns=x_labels)
     table = pd.DataFrame(table.to_numpy(float), index=y_labels, columns=x_labels)
     table.index.name = row_name
     table.columns.name = col_name
     z = table.to_numpy(float)
     limit = float(np.nanmax(np.abs(z))) if np.isfinite(z).any() else 1.0
     limit = limit if limit > 0 else 1.0
+    # How many candles went into each cell rides along in the hover. A cell
+    # built from two candles and one built from two hundred look identical on
+    # a heatmap, and only one of them means anything.
+    sample = counts.to_numpy(float)
     figure = go.Figure(go.Heatmap(
-        z=z, x=list(table.columns), y=list(table.index), colorscale=_DIVERGING_RETURNS,
-        zmid=0.0, zmin=-limit, zmax=limit,
+        z=z, x=list(x_labels), y=list(y_labels), colorscale=_DIVERGING_RETURNS,
+        zmid=0.0, zmin=-limit, zmax=limit, customdata=sample,
         text=np.round(z, 2), texttemplate="%{text}", textfont=dict(size=10),
         colorbar=dict(title="%"),
-        hovertemplate=f"{col_name} %{{x}}<br>{row_name} %{{y}}<br>%{{z:.2f}}%<extra></extra>"))
+        hovertemplate=(f"{col_name} %{{x}}<br>{row_name} %{{y}}<br>"
+                       f"%{{z:.2f}}%  ({cell_meaning})<br>"
+                       f"from %{{customdata:.0f}} candles<extra></extra>")))
     figure.update_layout(
-        title=dict(text=title, x=0.01, xanchor="left", font=dict(size=14)),
+        title=dict(text=f"{title} — {cell_meaning}", x=0.01, xanchor="left",
+                   font=dict(size=14)),
         height=max(260, 42 * len(table.index) + 120),
         margin=dict(l=70, r=20, t=50, b=40),
         template="plotly_white" if light else None)
@@ -17128,25 +17715,58 @@ def studio_stack(panels: list, light: bool = False, row_height: int = 300):
     it by looking straight up or down rather than by comparing dates by eye.
     """
     from plotly.subplots import make_subplots
-    import plotly.graph_objects as go
 
     usable = [(label, frame) for label, frame in panels
               if frame is not None and not frame.empty]
     if not usable:
         return None
+    # Every panel is drawn on the SAME bars. Three panels with three different
+    # indices look stacked but are not comparable -- a gap in the bottom panel
+    # would sit under candles in the top one, and the whole point of stacking
+    # is that a column of the chart is one moment in time.
+    #
+    # Panels of equal length are taken to be the same bars already, which is
+    # the normal case here because the caller builds them from one aligned
+    # join. That matters: an Indian daily bar is stamped 00:00 Asia/Kolkata and
+    # a crypto one 00:00 UTC, so intersecting the raw indices finds NOTHING in
+    # common and would throw away two of the three panels -- which is exactly
+    # what it did before this was written down.
+    lengths = {len(frame) for _label, frame in usable}
+    if len(lengths) > 1:
+        shared = None
+        for _label, frame in usable:
+            index = pd.DatetimeIndex(frame.index)
+            index = index.tz_convert("UTC") if index.tz is not None \
+                else index.tz_localize("UTC")
+            shared = index if shared is None else shared.intersection(index)
+        if shared is not None and len(shared) >= 2:
+            cut = []
+            for label, frame in usable:
+                index = pd.DatetimeIndex(frame.index)
+                index = index.tz_convert("UTC") if index.tz is not None \
+                    else index.tz_localize("UTC")
+                aligned = frame.copy()
+                aligned.index = index
+                cut.append((label, aligned.reindex(shared).dropna(how="all")))
+            usable = [(label, frame) for label, frame in cut if not frame.empty]
+    if not usable:
+        return None
+
     figure = make_subplots(rows=len(usable), cols=1, shared_xaxes=True,
                            vertical_spacing=0.055,
                            subplot_titles=[label for label, _f in usable])
     for row, (_label, frame) in enumerate(usable, start=1):
-        figure.add_trace(go.Candlestick(
-            x=frame.index, open=frame["Open"], high=frame["High"],
-            low=frame["Low"], close=frame["Close"], showlegend=False,
-            increasing_line_color=_UP, decreasing_line_color=_DOWN,
-            increasing_fillcolor=_UP, decreasing_fillcolor=_DOWN,
-            line=dict(width=1)), row=row, col=1)
+        figure.add_trace(candle_trace(frame, showlegend=False), row=row, col=1)
         figure.update_yaxes(showgrid=True, gridcolor="rgba(128,128,128,0.15)",
                             row=row, col=1)
         figure.update_xaxes(rangeslider_visible=False, showgrid=False, row=row, col=1)
+        # Bar positions, not a calendar: see gapless_axis. Only the bottom
+        # panel carries labels, since all three share one axis.
+        if row == len(usable):
+            gapless_axis(frame.index, figure, row=row, col=1)
+        else:
+            figure.update_xaxes(range=[-1, len(frame)], showticklabels=False,
+                                zeroline=False, row=row, col=1)
     figure.update_layout(
         height=int(row_height) * len(usable) + 60,
         margin=dict(l=62, r=24, t=48, b=40), hovermode="x unified", dragmode="pan",
@@ -17360,17 +17980,14 @@ def studio_chart(frame: pd.DataFrame, title: str, light: bool = False, height: i
     """The big readable candle chart: everything else on this tab explains it."""
     import plotly.graph_objects as go
 
-    figure = go.Figure(go.Candlestick(
-        x=frame.index, open=frame["Open"], high=frame["High"],
-        low=frame["Low"], close=frame["Close"], name="Price",
-        increasing_line_color=_UP, decreasing_line_color=_DOWN,
-        increasing_fillcolor=_UP, decreasing_fillcolor=_DOWN,
-        line=dict(width=1)))
+    figure = go.Figure(candle_trace(frame))
+    positions = list(range(len(frame)))
     for length, colour in ((20, "#f4a261"), (50, "#4f9df7")):
         if len(frame) > length:
             figure.add_trace(go.Scatter(
-                x=frame.index, y=ema(frame["Close"], length), mode="lines",
-                name=f"EMA {length}", line=dict(width=1.6, color=colour)))
+                x=positions, y=ema(frame["Close"], length), mode="lines",
+                name=f"EMA {length}", line=dict(width=1.6, color=colour),
+                hovertemplate=f"EMA {length}: %{{y:.2f}}<extra></extra>"))
     figure.update_layout(
         height=int(height), margin=dict(l=66, r=24, t=54, b=44),
         title=dict(text=title, x=0.01, xanchor="left", font=dict(size=16)),
@@ -17378,7 +17995,7 @@ def studio_chart(frame: pd.DataFrame, title: str, light: bool = False, height: i
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         template="plotly_white" if light else None)
     figure.update_yaxes(showgrid=True, gridcolor="rgba(128,128,128,0.15)")
-    figure.update_xaxes(showgrid=False)
+    gapless_axis(frame.index, figure)
     return figure
 
 
@@ -17702,6 +18319,53 @@ def tab_chart_studio(cfg: dict) -> None:
                "to add returns over time — summing them overstates a run of gains and "
                "understates a run of losses.")
 
+    # Which bin the ratio is standing in -- in time, and in value. Those are
+    # two different questions and only one of them is interesting: in time the
+    # answer is always the last bin, so what is worth knowing is which EARLIER
+    # stretches traded at the level it is at now.
+    st.markdown("##### Where the ratio is right now")
+    current = float(ratio["Close"].iloc[-1])
+    live_bin = int(bin_table["Bin"].iloc[-1]) if not bin_table.empty else None
+    matches = []
+    for _i, row in bin_table.iterrows():
+        text = str(row.get("Ratio range") or "")
+        if "–" not in text:
+            continue
+        try:
+            low_s, high_s = (part.strip() for part in text.split("–"))
+            low_v, high_v = float(low_s), float(high_s)
+        except Exception:                                           # noqa: BLE001
+            continue
+        if low_v <= current <= high_v:
+            matches.append((int(row["Bin"]), low_v, high_v,
+                            row["From"], row["To"]))
+
+    w1, w2 = st.columns([1, 2])
+    w1.metric(f"{ticker} / {second} now", f"{current:,.4f}")
+    earlier = [m for m in matches if m[0] != live_bin]
+    if earlier:
+        where = ", ".join(
+            f"**bin {number}** ({low:,.4f}–{high:,.4f}, "
+            f"{start:%d %b %H:%M} to {end:%d %b %H:%M})"
+            for number, low, high, start, end in earlier)
+        w2.markdown(
+            f"In time the ratio sits in **bin {live_bin}**, the most recent stretch — that "
+            f"is true by construction, since the bins are consecutive slices of this "
+            f"window. What is worth knowing is that {current:,.4f} also falls inside the "
+            f"range traded in {where}. The ratio has been at this level before in this "
+            f"window, so whatever happened next in those stretches is at least a question "
+            f"worth asking.")
+    else:
+        w2.markdown(
+            f"In time the ratio sits in **bin {live_bin}**, the most recent stretch. "
+            f"{current:,.4f} falls **outside every earlier bin's range**, so on this "
+            f"window the relationship is at a level it has not traded at before — there is "
+            f"no earlier stretch here to compare it with. Lengthen the period to give it "
+            f"some history.")
+    st.caption("Bins are equal slices of TIME, so the current ratio is always in the last "
+               "one; the useful question is which earlier slices covered the level it is "
+               "at now, and that is what the note above answers.")
+
     b1, b2 = st.columns(2)
     b1.download_button("Bins as CSV", bin_table.to_csv(index=False).encode("utf-8"),
                        f"bins_{ticker}_{second}.csv", "text/csv", key="studio_bins_csv",
@@ -17714,8 +18378,15 @@ def tab_chart_studio(cfg: dict) -> None:
 
     # ---- the heatmaps -------------------------------------------------------
     st.markdown("#### Returns heatmaps")
+    st.caption(f"Each leg's heatmap is built from **its own** candles over {interval} / "
+               f"{effective} — all of them, not only the ones that happened to line up "
+               f"with the other ticker. Pairing them first would turn an overnight gap in "
+               f"one market into a fake return in the other. Only the ratio, which needs "
+               f"both legs by definition, is built on the matched bars.")
     grids = {}
-    panels = ((ticker, returns[returns.columns[0]]), (second, returns[returns.columns[1]]),
+    own_a = (frame["Close"].pct_change() * 100.0).dropna()
+    own_b = (other["Close"].pct_change() * 100.0).dropna()
+    panels = ((ticker, own_a), (second, own_b),
               (f"{ticker} / {second} ratio", ratio_returns))
     for label, column in panels:
         figure, grid = returns_heatmap(column, f"{label} — returns (%)",
@@ -17751,8 +18422,18 @@ def tab_chart_studio(cfg: dict) -> None:
                  key="studio_stack_btn", width="stretch", type="primary"):
         @st.dialog("Three charts, one time axis", width="large")
         def _stacked():
-            figure = studio_stack([(f"{ticker} (numerator)", frame),
-                                   (f"{second} (denominator)", other),
+            # All three panels are built from the ALIGNED join, not from the
+            # raw downloads, so every column of the stack is one moment for
+            # all three. Feeding the raw frames here would stack three
+            # different clocks and the columns would not line up.
+            numerator = pd.DataFrame(
+                {"Open": joined["a_open"], "High": joined["a_high"],
+                 "Low": joined["a_low"], "Close": joined["a_close"]}, index=joined.index)
+            denominator = pd.DataFrame(
+                {"Open": joined["b_open"], "High": joined["b_high"],
+                 "Low": joined["b_low"], "Close": joined["b_close"]}, index=joined.index)
+            figure = studio_stack([(f"{ticker} (numerator)", numerator),
+                                   (f"{second} (denominator)", denominator),
                                    (f"{ticker} / {second} (ratio)", ratio)],
                                   light=bool(cfg.get("light_charts")), row_height=300)
             if figure is None:
@@ -20678,92 +21359,282 @@ def _test_smc_concepts_and_sector_flip_direction():
 
 def _test_momentum_pulse_checklist():
     """
-    The four-and-four condition screener.
+    The eleven-and-eleven condition screener, and its opt-in layer.
 
-    Every ticker must come back as a ROW even when nothing is true -- 0/4 is
-    information, and a screener that drops its quiet names cannot be told apart
-    from one that is broken. The conditions must also be genuinely independent:
-    a frame built to satisfy all four bullish tests must score 4/4 bullish and
-    0/4 bearish, and a mirrored frame the reverse.
+    Every ticker must come back as a ROW even when nothing is true -- 0 of 11
+    is information, and a screener that drops its quiet names cannot be told
+    apart from one that is broken.
+
+    The hard part is that volume and range are direction-NEUTRAL events. A
+    sell-off has heavy volume and a wide range exactly as a breakout does, so
+    counting either on its own hands the same tick to both sides, which is how
+    this checklist was weak before. Each is now paired with where the close
+    landed inside its candle and inside the day, and this bench asserts that
+    the pairing actually discriminates.
     """
     real_st = globals()["st"]
     fake = _FakeStreamlit()
     globals()["st"] = fake
     saved = {"load_market_data": globals()["load_market_data"]}
     try:
-        def build(direction: int) -> pd.DataFrame:
-            """Two sessions of 5m candles; the second breaks out `direction`."""
+        def build(direction: int, sessions: int = 2) -> pd.DataFrame:
+            """Sessions of 5m candles; the last one breaks out `direction`."""
             rows, index = [], []
-            for day, base in ((pd.Timestamp("2026-10-15 09:15", tz="Asia/Kolkata"), 1000.0),
-                              (pd.Timestamp("2026-10-16 09:15", tz="Asia/Kolkata"), 1000.0)):
+            start = pd.Timestamp("2026-10-15 09:15", tz="Asia/Kolkata")
+            days = []
+            day = start
+            while len(days) < sessions:
+                if day.dayofweek < 5:
+                    days.append(day)
+                day = (day + pd.Timedelta(days=1)).normalize() \
+                    + pd.Timedelta(hours=9, minutes=15)
+            for number, day in enumerate(days):
+                last_day = number == len(days) - 1
                 for i in range(40):
                     stamp = day + pd.Timedelta(minutes=5 * i)
-                    if day.day == 15:               # a quiet previous session
-                        px = base + (i % 4) * 0.5
-                        vol = 1000.0
+                    if not last_day:
+                        px, vol, strong = 1000.0 + (i % 4) * 0.5, 1000.0, False
                     else:
-                        # Flat through the opening range, then a strong move.
-                        px = base + (0.0 if i < 3 else direction * (i - 2) * 3.0)
-                        # The spike has to be recent: a surge that runs for the
-                        # whole session becomes its own 20-bar average and the
-                        # ratio collapses back to 1.0.
+                        px = 1000.0 + (0.0 if i < 3 else direction * (i - 2) * 3.0)
                         vol = 9000.0 if i >= 37 else 1000.0
+                        strong = i >= 37
                     index.append(stamp)
-                    rows.append({"Open": px, "High": px + 0.4, "Low": px - 0.4,
-                                 "Close": px, "Volume": vol})
+                    # On the breakout candles the close is pushed to the end of
+                    # its own range, which is what makes the volume tick
+                    # directional rather than neutral.
+                    if strong and direction > 0:
+                        rows.append({"Open": px - 0.4, "High": px + 0.05, "Low": px - 0.5,
+                                     "Close": px, "Volume": vol})
+                    elif strong:
+                        rows.append({"Open": px + 0.4, "High": px + 0.5, "Low": px - 0.05,
+                                     "Close": px, "Volume": vol})
+                    else:
+                        rows.append({"Open": px, "High": px + 0.4, "Low": px - 0.4,
+                                     "Close": px, "Volume": vol})
             frame = pd.DataFrame(rows, index=pd.DatetimeIndex(index))
             frame["High"] = frame[["Open", "High", "Close"]].max(axis=1)
             frame["Low"] = frame[["Open", "Low", "Close"]].min(axis=1)
             return frame
 
         pcfg = {"or_bars": 3, "vol_mult": 1.5, "range_mult": 1.0, "vol_len": 20,
-                "range_len": 10, "near_pct": 0.25}
+                "range_len": 10, "near_pct": 0.25, "extras": []}
+
+        assert len(PULSE_BULL) == len(PULSE_BEAR) == 11, (PULSE_BULL, PULSE_BEAR)
+        assert len(set(PULSE_BULL)) == 11 and len(set(PULSE_BEAR)) == 11
 
         up = build(+1)
         globals()["load_market_data"] = lambda *a, **k: DataBundle(
             frame=up.copy(), symbol="T.NS", interval="5m", period="5d")
         row = momentum_pulse_scan_one("T.NS", "5m", pcfg)
-        assert row["Bull count"] == 4, f"a clean breakout day must score 4/4: {row}"
-        assert row["Bear count"] == 0, f"and nothing on the bear side: {row}"
-        assert row["Bias"] == "BULLISH"
-        # The previous session's high must be a REAL previous-day level, not
-        # today's own high, or the PDH test is trivially true for everything.
-        pdh, pdl, pdc = previous_session_levels(up)
-        assert pdh < row["Day High"], "PDH must come from the earlier session"
-        assert np.isfinite(pdl) and np.isfinite(pdc)
+        assert row["Bear count"] == 0, f"nothing may tick on the bear side: {row}"
+        assert row["Bias"] == "BULLISH" and row["Bull of"] == 11
+        for name in ("Breakout", "PDH", "Day high", "VWAP", "CHoCH", "Volume", "Range"):
+            assert row[f"B:{name}"] == "YES", f"{name} should tick on a clean breakout: {row}"
+        # The week and month tests must be BLANK, not false-by-accident: two
+        # sessions cannot establish a previous week or a previous month, and a
+        # partial figure dressed up as a real one would be worse than nothing.
+        assert row["PWH"] is None and row["PMH"] is None, row
+        assert row["B:PWH"] == "NO" and row["B:PMH"] == "NO"
 
         down = build(-1)
         globals()["load_market_data"] = lambda *a, **k: DataBundle(
             frame=down.copy(), symbol="T.NS", interval="5m", period="5d")
         row2 = momentum_pulse_scan_one("T.NS", "5m", pcfg)
-        assert row2["Bear count"] == 4, f"a clean breakdown day must score 4/4 bearish: {row2}"
-        assert row2["Bias"] == "BEARISH"
-        # The DIRECTIONAL bullish conditions must all be false on a down day.
-        # Volume and Range are deliberately NOT asserted here: they are
-        # direction-neutral by construction -- a hard sell-off has heavy volume
-        # and an expanded range too -- so a falling stock legitimately scores on
-        # them. That is why the bull count can read 2/4 while the bear count
-        # reads 4/4, and why the tab says so rather than hiding it.
+        assert row2["Bias"] == "BEARISH", row2
+        for name in ("Breakdown", "PDL", "Day low", "VWAP", "CHoCH", "Volume", "Range"):
+            assert row2[f"S:{name}"] == "YES", f"{name} should tick on a breakdown: {row2}"
         assert row2["B:Breakout"] == "NO" and row2["B:PDH"] == "NO", row2
-        assert row2["S:Breakout"] == "YES" and row2["S:PDL"] == "YES"
-        assert row2["S:VWAP"] == "YES" and row2["S:DL"] == "YES"
+        # THE point of the rework: the same heavy volume and the same wide
+        # range must NOT tick the bull side on a sell-off.
+        assert row2["B:Volume"] == "NO" and row2["B:Range"] == "NO", \
+            "direction-neutral events must not hand a tick to the wrong side"
+        assert row2["Bull count"] < row2["Bear count"], (row2["Bull count"],
+                                                         row2["Bear count"])
 
-        # A dead-flat day must come back as a ROW scoring zero, not vanish.
+        # A dead-flat day must come back as a ROW scoring near zero, not vanish.
         flat = up.copy()
         flat[["Open", "High", "Low", "Close"]] = 1000.0
         flat["Volume"] = 1000.0
         globals()["load_market_data"] = lambda *a, **k: DataBundle(
             frame=flat.copy(), symbol="T.NS", interval="5m", period="5d")
         quiet = momentum_pulse_scan_one("T.NS", "5m", pcfg)
-        assert isinstance(quiet, dict) and quiet["Bull count"] == 0 and quiet["Bear count"] <= 1
+        assert isinstance(quiet, dict)
+        assert quiet["Bull count"] <= 4 and quiet["Bear count"] <= 4, quiet
+        assert quiet["B:Volume"] == "NO" and quiet["B:Range"] == "NO", quiet
         for name in PULSE_BULL:
             assert f"B:{name}" in quiet, f"the bull checklist must report {name}"
         for name in PULSE_BEAR:
             assert f"S:{name}" in quiet, f"the bear checklist must report {name}"
-        print("   momentum pulse: 4/4 up, 4/4 down, quiet names still reported  OK")
+
+        # Weekly and monthly levels: with enough sessions they must appear, and
+        # they must be the PREVIOUS period's, not this one's.
+        long_up = build(+1, sessions=45)
+        globals()["load_market_data"] = lambda *a, **k: DataBundle(
+            frame=long_up.copy(), symbol="T.NS", interval="5m", period="60d")
+        wide = momentum_pulse_scan_one("T.NS", "5m", pcfg)
+        assert wide["PWH"] is not None and wide["PWL"] is not None, wide
+        assert wide["PMH"] is not None, wide
+        week_hi, week_lo, prev_week_hi, _pwl = _period_extremes(long_up, "W")
+        assert prev_week_hi <= week_hi + 1e-9, "a previous week high cannot exceed this one"
+        assert wide["Week High"] >= wide["PWH"], wide
+
+        # The opt-in layer: off by default, and when on it changes the
+        # DENOMINATOR rather than quietly inflating the count.
+        assert wide["Bull of"] == 11 and not wide["_bull_extra"], wide["_bull_extra"]
+        daily_index = pd.date_range("2026-04-01", periods=260, freq="1D", tz="Asia/Kolkata")
+        rising = pd.Series(np.linspace(500.0, 1200.0, 260), index=daily_index)
+        daily = pd.DataFrame({"Open": rising, "High": rising * 1.01, "Low": rising * 0.99,
+                              "Close": rising, "Volume": 1000.0}, index=daily_index)
+
+        def _router(symbol, period, interval, **kwargs):
+            frame = daily.copy() if interval == "1d" else long_up.copy()
+            return DataBundle(frame=frame, symbol=symbol, interval=interval, period=period)
+
+        globals()["load_market_data"] = _router
+        # EVERY extra, not a sample: each one unpacks a different indicator's
+        # return shape, and a wrong unpack only shows up when that one runs.
+        wanted = [key for key, _l, _c, _b in PULSE_EXTRAS]
+        with_extras = momentum_pulse_scan_one("T.NS", "5m", dict(pcfg, extras=wanted))
+        assert len(wanted) == len(PULSE_EXTRAS) == 13, len(wanted)
+        assert with_extras["Bull of"] == 11 + len(wanted), with_extras["Bull of"]
+        assert with_extras["Bear of"] == 11 + len(wanted)
+        assert len(with_extras["_bull_extra"]) == len(wanted), with_extras["_bull_extra"]
+        # Price is ~1100 against a rising daily series whose 200-day average is
+        # far below it, so the long-average rows must tick bullish.
+        label_200 = PULSE_EXTRA_BY_KEY["sma200"][0]
+        assert with_extras[f"B+:{label_200}"] == "YES", with_extras
+        assert with_extras[f"S+:{label_200}"] == "NO"
+        assert with_extras["sma200 value"] < with_extras["Price"], with_extras
+
+        # An average longer than the history available must report NEITHER
+        # side, instead of counting as a failure in one direction.
+        short_daily = daily.tail(40)
+
+        def _short_router(symbol, period, interval, **kwargs):
+            frame = short_daily.copy() if interval == "1d" else long_up.copy()
+            return DataBundle(frame=frame, symbol=symbol, interval=interval, period=period)
+
+        globals()["load_market_data"] = _short_router
+        thin = momentum_pulse_scan_one("T.NS", "5m", dict(pcfg, extras=["sma200"]))
+        assert thin[f"B+:{label_200}"] == "NO" and thin[f"S+:{label_200}"] == "NO", thin
+        assert "sma200 value" not in thin, \
+            "an average that cannot be computed must not report a value"
+
+        print(f"   momentum pulse: {len(PULSE_BULL)} core confluences each side, volume and "
+              f"range made directional, previous week/month blank until earned, "
+              f"{len(PULSE_EXTRAS)} opt-in extras change the denominator  OK")
     finally:
         globals()["st"] = real_st
         globals().update(saved)
+
+
+def _test_signal_freshness_and_cell_arithmetic():
+    """
+    Two things the operator caught by reading the output rather than the code.
+
+    One: a screener that lists a pattern which completed twelve candles ago
+    next to one that completed on this candle is not a screener. Every detector
+    now dates its own signal, and the scan can refuse the stale ones.
+
+    Two: the month cells of a returns heatmap were SUMMING percentage returns.
+    Returns do not add -- +10% then -10% is -1%, not 0% -- so every cell
+    covering a volatile month was wrong, and wrong by more the more the month
+    moved.
+    """
+    # --- every hit must date itself, and the age must behave like an age ----
+    assert _mb_bars_ago([]) == 0
+    assert _mb_bars_ago([True]) == 0, "true on this candle is nought candles old"
+    assert _mb_bars_ago([False, True, True, True]) == 2
+    assert _mb_bars_ago([True, True, False]) == 0, \
+        "a condition not true now is not an old signal, it is no signal"
+
+    dated = 0
+    for seed in range(30):
+        ctx = mb_context(_synthetic(400, seed=seed), 120, 3, 0.5)
+        if ctx is None:
+            continue
+        for key, label, fn in MAKE_BREAK_SETUPS:
+            hit = fn(ctx)
+            if not hit:
+                continue
+            dated += 1
+            age = hit.get("bars_ago")
+            assert isinstance(age, int), (key, age)
+            assert 0 <= age < len(ctx.closes), (key, age, len(ctx.closes))
+    assert dated > 20, f"only {dated} hits to check an age on"
+
+    # An inverted V that completed long ago must report a LARGE age, which is
+    # the exact case the operator screenshotted: the pattern was real, the
+    # signal was twelve candles stale, and the table said nothing about it.
+    # A quiet base at 100, a 50-point advance, the whole advance given back,
+    # and then eighteen candles of sitting at the origin.
+    old_v = _mb_fixture(
+        [100 + 0.3 * math.sin(i / 3) for i in range(40)]
+        + list(np.linspace(100, 150, 40)) + list(np.linspace(150, 100, 40))
+        + [100 + 0.3 * math.sin(i / 3) for i in range(18)])
+    old_ctx = mb_context(old_v, 120, 3, 0.5)
+    stale = mb_inverted_v(old_ctx)
+    assert stale, "the fixture must still contain the pattern"
+    assert stale["bars_ago"] >= 10, \
+        f"a return to the origin 18 candles back must read as old, got {stale['bars_ago']}"
+
+    # --- the scan must actually refuse stale rows ---------------------------
+    saved = {"load_market_data": load_market_data}
+    try:
+        globals()["load_market_data"] = lambda *a, **k: DataBundle(
+            frame=old_v.copy(), symbol="T.NS", interval="1d", period="6mo")
+        every = make_break_scan_one("T.NS", "1d", "6mo", ["inverted_v"], 120, 3, 0.5,
+                                    0.0, None)
+        assert every and every[0]["Bars ago"] == stale["bars_ago"], every
+        fresh = make_break_scan_one("T.NS", "1d", "6mo", ["inverted_v"], 120, 3, 0.5,
+                                    0.0, 3)
+        assert fresh == [], "a 3-candle freshness limit must drop an 18-candle-old signal"
+        wide = make_break_scan_one("T.NS", "1d", "6mo", ["inverted_v"], 120, 3, 0.5,
+                                   0.0, 60)
+        assert len(wide) == 1, "a generous limit must let it back in"
+    finally:
+        globals().update(saved)
+
+    # --- heatmap cells: compounded, and checkable against a price path ------
+    index = pd.date_range("2024-01-01", periods=31, freq="1D", tz="UTC")
+    swings = pd.Series([10.0] * 15 + [-10.0] * 16, index=index)
+    _figure, grid = returns_heatmap(swings, "january")
+    cell = float(grid.iloc[0, 0])
+    # What a pound would actually have become, which is the only definition of
+    # a month's return that matters.
+    path = 100.0 * float((1.0 + swings / 100.0).prod())
+    assert abs(cell - (path - 100.0)) < 1e-9, (cell, path)
+    assert abs(cell - float(swings.sum())) > 10.0, \
+        "this fixture is only meaningful if summing gives a very different answer"
+    assert _compound([10.0, -10.0]) == pytest_approx(-1.0), _compound([10.0, -10.0])
+    assert math.isnan(_compound([]))
+
+    # Intraday cells are an AVERAGE, which is a different question with a
+    # different right answer: what a typical candle in that slot does.
+    hourly_index = pd.date_range("2024-01-01 09:00", periods=48, freq="1h", tz="UTC")
+    hourly = pd.Series(np.tile([2.0, -1.0], 24), index=hourly_index)
+    _hf, hourly_grid = returns_heatmap(hourly, "hours")
+    flat = hourly_grid.stack(future_stack=True).dropna()
+    assert float(flat.max()) <= 2.0 + 1e-9 and float(flat.min()) >= -1.0 - 1e-9, \
+        "an average cell can never exceed the values averaged into it"
+
+    # And every cell must say how many candles it came from, or a cell built
+    # from two candles looks exactly like one built from two hundred.
+    counts = np.asarray(_hf.data[0].customdata, float)
+    assert np.nansum(counts) == len(hourly), (np.nansum(counts), len(hourly))
+    print(f"   freshness and cells: {dated} hits all dated, an 18-candle-old V is refused "
+          f"at 3 and kept at 60, month cells compound ({cell:+.2f}% not "
+          f"{float(swings.sum()):+.2f}%), every cell carries its sample size  OK")
+
+
+def pytest_approx(value, tolerance=1e-9):
+    """A tiny stand-in so the bench needs no test framework."""
+    class _Close:
+        def __eq__(self, other):
+            return abs(float(other) - float(value)) <= tolerance
+        def __repr__(self):
+            return f"~{value}"
+    return _Close()
 
 
 def _test_setup_drawing_and_zones():
@@ -20804,12 +21675,19 @@ def _test_setup_drawing_and_zones():
         figure = mb_setup_chart(ctx, hit, plan, label)
         assert figure.data, label
         assert figure.data[0].type == "candlestick", label
-        # Bar positions must be mapped through the window's own index, so every
-        # drawn x value is a real timestamp from the data.
-        stamps = set(ctx.window.index)
+        # Candles are drawn at BAR POSITIONS, not on a calendar, so an intraday
+        # chart has no overnight whitespace. Every overlay must use the same
+        # positions, or it would be drawn against the wrong candles.
+        assert list(figure.data[0].x) == list(range(len(ctx.window))), label
         for trace in figure.data[1:]:
             for x in (trace.x or []):
-                assert x in stamps, f"{label} drew at {x}, which is not a bar in the window"
+                assert isinstance(x, (int, np.integer)) and 0 <= x < len(ctx.window), \
+                    f"{label} drew at {x!r}, which is not a bar position in the window"
+        # And the real dates must still be reachable, or the hover is useless.
+        assert figure.data[0].customdata is not None, label
+        assert len(figure.data[0].customdata) == len(ctx.window), label
+        ticks = figure.layout.xaxis.ticktext
+        assert ticks and len(ticks) >= 2, f"{label} lost its date labels"
         # The y-axis stays on the candles. A target far outside them used to
         # flatten these charts into a line.
         low, high = float(ctx.window["Low"].min()), float(ctx.window["High"].max())
@@ -20834,9 +21712,10 @@ def _test_setup_drawing_and_zones():
     slope_, intercept, _name = hit["lines"][0]
     figure = mb_setup_chart(ctx, hit, mb_plan(ctx, hit), "trendline")
     line_trace = [t for t in figure.data[1:] if "trendline" in (t.name or "")][0]
-    positions = {stamp: i for i, stamp in enumerate(ctx.window.index)}
     for x, y in zip(line_trace.x, line_trace.y):
-        assert abs(float(y) - (slope_ * positions[x] + intercept)) < 1e-6, (x, y)
+        if y is None or not np.isfinite(float(y)):
+            continue                      # blanked where it runs off the chart
+        assert abs(float(y) - (slope_ * int(x) + intercept)) < 1e-6, (x, y)
 
     # Zones: a demand zone is a tight base a move LEFT from, that price has
     # returned to. A wide base is a range, and a grind is not an impulse.
@@ -20923,9 +21802,39 @@ def _test_setup_drawing_and_zones():
             "T.NS", "1d", "6mo", "cup_handle", 120, 3, 0.5)[3]
     finally:
         globals().update(saved)
+    # The reason for all of it: a 15-minute chart of ten sessions spans two
+    # calendar weeks, so on a datetime axis nine tenths of the chart is night
+    # and weekend and the candles are unreadable slivers. On bar positions the
+    # spacing is uniform and every candle gets the same width.
+    sessions, stamps_i = [], []
+    day = pd.Timestamp("2026-10-01 09:15", tz="Asia/Kolkata")
+    while len(stamps_i) < 250:
+        if day.dayofweek < 5:
+            stamps_i += [day + pd.Timedelta(minutes=15 * k) for k in range(25)]
+        day = (day + pd.Timedelta(days=1)).normalize() + pd.Timedelta(hours=9, minutes=15)
+    intraday_index = pd.DatetimeIndex(stamps_i[:250])
+    closes = pd.Series(2350.0 + np.arange(250) * -1.2, index=intraday_index)
+    intraday = pd.DataFrame({"Open": closes, "High": closes * 1.002,
+                             "Low": closes * 0.998, "Close": closes,
+                             "Volume": 1000.0}, index=intraday_index)
+    calendar_days = (intraday_index[-1] - intraday_index[0]).days
+    assert calendar_days > 10, "this fixture is only meaningful if it spans weekends"
+    chart = studio_chart(intraday, "15m")
+    assert list(chart.data[0].x) == list(range(250)), "candles must sit on bar positions"
+    assert chart.layout.xaxis.range == (-1, 250), chart.layout.xaxis.range
+    assert chart.layout.xaxis.zeroline is False, \
+        "a numeric x-axis would otherwise rule a line down the first candle"
+    gaps = np.diff(np.asarray(chart.data[0].x, float))
+    assert np.all(gaps == 1.0), "every candle must be the same width apart"
+    labels = list(chart.layout.xaxis.ticktext)
+    assert 2 <= len(labels) <= 16, labels
+    assert any(":" in str(label) for label in labels), \
+        "an intraday chart's labels must carry the clock time"
+
     print(f"   setup drawing: {len(MAKE_BREAK_SETUPS)} setups draw their own geometry, "
           f"zones need an impulse, bowls beat Vs on R², handles stay shallow, a wedge is "
-          f"not a channel, rebuild matches the scan  OK")
+          f"not a channel, rebuild matches the scan, {calendar_days}-day intraday span "
+          f"draws gapless  OK")
 
 
 def _test_studio_second_leg_and_insights():
@@ -21934,6 +22843,7 @@ def run_selftest() -> int:
         _test_gamma_blast_detail_chart()
         _test_chart_studio_alignment_and_bins()
         _test_setup_drawing_and_zones()
+        _test_signal_freshness_and_cell_arithmetic()
         _test_studio_second_leg_and_insights()
         _test_sweep_progress_is_visible_and_rerun_is_deferred()
         print("-- filters --")
