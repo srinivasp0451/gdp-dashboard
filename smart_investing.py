@@ -98,7 +98,25 @@ ASSET_UNIVERSE: dict[str, dict[str, str]] = {
     },
     "Crypto": {"Bitcoin": "BTC-USD", "Ethereum": "ETH-USD"},
     "Forex": {"USD / INR": "USDINR=X", "EUR / USD": "EURUSD=X"},
-    "Commodities": {"Gold Futures": "GC=F", "Silver Futures": "SI=F"},
+    "Commodities": {
+        "Gold Futures (USD)": "GC=F",
+        "Silver Futures (USD)": "SI=F",
+        "Crude Oil WTI (USD)": "CL=F",
+        "Brent Crude (USD)": "BZ=F",
+        "Natural Gas (USD)": "NG=F",
+        "Copper (USD)": "HG=F",
+    },
+    # Indian commodity exposure comes through NSE-listed ETFs, because MCX
+    # itself is not on Yahoo. These are rupee-denominated and keep NSE hours,
+    # so they behave like Indian equities rather than like the 23-hour global
+    # futures above -- which matters for every session-based test in the app.
+    # There is no NSE-listed crude ETF, so crude is only available as the
+    # dollar futures above.
+    "Indian Commodities (NSE ETFs)": {
+        "Gold BeES (INR)": "GOLDBEES.NS",
+        "Silver BeES (INR)": "SILVERBEES.NS",
+        "Gold ETF — HDFC (INR)": "HDFCGOLD.NS",
+    },
     "Indian Stocks": {
         "Reliance Industries": "RELIANCE.NS",
         "Kaynes Technology": "KAYNES.NS",
@@ -5599,12 +5617,12 @@ def price_chart(df, title, overlays=("ema_fast", "ema_slow"), trades=None, tail=
     import plotly.graph_objects as go
 
     data = df.tail(tail) if tail else df
+    # Bar positions, not a calendar: see gapless_axis. `hide_weekends` is kept
+    # in the signature because callers pass it, but it no longer does anything
+    # -- there are no weekends to hide when the axis counts candles.
+    spots = list(range(len(data)))
     fig = go.Figure()
-    fig.add_trace(go.Candlestick(
-        x=data.index, open=data["Open"], high=data["High"], low=data["Low"],
-        close=data["Close"], name="Price",
-        increasing_line_color=_UP, decreasing_line_color=_DOWN,
-        increasing_fillcolor=_UP, decreasing_fillcolor=_DOWN))
+    fig.add_trace(candle_trace(data))
 
     # Name the EMAs by their actual length -- "EMA 9" tells you more than
     # "Fast EMA" when the lengths are configurable.
@@ -5620,15 +5638,17 @@ def price_chart(df, title, overlays=("ema_fast", "ema_slow"), trades=None, tail=
         last = data[col].dropna()
         value = float(last.iloc[-1]) if len(last) else None
         name = ema_names.get(col, _label(col)) + (f"  {fmt(value)}" if value is not None else "")
-        fig.add_trace(go.Scatter(x=data.index, y=data[col], mode="lines", name=name,
-                                 line=dict(width=1.6, color=colour)))
+        fig.add_trace(go.Scatter(x=spots, y=data[col], mode="lines", name=name,
+                                 line=dict(width=1.6, color=colour),
+                                 hovertemplate=f"{_label(col)}: %{{y:,.2f}}<extra></extra>"))
         if value is not None:
-            fig.add_annotation(x=last.index[-1], y=value, text=f"{_label(col)} {fmt(value)}",
+            fig.add_annotation(x=position_of(data.index, last.index[-1]), y=value,
+                               text=f"{_label(col)} {fmt(value)}",
                                showarrow=False, xanchor="left", xshift=6, font=dict(size=11,
                                color=colour), bgcolor="rgba(0,0,0,0.35)")
 
     close = float(data["Close"].iloc[-1])
-    fig.add_annotation(x=data.index[-1], y=close, text=f"LTP {fmt(close)}", showarrow=False,
+    fig.add_annotation(x=len(data) - 1, y=close, text=f"LTP {fmt(close)}", showarrow=False,
                        xanchor="left", xshift=6, font=dict(size=12, color="#ffffff"),
                        bgcolor="rgba(38,166,154,0.85)")
 
@@ -5638,17 +5658,24 @@ def price_chart(df, title, overlays=("ema_fast", "ema_slow"), trades=None, tail=
                                          (trades[trades["Direction"] == "SHORT"], "Short entry",
                                           "triangle-down", _DOWN)):
             if not frame.empty:
+                # A fill is placed on the candle it happened on, which is what
+                # the position mapper is for.
                 fig.add_trace(go.Scatter(
-                    x=frame["Entry Time"], y=frame["Entry Price"], mode="markers", name=name,
+                    x=position_of(data.index, frame["Entry Time"]),
+                    y=frame["Entry Price"], mode="markers", name=name,
                     marker=dict(symbol=sym, size=11, color=colour,
                                 line=dict(width=1, color="#fff")),
-                    hovertemplate="%{x}<br>Entry %{y:,.2f}<extra></extra>"))
+                    customdata=np.array([_hover_dates(frame["Entry Time"])]).T,
+                    hovertemplate="%{customdata[0]}<br>Entry %{y:,.2f}<extra></extra>"))
+        exits = np.column_stack([trades["Exit Reason"].astype(str).to_numpy(),
+                                 trades["PnL"].to_numpy(),
+                                 _hover_dates(trades["Exit Time"])])
         fig.add_trace(go.Scatter(
-            x=trades["Exit Time"], y=trades["Exit Price"], mode="markers", name="Exit",
-            marker=dict(symbol="x", size=9, color="#8d99ae"),
-            customdata=trades[["Exit Reason", "PnL"]],
-            hovertemplate="%{x}<br>Exit %{y:,.2f}<br>%{customdata[0]}"
-                          "<br>PnL %{customdata[1]:,.2f}<extra></extra>"))
+            x=position_of(data.index, trades["Exit Time"]),
+            y=trades["Exit Price"], mode="markers", name="Exit",
+            marker=dict(symbol="x", size=9, color="#8d99ae"), customdata=exits,
+            hovertemplate="%{customdata[2]}<br>Exit %{y:,.2f}<br>%{customdata[0]}"
+                          "<br>PnL %{customdata[1]}<extra></extra>"))
 
     fig.update_layout(title=dict(text=title, x=0.01, xanchor="left", font=dict(size=15)),
                       height=height, margin=dict(l=10, r=90, t=46, b=10), hovermode="x",
@@ -5659,8 +5686,7 @@ def price_chart(df, title, overlays=("ema_fast", "ema_slow"), trades=None, tail=
         fig.update_xaxes(showgrid=False, showspikes=True, spikemode="across",
                          spikedash="dot", spikethickness=1, spikecolor="#9aa0a6")
         fig.update_yaxes(showgrid=True, gridcolor="rgba(0,0,0,0.06)", side="left")
-    if hide_weekends:
-        fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
+    gapless_axis(data.index, fig)
     return fig
 
 
@@ -7938,7 +7964,8 @@ SCREENER_UNIVERSES = [
     "Nifty Energy", "Nifty Realty", "Nifty Financial Services",
     "All NSE equities (Dhan master)",
     "Broad indices", "Sector indices",
-    "Crypto (major)", "US large caps", "Forex majors", "Commodities", "Global indices",
+    "Crypto (major)", "US large caps", "Forex majors", "Commodities",
+    "Indian commodity ETFs", "Global indices",
     "Custom list (paste or upload)",
 ]
 
@@ -7965,6 +7992,14 @@ COMMODITY_FUTURES = [
     "GC=F", "SI=F", "CL=F", "NG=F", "HG=F", "PL=F", "PA=F", "BZ=F",
     "ZC=F", "ZW=F", "ZS=F", "KC=F", "SB=F", "CT=F",
 ]
+# NSE-listed commodity ETFs: rupee-denominated gold and silver on Indian market
+# hours. MCX contracts themselves are not carried by Yahoo, so this is the only
+# way to screen Indian commodity exposure here, and these track the metal's
+# rupee price rather than the dollar futures above.
+INDIAN_COMMODITY_ETFS = [
+    "GOLDBEES.NS", "SILVERBEES.NS", "HDFCGOLD.NS", "GOLDSHARE.NS",
+    "AXISGOLD.NS", "SETFGOLD.NS",
+]
 GLOBAL_INDICES = [
     "^GSPC", "^DJI", "^IXIC", "^RUT", "^VIX", "^FTSE", "^GDAXI", "^FCHI",
     "^N225", "^HSI", "^STOXX50E", "^AXJO", "^BSESN", "^NSEI",
@@ -7979,8 +8014,17 @@ STATIC_UNIVERSES = {
                                      "your own list if you need exact constituents."),
     "Forex majors": (FOREX_MAJORS, "Spot FX crosses. These report zero volume on Yahoo, so "
                                    "volume-gated strategies and filters will not arm."),
-    "Commodities": (COMMODITY_FUTURES, "Front-month futures. Yahoo stitches contract rollovers, "
-                                       "which puts artificial gaps in the history."),
+    "Commodities": (COMMODITY_FUTURES, "Front-month futures, including WTI and Brent crude. "
+                                       "Yahoo stitches contract rollovers, which puts "
+                                       "artificial gaps in the history."),
+    "Indian commodity ETFs": (INDIAN_COMMODITY_ETFS,
+                              "NSE-listed gold and silver ETFs, priced in rupees and keeping "
+                              "Indian market hours — so the session-based tests mean what "
+                              "they say, which is not true of the dollar futures. These are "
+                              "ETFs, so they carry a tracking difference against the metal "
+                              "and their volume is their own, not the metal's. MCX contracts "
+                              "are not on Yahoo, so there is no Indian crude here; use WTI "
+                              "or Brent under Commodities."),
     "Global indices": (GLOBAL_INDICES, "Index levels report zero volume on Yahoo; VWAP falls "
                                        "back to a session TWAP."),
 }
@@ -9455,44 +9499,62 @@ def draw_pattern(f: pd.DataFrame, hit: PatternHit, pad: int = 60):
     lo = max(0, hit.index - pad)
     hi = min(len(f), hit.index + pad // 3)
     data = f.iloc[lo:hi]
-    fig = go.Figure(go.Candlestick(
-        x=data.index, open=data["Open"], high=data["High"], low=data["Low"],
-        close=data["Close"], name="Price", increasing_line_color=_UP,
-        decreasing_line_color=_DOWN, increasing_fillcolor=_UP, decreasing_fillcolor=_DOWN))
+    fig = go.Figure(candle_trace(data, showlegend=False))
+
+    # The pattern's geometry arrives stamped with wall-clock times, because
+    # that is how the detectors found it. The candles are drawn at bar
+    # positions (see gapless_axis), so every piece of geometry is mapped onto
+    # the candle it belongs to -- otherwise a neckline drawn at a timestamp
+    # lands nowhere on an axis that counts bars.
+    def spot(value):
+        return position_of(data.index, value)
+
+    def spots(values):
+        return position_of(data.index, list(values))
 
     for g in hit.geometry:
         kind = g.get("type")
         if kind == "line":
-            fig.add_trace(go.Scatter(x=[g["x0"], g["x1"]], y=[g["y0"], g["y1"]], mode="lines",
+            fig.add_trace(go.Scatter(x=[spot(g["x0"]), spot(g["x1"])],
+                                     y=[g["y0"], g["y1"]], mode="lines",
                                      line=dict(color="#4f9df7", width=2),
-                                     name=g.get("label", "line"), showlegend=False))
-            fig.add_annotation(x=g["x1"], y=g["y1"], text=g.get("label", ""), showarrow=False,
+                                     name=g.get("label", "line"), showlegend=False,
+                                     hovertemplate="%{y:,.2f}<extra></extra>"))
+            fig.add_annotation(x=spot(g["x1"]), y=g["y1"], text=g.get("label", ""),
+                               showarrow=False,
                                font=dict(size=10, color="#4f9df7"), xanchor="left")
         elif kind == "curve":
-            fig.add_trace(go.Scatter(x=g["x"], y=g["y"], mode="lines",
+            fig.add_trace(go.Scatter(x=spots(g["x"]), y=g["y"], mode="lines",
                                      line=dict(color="#4f9df7", width=2, dash="dot"),
-                                     showlegend=False))
+                                     showlegend=False,
+                                     hovertemplate="%{y:,.2f}<extra></extra>"))
         elif kind == "pivot":
-            fig.add_trace(go.Scatter(x=[g["x"]], y=[g["y"]], mode="markers",
+            fig.add_trace(go.Scatter(x=[spot(g["x"])], y=[g["y"]], mode="markers",
                                      marker=dict(symbol="circle-open", size=12,
                                                  color="#4dd0e1", line=dict(width=2)),
-                                     showlegend=False))
+                                     showlegend=False,
+                                     hovertemplate="pivot %{y:,.2f}<extra></extra>"))
         elif kind == "star":
-            fig.add_trace(go.Scatter(x=[g["x"]], y=[g["y"]], mode="markers+text",
+            fig.add_trace(go.Scatter(x=[spot(g["x"])], y=[g["y"]], mode="markers+text",
                                      marker=dict(symbol="star", size=15, color="#ffb300"),
                                      text=[g.get("label", "")], textposition="top right",
-                                     textfont=dict(color="#ffb300", size=10), showlegend=False))
+                                     textfont=dict(color="#ffb300", size=10), showlegend=False,
+                                     hovertemplate="%{text} %{y:,.2f}<extra></extra>"))
         elif kind == "band":
-            fig.add_vrect(x0=g["x0"], x1=g["x1"], fillcolor="#ffb300", opacity=0.18, line_width=0)
+            fig.add_vrect(x0=spot(g["x0"]), x1=spot(g["x1"]), fillcolor="#ffb300",
+                          opacity=0.18, line_width=0)
         elif kind == "zone":
-            fig.add_shape(type="rect", x0=g["x0"], x1=g["x1"], y0=g["y0"], y1=g["y1"],
+            fig.add_shape(type="rect", x0=spot(g["x0"]), x1=spot(g["x1"]),
+                          y0=g["y0"], y1=g["y1"],
                           fillcolor="#4f9df7", opacity=0.2, line=dict(width=0))
 
     fig.update_layout(
         title=dict(text=f"{hit.pattern} — {fmt_time(hit.time)}", x=0.01, xanchor="left",
                    font=dict(size=14)),
-        height=460, margin=dict(l=10, r=10, t=44, b=10), xaxis_rangeslider_visible=False,
+        height=460, margin=dict(l=62, r=24, t=44, b=42), xaxis_rangeslider_visible=False,
         hovermode="x unified", showlegend=False, dragmode="pan")
+    fig.update_yaxes(showgrid=True, gridcolor="rgba(128,128,128,0.15)")
+    gapless_axis(data.index, fig)
     return fig
 
 
@@ -11793,12 +11855,10 @@ def gamma_blast_detail(ticker: str, interval: str, gcfg: dict, strike: float,
     for note in fig.layout.annotations:
         note.update(x=0, xanchor="left", font=dict(size=12))
 
-    fig.add_trace(go.Candlestick(
-        x=tail.index, open=tail["Open"], high=tail["High"], low=tail["Low"],
-        close=tail["Close"], name="Price",
-        increasing_line_color=_UP, decreasing_line_color=_DOWN,
-        increasing_fillcolor=_UP, decreasing_fillcolor=_DOWN,
-        line=dict(width=1), showlegend=False), row=1, col=1)
+    # Bar positions on every panel, so the candles are evenly spaced and the
+    # volume and open-interest panels line up with them candle for candle.
+    spots = list(range(len(tail)))
+    fig.add_trace(candle_trace(tail, showlegend=False), row=1, col=1)
     # Scale the price panel to the CANDLES, then draw only the levels that fit.
     #
     # A strike several hundred points away from the market -- which is normal
@@ -11831,16 +11891,17 @@ def gamma_blast_detail(ticker: str, interval: str, gcfg: dict, strike: float,
 
     if has_volume:
         rising = tail["Close"].to_numpy() >= tail["Open"].to_numpy()
-        fig.add_trace(go.Bar(x=tail.index, y=tail["Volume"], name="Volume",
+        stamps = _hover_dates(tail.index)
+        fig.add_trace(go.Bar(x=spots, y=tail["Volume"], name="Volume",
                              marker=dict(color=np.where(rising, _UP, _DOWN),
                                          line=dict(width=0)),
-                             opacity=0.55, showlegend=False,
-                             hovertemplate="%{x}<br>Volume %{y:,.0f}<extra></extra>"),
+                             opacity=0.55, showlegend=False, customdata=stamps,
+                             hovertemplate="%{customdata}<br>Volume %{y:,.0f}<extra></extra>"),
                       row=2, col=1)
-        fig.add_trace(go.Scatter(x=tail.index, y=vol_avg.reindex(tail.index),
+        fig.add_trace(go.Scatter(x=spots, y=vol_avg.reindex(tail.index),
                                  name=f"{vol_len}-candle average", mode="lines",
                                  line=dict(width=2, color="#e9c46a"), showlegend=False,
-                                 hovertemplate="%{x}<br>Average %{y:,.0f}<extra></extra>"),
+                                 hovertemplate="Average %{y:,.0f}<extra></extra>"),
                       row=2, col=1)
     else:
         fig.add_annotation(text="This instrument reports no volume on Yahoo",
@@ -11848,15 +11909,21 @@ def gamma_blast_detail(ticker: str, interval: str, gcfg: dict, strike: float,
                            showarrow=False, row=2, col=1)
 
     if has_oi:
+        # Each open-interest reading is placed on the candle it was taken
+        # during, which is the only way it can be compared with the price and
+        # volume above it once those are drawn at bar positions.
+        oi_spots = position_of(tail.index, times)
+        oi_stamps = _hover_dates(times)
         for values, label, colour in ((ce_series, "CE OI", _OI_CE),
                                       (pe_series, "PE OI", _OI_PE)):
             fig.add_trace(go.Scatter(
-                x=times, y=values, name=label, mode="lines+markers",
+                x=oi_spots, y=values, name=label, mode="lines+markers",
                 line=dict(width=2, color=colour), marker=dict(size=8, color=colour),
-                hovertemplate="%{x}<br>" + label + " %{y:,.0f}<extra></extra>"),
+                customdata=oi_stamps,
+                hovertemplate="%{customdata}<br>" + label + " %{y:,.0f}<extra></extra>"),
                 row=3, col=1)
-            if len(times):
-                fig.add_annotation(x=times[-1], y=values[-1], text=f" {label}",
+            if len(oi_spots):
+                fig.add_annotation(x=oi_spots[-1], y=values[-1], text=f" {label}",
                                    showarrow=False, xanchor="left",
                                    font=dict(size=11), row=3, col=1)
 
@@ -11868,9 +11935,11 @@ def gamma_blast_detail(ticker: str, interval: str, gcfg: dict, strike: float,
     # is drawn on all three.
     if has_oi and len(times) > 1:
         for r in (1, 2):
-            fig.add_vrect(x0=times[0], x1=times[-1], row=r, col=1,
+            fig.add_vrect(x0=oi_spots[0], x1=max(oi_spots[-1], oi_spots[0] + 0.5),
+                          row=r, col=1,
                           fillcolor="rgba(128,128,128,0.16)", line_width=0, layer="below")
-        fig.add_annotation(x=times[0], y=1, yref="y domain", xanchor="left", yanchor="bottom",
+        fig.add_annotation(x=oi_spots[0], y=1, yref="y domain", xanchor="left",
+                           yanchor="bottom",
                            text=f"open interest observed here ({fmt(numbers_minutes(times), 0)}"
                                 f" min)", showarrow=False, font=dict(size=10), row=1, col=1)
 
@@ -11883,8 +11952,12 @@ def gamma_blast_detail(ticker: str, interval: str, gcfg: dict, strike: float,
                    x=0.01, xanchor="left", font=dict(size=15)))
     fig.update_xaxes(rangeslider_visible=False, showgrid=False)
     fig.update_yaxes(showgrid=True, gridcolor="rgba(128,128,128,0.15)")
-    if not (ticker.endswith("-USD") or ticker.endswith("=X")):
-        fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
+    # No rangebreaks any more: the axis counts candles, so there are no nights
+    # or weekends in it to break out. Labels go on the bottom panel only.
+    for r in range(1, rows):
+        fig.update_xaxes(range=[-1, len(tail)], showticklabels=False, zeroline=False,
+                         row=r, col=1)
+    gapless_axis(tail.index, fig, row=rows, col=1)
 
     last_vol = float(tail["Volume"].iloc[-1]) if has_volume else float("nan")
     avg_vol = float(vol_avg.iloc[-1]) if has_volume else float("nan")
@@ -12479,21 +12552,50 @@ def momentum_pulse_scan_one(ticker: str, interval: str, pcfg: dict) -> dict:
     period, _ = lab_period_for(interval, 200)
     bundle = load_market_data(ticker, period, interval, freshness_seconds=120, min_bars=30)
     frame = bundle.frame
-    sessions = session_key(frame.index)
-    today = frame[sessions == sessions.iloc[-1]]
-    if today.empty:
+    is_intraday = interval in INTRADAY_INTERVALS
+
+    # ON A DAILY OR LONGER TIMEFRAME THERE IS NO SESSION. Several of these
+    # tests are intraday ideas, and rather than quietly computing nonsense on
+    # a weekly chart each one is restated as the thing it actually means:
+    #
+    #   "today"          -> the current candle
+    #   "previous day"   -> the previous candle
+    #   "opening range"  -> the last N candles before this one, which is the
+    #                       nearest honest equivalent of a range to break
+    #   "session VWAP"   -> a VWAP anchored at the start of the series, since
+    #                       there is no session to anchor to
+    #
+    # The tab renames the rows to match, so nothing claims to be a day's high
+    # when it is a month's.
+    if is_intraday:
+        sessions = session_key(frame.index)
+        today = frame[sessions == sessions.iloc[-1]]
+        if today.empty:
+            today = frame.tail(1)
+    else:
         today = frame.tail(1)
 
     price = float(frame["Close"].iloc[-1])
-    pdh, pdl, pdc = previous_session_levels(frame)
+    if is_intraday:
+        pdh, pdl, pdc = previous_session_levels(frame)
+    elif len(frame) > 1:
+        previous = frame.iloc[-2]
+        pdh, pdl, pdc = (float(previous["High"]), float(previous["Low"]),
+                         float(previous["Close"]))
+    else:
+        pdh = pdl = pdc = float("nan")
     day_high, day_low = float(today["High"].max()), float(today["Low"].min())
     session_open = float(today["Open"].iloc[0]) if len(today) else float("nan")
     week_high, week_low, pwh, pwl = _period_extremes(frame, "W")
     month_high, month_low, pmh, pml = _period_extremes(frame, "M")
 
-    # Opening range: the first N candles of the current session.
+    # Opening range: the first N candles of the current session intraday, and
+    # the last N closed candles on a higher timeframe.
     or_bars = int(pcfg.get("or_bars", 3))
-    opening = today.head(or_bars)
+    if is_intraday:
+        opening = today.head(or_bars)
+    else:
+        opening = frame.iloc[-(or_bars + 1):-1] if len(frame) > or_bars else frame.head(0)
     or_high = float(opening["High"].max()) if len(opening) else float("nan")
     or_low = float(opening["Low"].min()) if len(opening) else float("nan")
 
@@ -12506,22 +12608,27 @@ def momentum_pulse_scan_one(ticker: str, interval: str, pcfg: dict) -> dict:
     vol_ratio = (vol_now / vol_avg) if (has_volume and vol_avg) else float("nan")
     heavy = bool(np.isfinite(vol_ratio) and vol_ratio >= float(pcfg.get("vol_mult", 1.5)))
 
-    # Range expansion: today's range so far against the average session range.
+    # Range expansion: this period's range against the average of the last N.
     day_range = day_high - day_low
-    past = frame[sessions != sessions.iloc[-1]]
-    if len(past):
-        per_session = past.groupby(session_key(past.index)).agg(
-            hi=("High", "max"), lo=("Low", "min"))
-        avg_range = float((per_session["hi"] - per_session["lo"]).tail(
-            int(pcfg.get("range_len", 10))).mean())
+    if is_intraday:
+        past = frame[sessions != sessions.iloc[-1]]
+        if len(past):
+            per_session = past.groupby(session_key(past.index)).agg(
+                hi=("High", "max"), lo=("Low", "min"))
+            avg_range = float((per_session["hi"] - per_session["lo"]).tail(
+                int(pcfg.get("range_len", 10))).mean())
+        else:
+            avg_range = float("nan")
     else:
-        avg_range = float("nan")
+        spans = (frame["High"] - frame["Low"]).iloc[:-1]
+        avg_range = float(spans.tail(int(pcfg.get("range_len", 10))).mean()) \
+            if len(spans) else float("nan")
     range_ratio = (day_range / avg_range) if (np.isfinite(avg_range) and avg_range > 0) \
         else float("nan")
     expanded = bool(np.isfinite(range_ratio)
                     and range_ratio >= float(pcfg.get("range_mult", 1.0)))
 
-    series, volume_backed = vwap(frame, True)
+    series, volume_backed = vwap(frame, is_intraday)
     vwap_now = float(series.iloc[-1]) if len(series) else float("nan")
 
     # Change of character: the structure's own last break, from the shared
@@ -12598,6 +12705,7 @@ def momentum_pulse_scan_one(ticker: str, interval: str, pcfg: dict) -> dict:
     row = {
         "Ticker": ticker, "Timeframe": interval,
         "Sector": SECTOR_BY_TICKER.get(ticker, "--"),
+        "Reading": "session" if is_intraday else "per candle",
         "Price": round(price, 2),
         "Change %": round(change_pct, 2) if np.isfinite(change_pct) else None,
         "Bullish": f"{bull_score}/{bull_total}", "Bearish": f"{bear_score}/{bear_total}",
@@ -12689,6 +12797,92 @@ def _pulse_checklist(row: dict) -> None:
                "a count of how much they overlap.")
 
 
+def pulse_chart(frame: pd.DataFrame, row: dict, title: str, light: bool = False,
+                height: int = 560):
+    """
+    The candles the checklist was scored on, with every level it tested drawn.
+
+    A column of YES and NO is an argument about a chart. Drawn, you can see at
+    once whether "above PDH" means a decisive break or a two-tick graze, which
+    the tick alone will never tell you. Levels the download could not establish
+    are simply absent, for the same reason they are blank in the table.
+    """
+    import plotly.graph_objects as go
+
+    figure = go.Figure(candle_trace(frame))
+    span = len(frame)
+    lo, hi = float(frame["Low"].min()), float(frame["High"].max())
+    pad = max((hi - lo) * 0.07, abs(hi) * 0.001)
+
+    # VWAP as a line, because it moves; everything else is a flat level.
+    try:
+        series, volume_backed = vwap(frame, True)
+        if len(series) and series.notna().any():
+            figure.add_trace(go.Scatter(
+                x=list(range(span)), y=series, mode="lines",
+                name="VWAP" if volume_backed else "TWAP (no volume)",
+                line=dict(width=1.8, color="#e9c46a"),
+                hovertemplate="VWAP %{y:,.2f}<extra></extra>"))
+    except Exception:                                               # noqa: BLE001
+        pass
+
+    # Grouped so the eye can tell a day level from a month level without
+    # reading every label: today solid, previous period dashed, longer dotted.
+    levels = [
+        ("OR High", _UP, "dot"), ("OR Low", _DOWN, "dot"),
+        ("Day High", _UP, "solid"), ("Day Low", _DOWN, "solid"),
+        ("PDH", _UP, "dash"), ("PDL", _DOWN, "dash"),
+        ("Week High", _SMC_INK, "dash"), ("Week Low", _SMC_INK, "dash"),
+        ("PWH", _SMC_INK, "dot"), ("PWL", _SMC_INK, "dot"),
+        ("Month High", _MB_LINE, "dash"), ("Month Low", _MB_LINE, "dash"),
+        ("PMH", _MB_LINE, "dot"), ("PML", _MB_LINE, "dot"),
+    ]
+    offscreen, on_chart = [], []
+    for name, colour, dash in levels:
+        value = row.get(name)
+        if value is None:
+            continue
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            continue
+        if not np.isfinite(value):
+            continue
+        if lo - pad <= value <= hi + pad:
+            on_chart.append((value, name, colour, dash))
+        else:
+            offscreen.append(f"{name} {fmt(value)}")
+
+    # Several of these levels sit within a few rupees of each other, so their
+    # labels are nudged apart. The lines stay exactly where they are.
+    nudges = stagger_labels([v for v, _n, _c, _d in on_chart], lo - pad, hi + pad,
+                            int(height) - 100)
+    for (value, name, colour, dash), nudge in zip(on_chart, nudges):
+        figure.add_hline(y=value, line=dict(color=colour, width=1.2, dash=dash),
+                         annotation_text=f"{name} {fmt(value)}",
+                         annotation_position="right", annotation_yshift=int(nudge),
+                         annotation_font=dict(size=9, color=colour))
+    if offscreen:
+        figure.add_annotation(
+            xref="paper", yref="paper", x=0.01, y=1.0, xanchor="left", yanchor="top",
+            text="off this chart: " + " · ".join(offscreen), showarrow=False,
+            font=dict(size=10, color=_SMC_INK), bgcolor="rgba(127,127,127,0.18)",
+            borderpad=3)
+
+    bull, bear = row.get("Bullish", "--"), row.get("Bearish", "--")
+    figure.update_layout(
+        height=int(height), margin=dict(l=62, r=132, t=54, b=44),
+        title=dict(text=f"{title} — bullish {bull}, bearish {bear}",
+                   x=0.01, xanchor="left", font=dict(size=15)),
+        hovermode="x unified", dragmode="pan", xaxis_rangeslider_visible=False,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        template="plotly_white" if light else None)
+    figure.update_yaxes(range=[lo - pad, hi + pad], showgrid=True,
+                        gridcolor="rgba(128,128,128,0.15)")
+    gapless_axis(frame.index, figure)
+    return figure
+
+
 def tab_momentum_pulse(cfg: dict) -> None:
     st.subheader("Momentum Pulse \u2014 intraday condition screener")
     st.warning(
@@ -12702,13 +12896,19 @@ def tab_momentum_pulse(cfg: dict) -> None:
 
     c1, c2, c3 = st.columns(3)
     universe = c1.selectbox("Universe", SCREENER_UNIVERSES, key="pulse_universe")
-    intraday_choices = [i for i in INTERVALS if i in INTRADAY_INTERVALS]
+    # Intraday first, then the swing and positional timeframes. On 1d and
+    # longer there is no session, so the session-based tests are restated per
+    # candle -- the scan says which reading it used in its own Reading column.
+    tf_choices = ([i for i in INTERVALS if i in INTRADAY_INTERVALS]
+                  + [i for i in ("1d", "1wk", "1mo") if i in INTERVALS])
     interval = c2.selectbox(
-        "Timeframe", intraday_choices, index=intraday_choices.index("5m"),
+        "Timeframe", tf_choices, index=tf_choices.index("5m"),
         key="pulse_tf",
-        help="The reference screen does not state its timeframe. 5m is the usual choice for "
-             "an intraday breakout screen: fast enough to catch a move, slow enough that the "
-             "opening-range and volume tests are not pure noise. 15m is the steadier option.")
+        help="5m is the usual choice for an intraday breakout screen: fast enough to catch "
+             "a move, slow enough that the opening-range and volume tests are not pure "
+             "noise. 15m is steadier. 1d, 1wk and 1mo turn this into a swing or positional "
+             "screen — on those there is no intraday session, so 'previous day' becomes the "
+             "previous candle and the opening range becomes the last few closed candles.")
     bias_filter = c3.selectbox("Show", ["Everything", "Bullish only", "Bearish only",
                                         "Full house only", "At least 70% one way"],
                                key="pulse_bias")
@@ -12747,6 +12947,15 @@ def tab_momentum_pulse(cfg: dict) -> None:
             "the top of its candle is buying, the same volume closing at the bottom is "
             "selling. The two counts still do not sum to eleven — a quiet, mid-range name "
             "scores low on both, which is the correct answer.")
+        if interval not in INTRADAY_INTERVALS:
+            st.info(
+                f"**You are on {interval}, where there is no intraday session.** The "
+                f"session-based rows are restated as the thing they actually mean here: "
+                f"*previous day* is the previous {interval} candle, *day high / low* is "
+                f"this candle's own high and low, the *opening range* is the last few "
+                f"closed candles, and VWAP is anchored at the start of the series rather "
+                f"than at a session open. Week and month levels are unchanged — those are "
+                f"calendar facts either way.")
         st.caption("A previous week or month that is not fully inside the downloaded "
                    "window is reported as blank rather than as a partial figure: a month "
                    "high computed from four days of that month is not a month high. On "
@@ -12881,6 +13090,32 @@ def tab_momentum_pulse(cfg: dict) -> None:
     pick = s1.selectbox("Ticker", view["Ticker"].tolist(), key="pulse_pick")
     picked = view[view["Ticker"] == pick].iloc[0].to_dict()
     _pulse_checklist(picked)
+
+    # The chart the checklist is describing. A column of YES and NO is an
+    # argument about a chart; without the chart there is no way to disagree
+    # with it, and the levels it is measuring against are invisible.
+    if st.checkbox("Draw the chart with these levels on it", value=True,
+                   key="pulse_draw"):
+        v1, v2 = st.columns([1, 3])
+        chart_bars = v1.number_input("Candles to show", 40, 600, 150, 10,
+                                     key="pulse_bars")
+        try:
+            chart_frame = load_market_data(
+                pick, lab_period_for(interval, 200)[0], interval,
+                freshness_seconds=120, min_bars=30).frame
+        except Exception as exc:                                    # noqa: BLE001
+            st.info(f"Could not redraw `{pick}`: {exc}")
+        else:
+            figure = pulse_chart(chart_frame.tail(int(chart_bars)), picked,
+                                 f"{pick} · {interval}",
+                                 light=bool(cfg.get("light_charts")))
+            st.plotly_chart(figure, width="stretch",
+                            config={"scrollZoom": True, "displaylogo": False})
+            st.caption("Every level the checklist tests against is drawn: the opening "
+                       "range, VWAP, and the previous day, week and month extremes that "
+                       "the data actually supports. A level the download could not "
+                       "establish — a previous month on a five-day window, say — is "
+                       "absent here for the same reason it is blank in the table.")
     if s2.button("Apply to the sidebar", width="stretch", key="pulse_apply",
                  help="Sends this ticker and timeframe to the control console so it can be "
                       "backtested, optimised or traded live with a real strategy."):
@@ -14814,18 +15049,16 @@ def smc_chart(df: pd.DataFrame, analysis: dict, title: str, light: bool = False,
 
     tail = df.tail(int(bars))
     fig = go.Figure()
-    fig.add_trace(go.Candlestick(
-        x=tail.index, open=tail["Open"], high=tail["High"], low=tail["Low"],
-        close=tail["Close"], name="Price",
-        increasing_line_color=_UP, decreasing_line_color=_DOWN,
-        increasing_fillcolor=_UP, decreasing_fillcolor=_DOWN,
-        line=dict(width=1), showlegend=False))
+    fig.add_trace(candle_trace(tail, showlegend=False))
 
     shapes = analysis.get("shapes", {})
     lo, hi = float(tail["Low"].min()), float(tail["High"].max())
     pad = max((hi - lo) * 0.06, hi * 0.001)
     y_lo, y_hi = lo - pad, hi + pad
-    left_edge, right_edge = tail.index[0], tail.index[-1]
+    # Bar positions, not a calendar (see gapless_axis), so the zones and sweep
+    # markers are placed on the candles they were found on.
+    left_edge, right_edge = 0, max(len(tail) - 1, 0)
+    _label_rows: list = []          # where zone labels have already landed
 
     def band(low, high, colour, label, opacity=0.14, side="left"):
         """
@@ -14835,6 +15068,11 @@ def smc_chart(df: pd.DataFrame, analysis: dict, title: str, light: bool = False,
         where four of them overlapped each other and the sweep markers. Writing
         the name at the band's own midpoint spreads the labels down the chart
         by construction, because the bands are at different prices.
+
+        Two zones at nearly the SAME price still collide -- an order block and
+        a fair-value gap often sit on top of each other, and their labels then
+        print as one smudge. Each label remembers where the last one went and
+        steps aside if it would land on it. The bands themselves never move.
         """
         if low is None or high is None or not (np.isfinite(low) and np.isfinite(high)):
             return
@@ -14850,9 +15088,16 @@ def smc_chart(df: pd.DataFrame, analysis: dict, title: str, light: bool = False,
             at_y, anchor_y = low, "bottom"
         else:
             at_y, anchor_y = (low + high) / 2.0, "middle"
+        pixels_per_unit = 440.0 / max(y_hi - y_lo, 1e-9)
+        place = (at_y - y_lo) * pixels_per_unit
+        shift = 0
+        for taken in _label_rows:
+            if abs(place + shift - taken) < 12:
+                shift = int(round(taken + 12 - place))
+        _label_rows.append(place + shift)
         fig.add_annotation(
             x=1.0 if at_right else 0.0, xref="x domain",
-            y=at_y, text=(f"{label} " if at_right else f" {label}"),
+            y=at_y, yshift=shift, text=(f"{label} " if at_right else f" {label}"),
             showarrow=False, xanchor="right" if at_right else "left", yanchor=anchor_y,
             font=dict(size=10, color=colour))
 
@@ -14890,11 +15135,13 @@ def smc_chart(df: pd.DataFrame, analysis: dict, title: str, light: bool = False,
         if not sweep:
             continue
         fig.add_trace(go.Scatter(
-            x=[sweep[1]], y=[sweep[0]], mode="markers+text", name=label,
+            x=[position_of(tail.index, sweep[1])], y=[sweep[0]],
+            mode="markers+text", name=label,
             marker=dict(symbol=symbol, size=14, color=_SMC_SWEEP,
                         line=dict(width=1.5, color=_SMC_SWEEP)),
             text=[label], textposition=place, textfont=dict(size=10),
-            hovertemplate=f"{label}<br>%{{x}}<br>%{{y:,.2f}}<extra></extra>"))
+            customdata=_hover_dates([sweep[1]]),
+            hovertemplate=f"{label}<br>%{{customdata}}<br>%{{y:,.2f}}<extra></extra>"))
 
     fig.update_layout(
         height=560, margin=dict(l=62, r=74, t=52, b=44),
@@ -14905,7 +15152,7 @@ def smc_chart(df: pd.DataFrame, analysis: dict, title: str, light: bool = False,
         xaxis_rangeslider_visible=False)
     fig.update_yaxes(range=[y_lo, y_hi], showgrid=True,
                      gridcolor="rgba(128,128,128,0.15)")
-    fig.update_xaxes(showgrid=False)
+    gapless_axis(tail.index, fig)
     return fig
 
 
@@ -16944,18 +17191,25 @@ def mb_setup_chart(ctx: MBContext, hit: dict, plan: dict, title: str,
     else:
         rows += [(hit.get("trigger"), "long above", _UP, "dash"),
                  (hit.get("invalidation"), "short below", _DOWN, "dash")]
-    offscreen = []
+    offscreen, on_chart = [], []
     for value, name, colour, dash in rows:
         if value is None or not np.isfinite(float(value)):
             continue
         value = float(value)
         if lo - pad <= value <= hi + pad:
-            figure.add_hline(y=value, line=dict(color=colour, width=1.4, dash=dash),
-                             annotation_text=f"{name} {fmt(value)}",
-                             annotation_position="right",
-                             annotation_font=dict(size=10, color=colour))
+            on_chart.append((value, name, colour, dash))
         else:
             offscreen.append(f"{name} {fmt(value)}")
+
+    # An entry and a stop half an ATR apart print on one row of pixels; the
+    # labels are nudged apart so both can be read, while the lines stay put.
+    nudges = stagger_labels([v for v, _n, _c, _d in on_chart], lo - pad, hi + pad,
+                            int(height) - 95)
+    for (value, name, colour, dash), nudge in zip(on_chart, nudges):
+        figure.add_hline(y=value, line=dict(color=colour, width=1.4, dash=dash),
+                         annotation_text=f"{name} {fmt(value)}",
+                         annotation_position="right", annotation_yshift=int(nudge),
+                         annotation_font=dict(size=10, color=colour))
 
     if offscreen:
         # In paper coordinates, pinned under the title. Placed in the data it
@@ -17348,6 +17602,75 @@ def tab_make_break(cfg: dict) -> None:
 # the guess is wrong. Positions need to know nothing.
 
 
+def stagger_labels(values, y_low: float, y_high: float, pixels: int,
+                   spacing: int = 13) -> list:
+    """
+    Vertical nudges that stop level labels printing on top of each other.
+
+    Two levels a few rupees apart are two different facts and need two
+    readable labels, but at chart scale they land on the same row of pixels
+    and the second overprints the first -- which is how "Day Low" and "Week
+    Low" became an unreadable smudge.
+
+    Labels are placed lowest first; each one that lands within `spacing`
+    pixels of the previous is pushed up just far enough to clear it. The
+    LINES do not move, only their labels, so nothing about the chart's
+    geometry is misrepresented.
+    """
+    span = float(y_high) - float(y_low)
+    if span <= 0 or not pixels:
+        return [0] * len(values)
+    per_unit = float(pixels) / span
+    order = sorted(range(len(values)), key=lambda i: float(values[i]))
+    shifts = [0] * len(values)
+    last = None
+    for i in order:
+        place = (float(values[i]) - float(y_low)) * per_unit
+        if last is not None and place - last < spacing:
+            shifts[i] = int(round(last + spacing - place))
+            place = last + spacing
+        last = place
+    return shifts
+
+
+def position_of(index, values):
+    """
+    Map timestamps onto bar positions on a gapless chart.
+
+    Overlays, trade markers and open-interest snapshots all arrive stamped with
+    a wall-clock time. Once the candles are drawn at bar positions those times
+    mean nothing to the axis, so each one is placed on the candle it belongs
+    to -- the nearest bar, which for a trade fill or an OI reading IS the bar
+    it happened on. A single value in, a single position out; a sequence in, a
+    list out.
+    """
+    stamps = pd.DatetimeIndex(index)
+    single = not isinstance(values, (list, tuple, np.ndarray, pd.Index, pd.Series))
+    wanted = pd.DatetimeIndex([values] if single else list(values))
+    if len(stamps) == 0 or len(wanted) == 0:
+        return 0 if single else []
+    # Both sides on one clock before comparing, or a tz-aware stamp and a naive
+    # one raise rather than compare.
+    def normalise(target):
+        return (target.tz_convert("UTC") if target.tz is not None
+                else target.tz_localize("UTC"))
+    try:
+        left, right = normalise(stamps), normalise(wanted)
+    except Exception:                                               # noqa: BLE001
+        return 0 if single else list(range(len(wanted)))
+    slots = np.searchsorted(left.asi8, right.asi8)
+    out = []
+    for slot, moment in zip(slots, right.asi8):
+        if slot <= 0:
+            out.append(0)
+        elif slot >= len(left):
+            out.append(len(left) - 1)
+        else:
+            before, after = left.asi8[slot - 1], left.asi8[slot]
+            out.append(int(slot - 1 if (moment - before) <= (after - moment) else slot))
+    return out[0] if single else out
+
+
 def _tick_every(count: int) -> int:
     """Roughly a dozen labels, on a round number of bars."""
     target = max(1, count // 12)
@@ -17594,7 +17917,11 @@ def _compound(values) -> float:
     return float((1.0 + series / 100.0).prod() - 1.0) * 100.0
 
 
-def returns_heatmap(series: pd.Series, title: str, light: bool = False):
+DISPLAY_TZ = "Asia/Kolkata"
+
+
+def returns_heatmap(series: pd.Series, title: str, light: bool = False,
+                    display_tz: str = DISPLAY_TZ):
     """
     Returns laid out on the two axes that actually explain them.
 
@@ -17613,11 +17940,25 @@ def returns_heatmap(series: pd.Series, title: str, light: bool = False):
     if values.empty:
         return None, pd.DataFrame()
     index = pd.DatetimeIndex(values.index)
+
+    # EVERY series is shown on ONE clock, and that clock is the operator's.
+    # Indian equities arrive stamped Asia/Kolkata and crypto in UTC, so hour
+    # 14 meant 2pm in Mumbai on one heatmap and 7:30pm in Mumbai on the one
+    # directly beneath it. Reading those two as if they shared an axis is the
+    # whole point of putting them one above the other, and it was wrong.
+    # A naive index is assumed to be UTC and converted like any other.
+    try:
+        index = (index.tz_localize("UTC") if index.tz is None
+                 else index).tz_convert(display_tz)
+    except Exception:                                               # noqa: BLE001
+        pass
+    zone = str(getattr(index, "tz", "") or "").split("/")[-1] or "local"
+
     intraday = bool(len(index) > 2 and (index[1:] - index[:-1]).min()
                     < pd.Timedelta(hours=23))
 
     if intraday:
-        row_name, col_name = "Hour", "Weekday"
+        row_name, col_name = f"Hour ({zone})", "Weekday"
         col_labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
         grid = pd.DataFrame({"r": index.hour, "c": index.dayofweek,
                              "v": values.to_numpy(float)})
@@ -17705,7 +18046,8 @@ def returns_bar(series: pd.Series, title: str, light: bool = False, height: int 
     return figure
 
 
-def studio_stack(panels: list, light: bool = False, row_height: int = 300):
+def studio_stack(panels: list, light: bool = False, row_height: int = 300,
+                 max_bars: int | None = 180):
     """
     Several candle charts stacked on ONE shared time axis.
 
@@ -17731,6 +18073,15 @@ def studio_stack(panels: list, light: bool = False, row_height: int = 300):
     # a crypto one 00:00 UTC, so intersecting the raw indices finds NOTHING in
     # common and would throw away two of the three panels -- which is exactly
     # what it did before this was written down.
+    # A CANDLE NEEDS ROOM TO BE A CANDLE. Two months of 15-minute data is
+    # about sixteen hundred bars; drawn in a panel twelve hundred pixels wide
+    # that is under a pixel each, and the result is a smear that cannot be
+    # read as candles at all -- which is exactly what it looked like. Showing
+    # the most recent slice at a readable width beats showing everything at a
+    # width that shows nothing, and the caller says how many bars are left out.
+    if max_bars:
+        usable = [(label, frame.tail(int(max_bars))) for label, frame in usable]
+
     lengths = {len(frame) for _label, frame in usable}
     if len(lengths) > 1:
         shared = None
@@ -18118,11 +18469,30 @@ def tab_chart_studio(cfg: dict) -> None:
     # ---- the bar by bar record ---------------------------------------------
     st.markdown("#### Candle by candle")
     table = frame.copy()
+    # The weekday, named, before the numbers. Shown in the operator's own
+    # clock so a 09:15 Mumbai candle does not read as Sunday because the feed
+    # stamped it 03:45 UTC.
+    stamps = pd.DatetimeIndex(table.index)
+    try:
+        local = (stamps.tz_localize("UTC") if stamps.tz is None
+                 else stamps).tz_convert(DISPLAY_TZ)
+    except Exception:                                               # noqa: BLE001
+        local = stamps
+    table.insert(len(table.columns), "Day", list(local.day_name()))
     table["Points"] = (table["Close"] - table["Open"]).round(2)
     table["Change %"] = ((table["Close"] / table["Open"] - 1.0) * 100.0).round(3)
     table["Move from previous close"] = (table["Close"] - table["Close"].shift(1)).round(2)
     table["Return %"] = (table["Close"].pct_change() * 100.0).round(3)
     table = table.reset_index().rename(columns={table.index.name or "index": "Datetime"})
+    # Datetime, then the day it fell on, then the price columns, then the
+    # movement columns -- so the day is read before the numbers it explains.
+    ordered = (["Datetime", "Day"]
+               + [c for c in ("Open", "High", "Low", "Close", "Volume")
+                  if c in table.columns]
+               + [c for c in table.columns
+                  if c not in {"Datetime", "Day", "Open", "High", "Low", "Close",
+                               "Volume"}])
+    table = table[[c for c in ordered if c in table.columns]]
     newest_first = st.checkbox("Newest first", value=True, key="studio_order")
     shown = table.iloc[::-1] if newest_first else table
 
@@ -18418,6 +18788,16 @@ def tab_chart_studio(cfg: dict) -> None:
     st.caption("Reading three charts spread down a scrolling page is hard. This stacks "
                "them on one shared time axis, so a move in the ratio can be traced "
                "straight up to the leg that caused it.")
+    sb1, sb2 = st.columns([1, 2])
+    stack_bars = sb1.number_input("Candles in the stacked view", 40, 400, 160, 20,
+                                  key="studio_stack_bars",
+                                  help="The most recent N candles. A candle needs a few "
+                                       "pixels of width to be readable as a candle; packing "
+                                       "a thousand of them into one panel gives a smear, "
+                                       "not a chart.")
+    sb2.caption(f"There are {len(joined)} matched candles in this window. The stacked view "
+                f"shows the most recent {min(int(stack_bars), len(joined))} of them at a "
+                f"width you can actually read; scroll-zoom inside it to move around.")
     if st.button(f"Compare {ticker}, {second} and the ratio side by side",
                  key="studio_stack_btn", width="stretch", type="primary"):
         @st.dialog("Three charts, one time axis", width="large")
@@ -18435,12 +18815,18 @@ def tab_chart_studio(cfg: dict) -> None:
             figure = studio_stack([(f"{ticker} (numerator)", numerator),
                                    (f"{second} (denominator)", denominator),
                                    (f"{ticker} / {second} (ratio)", ratio)],
-                                  light=bool(cfg.get("light_charts")), row_height=300)
+                                  light=bool(cfg.get("light_charts")), row_height=330,
+                                  max_bars=int(stack_bars))
             if figure is None:
                 st.info("Nothing to stack.")
                 return
             st.plotly_chart(figure, width="stretch",
                             config={"scrollZoom": True, "displaylogo": False})
+            if len(joined) > int(stack_bars):
+                st.caption(f"Showing the most recent {int(stack_bars)} of "
+                           f"{len(joined)} matched candles, so each one is wide enough "
+                           f"to read. Raise the count outside this window to see further "
+                           f"back, at the cost of candle width.")
             st.markdown("**How to read this.** The axis is shared, so zooming or panning "
                         "any panel moves all three. When the ratio turns, look directly "
                         "above it: if the numerator turned too, the move is news about "
@@ -21637,6 +22023,218 @@ def pytest_approx(value, tolerance=1e-9):
     return _Close()
 
 
+def _test_every_chart_is_gapless():
+    """
+    EVERY candlestick in the application sits on bar positions, not a calendar.
+
+    One chart left on a datetime axis is worse than none converted, because the
+    operator then has to remember which tabs they can trust. A 15-minute Indian
+    equity packs twenty-five candles into each twenty-four-hour day, so on a
+    calendar axis roughly nine tenths of the chart is night and weekend and the
+    candles are unreadable slivers -- and anything drawn across that whitespace,
+    a trendline or a neckline, arrives in pieces.
+
+    The bench builds a frame with that exact shape and checks every chart
+    builder in the file.
+    """
+    stamps, day = [], pd.Timestamp("2026-10-01 09:15", tz="Asia/Kolkata")
+    while len(stamps) < 300:
+        if day.dayofweek < 5:
+            stamps += [day + pd.Timedelta(minutes=15 * k) for k in range(25)]
+        day = (day + pd.Timedelta(days=1)).normalize() + pd.Timedelta(hours=9, minutes=15)
+    index = pd.DatetimeIndex(stamps[:300])
+    rng = np.random.default_rng(3)
+    close = pd.Series(2350.0 * np.exp(np.cumsum(rng.normal(-0.0004, 0.002, 300))),
+                      index=index)
+    frame = pd.DataFrame({"Open": close.shift(1).fillna(close.iloc[0]),
+                          "High": close * 1.003, "Low": close * 0.997,
+                          "Close": close,
+                          "Volume": rng.integers(1e4, 1e5, 300).astype(float)},
+                         index=index)
+    frame["High"] = frame[["Open", "High", "Close"]].max(axis=1)
+    frame["Low"] = frame[["Open", "Low", "Close"]].min(axis=1)
+    calendar_days = (index[-1] - index[0]).days
+    assert calendar_days > 10, "the fixture must span weekends to be meaningful"
+
+    def check(figure, bars, name):
+        candles = [t for t in figure.data if t.type == "candlestick"]
+        assert candles, f"{name} drew no candles"
+        for trace in candles:
+            xs = np.asarray(trace.x, float)
+            assert xs.min() >= 0 and xs.max() <= bars, (name, xs.min(), xs.max())
+            assert np.all(np.diff(xs) == 1.0), \
+                f"{name} left gaps between candles, so it is still on a calendar"
+            assert trace.customdata is not None, \
+                f"{name} lost the real timestamps, so its hover is useless"
+        axis = figure.layout.xaxis
+        assert axis.zeroline is False, f"{name} would rule a line down its first candle"
+        assert not axis.rangebreaks, \
+            f"{name} still declares rangebreaks, which only a calendar axis needs"
+
+    # 1. the backtest / live chart, with overlays and trade markers
+    with_ema = frame.copy()
+    with_ema["ema_fast"], with_ema["ema_slow"] = (ema(frame["Close"], 9),
+                                                  ema(frame["Close"], 21))
+    trades = pd.DataFrame({
+        "Direction": ["LONG", "SHORT"],
+        "Entry Time": [index[40], index[120]], "Entry Price": [float(close.iloc[40]),
+                                                               float(close.iloc[120])],
+        "Exit Time": [index[70], index[160]], "Exit Price": [float(close.iloc[70]),
+                                                             float(close.iloc[160])],
+        "Exit Reason": ["target", "stop"], "PnL": [120.0, -40.0]})
+    chart = price_chart(with_ema, "price", trades=trades, ema_lengths={"fast": 9, "slow": 21})
+    check(chart, 300, "price_chart")
+    # A fill must be placed on the candle it actually happened on.
+    markers = [t for t in chart.data if getattr(t, "mode", None) == "markers"]
+    assert markers, "the trade markers vanished"
+    assert 39 <= float(np.asarray(markers[0].x, float)[0]) <= 41, markers[0].x
+
+    # 2. the Chart Patterns screener. draw_pattern slices the frame, so the
+    #    bar count it is checked against is the slice, not the whole window.
+    hits = detect_patterns(frame)
+    drew = 0
+    for hit in hits[:5]:
+        figure = draw_pattern(frame, hit)
+        bars = len(figure.data[0].x)
+        check(figure, bars, f"draw_pattern/{hit.pattern}")
+        # The pattern's own geometry is stamped with wall-clock times; every
+        # piece of it must be mapped onto a candle in the slice, or it is
+        # drawn off the end of an axis that counts bars.
+        for trace in figure.data[1:]:
+            for x in (trace.x or []):
+                assert 0 <= float(x) <= bars, (hit.pattern, x, bars)
+        for shape in (figure.layout.shapes or []):
+            for edge in (shape.x0, shape.x1):
+                if edge is not None and shape.xref not in ("paper",):
+                    assert 0 <= float(edge) <= bars, (hit.pattern, edge, bars)
+        drew += 1
+    assert drew > 0, "no pattern fired on the fixture, so nothing was checked"
+
+    # 3. the SMC chart
+    analysis = smc_analyse(frame, 3, 3, 150)
+    check(smc_chart(frame, analysis, "smc", bars=160), 160, "smc_chart")
+
+    # 4. Make or Break
+    ctx = mb_context(frame, 120, 3, 0.5)
+    assert ctx is not None
+    for key, label, fn in MAKE_BREAK_SETUPS:
+        hit = fn(ctx)
+        if hit:
+            check(mb_setup_chart(ctx, hit, mb_plan(ctx, hit), label), ctx.lookback,
+                  f"mb_setup_chart/{key}")
+
+    # 5. Chart Studio, and the momentum-pulse chart
+    check(studio_chart(frame, "studio"), 300, "studio_chart")
+    pulse_row = {"OR High": float(frame["High"].iloc[:3].max()),
+                 "OR Low": float(frame["Low"].iloc[:3].min()),
+                 "Day High": float(frame["High"].max()),
+                 "Day Low": float(frame["Low"].min()),
+                 "PDH": float(close.iloc[-30]), "PDL": float(close.iloc[-60]),
+                 "Bullish": "6/11", "Bearish": "2/11"}
+    pulse = pulse_chart(frame, pulse_row, "pulse")
+    check(pulse, 300, "pulse_chart")
+    # The levels the checklist tested must actually BE on the chart, or the
+    # picture is not of the row above it.
+    drawn_levels = {round(float(shape.y0), 4) for shape in (pulse.layout.shapes or [])
+                    if shape.type == "line"}
+    for name in ("OR High", "Day Low", "PDH"):
+        value = round(float(pulse_row[name]), 4)
+        low, high = float(frame["Low"].min()), float(frame["High"].max())
+        if low <= value <= high:
+            assert any(abs(value - drawn) < 0.01 for drawn in drawn_levels), \
+                f"{name} was tested but not drawn"
+
+    # 6. Gamma Blast: three stacked panels, one shared position axis, and the
+    #    open-interest readings placed on the candles they were taken during.
+    oi_times = [index[-20], index[-10], index[-1]]
+    spots = position_of(index, oi_times)
+    assert spots == [280, 290, 299], spots
+    assert position_of(index, index[0] - pd.Timedelta(days=30)) == 0, "before the start"
+    assert position_of(index, index[-1] + pd.Timedelta(days=30)) == 299, "after the end"
+    # Nearest really means nearest, not next.
+    midpoint = index[50] + pd.Timedelta(minutes=4)
+    assert position_of(index, midpoint) == 50, position_of(index, midpoint)
+    assert position_of(index, index[50] + pd.Timedelta(minutes=11)) == 51
+
+    print(f"   gapless charts: price, {drew} pattern, SMC, make-or-break, studio and pulse "
+          f"charts all on bar positions over a {calendar_days}-day intraday span; "
+          f"fills and OI readings land on their own candle  OK")
+
+
+def _test_pulse_on_higher_timeframes():
+    """
+    The pulse checklist on 1d, 1wk and 1mo, where there is no session.
+
+    Several of these tests are intraday ideas. On a weekly chart "today's low"
+    and "the opening range" do not exist, and the dangerous failure is not an
+    exception -- it is a number that looks fine and means nothing. Each one is
+    restated as the thing it actually means on that timeframe, and the row says
+    which reading it used.
+    """
+    real_st = globals()["st"]
+    globals()["st"] = _FakeStreamlit()
+    saved = {"load_market_data": globals()["load_market_data"]}
+    try:
+        rng = np.random.default_rng(6)
+        index = pd.date_range("2024-01-01", periods=420, freq="1D", tz="Asia/Kolkata")
+        close = pd.Series(1000.0 * np.exp(np.cumsum(rng.normal(0.0008, 0.012, 420))),
+                          index=index)
+        daily = pd.DataFrame({"Open": close.shift(1).fillna(close.iloc[0]),
+                              "High": close * 1.008, "Low": close * 0.992,
+                              "Close": close, "Volume": 1e6}, index=index)
+        daily["High"] = daily[["Open", "High", "Close"]].max(axis=1)
+        daily["Low"] = daily[["Open", "Low", "Close"]].min(axis=1)
+        globals()["load_market_data"] = lambda *a, **k: DataBundle(
+            frame=daily.copy(), symbol="T.NS", interval="1d", period="2y")
+        pcfg = {"or_bars": 3, "vol_mult": 1.5, "range_mult": 1.0, "vol_len": 20,
+                "range_len": 10, "near_pct": 0.25, "extras": []}
+
+        for interval in ("1d", "1wk", "1mo"):
+            row = momentum_pulse_scan_one("T.NS", interval, pcfg)
+            assert row["Reading"] == "per candle", (interval, row["Reading"])
+            assert row["Bull of"] == row["Bear of"] == 11, row
+            assert 0 <= row["Bull count"] <= 11 and 0 <= row["Bear count"] <= 11, row
+            for name in PULSE_BULL:
+                assert row[f"B:{name}"] in ("YES", "NO"), (interval, name)
+            # "Previous day" is the previous CANDLE here, so it must be a real
+            # earlier level and not this candle's own.
+            assert row["PDH"] is not None and row["PDL"] is not None, row
+            assert row["PDH"] >= row["PDL"], row
+            # Day high/low is this candle's own range, so price sits inside it.
+            assert row["Day Low"] <= row["Price"] <= row["Day High"], row
+            # And with over a year of daily data the calendar levels exist.
+            assert row["PWH"] is not None and row["PMH"] is not None, (interval, row)
+
+        # An intraday scan on the same engine must still say it used sessions.
+        stamps, day = [], pd.Timestamp("2026-10-01 09:15", tz="Asia/Kolkata")
+        while len(stamps) < 300:
+            if day.dayofweek < 5:
+                stamps += [day + pd.Timedelta(minutes=15 * k) for k in range(25)]
+            day = (day + pd.Timedelta(days=1)).normalize() \
+                + pd.Timedelta(hours=9, minutes=15)
+        intra_index = pd.DatetimeIndex(stamps[:300])
+        intra_close = pd.Series(np.linspace(1000.0, 1080.0, 300), index=intra_index)
+        intraday = pd.DataFrame({"Open": intra_close, "High": intra_close * 1.002,
+                                 "Low": intra_close * 0.998, "Close": intra_close,
+                                 "Volume": 1e5}, index=intra_index)
+        globals()["load_market_data"] = lambda *a, **k: DataBundle(
+            frame=intraday.copy(), symbol="T.NS", interval="15m", period="60d")
+        intra_row = momentum_pulse_scan_one("T.NS", "15m", pcfg)
+        assert intra_row["Reading"] == "session", intra_row["Reading"]
+        # On an intraday frame the day's range is ONE session, so it must be
+        # much narrower than the whole window -- the proof the session split
+        # is really happening.
+        window_span = float(intraday["High"].max() - intraday["Low"].min())
+        day_span = intra_row["Day High"] - intra_row["Day Low"]
+        assert day_span < window_span * 0.5, (day_span, window_span)
+        print(f"   pulse on higher timeframes: 1d/1wk/1mo restate the session tests per "
+              f"candle and say so; intraday still splits sessions "
+              f"({day_span:.1f} of {window_span:.1f} points)  OK")
+    finally:
+        globals()["st"] = real_st
+        globals().update(saved)
+
+
 def _test_setup_drawing_and_zones():
     """
     The drawn setup must match the row it sits under, and the geometry it
@@ -21925,7 +22523,8 @@ def _test_studio_second_leg_and_insights():
     assert grid is not None and not grid.empty
     assert all(isinstance(label, str) for label in grid.index), list(grid.index)[:3]
     assert all(isinstance(label, str) for label in grid.columns), list(grid.columns)[:3]
-    assert grid.index.name in ("Year", "Hour") and grid.columns.name in ("Month", "Weekday")
+    assert grid.index.name in ("Year",) or str(grid.index.name).startswith("Hour (")
+    assert grid.columns.name in ("Month", "Weekday")
 
     bins_table = pd.DataFrame({"Bin": [1, 2], "From": [index[0], index[100]],
                                "To": [index[99], index[-1]],
@@ -22057,7 +22656,11 @@ def _test_chart_studio_alignment_and_bins():
     assert hourly_fig is not None
     # The grid carries the same labels the chart shows, so a cell can be named
     # in prose: "Mon / 05:00", not "0 / 5".
-    assert hourly_grid.index.name == "Hour" and hourly_grid.columns.name == "Weekday"
+    # The hour axis NAMES its timezone, because an hour number is meaningless
+    # without one -- and every series is converted to that one clock first.
+    assert hourly_grid.index.name.startswith("Hour ("), hourly_grid.index.name
+    assert "Kolkata" in hourly_grid.index.name, hourly_grid.index.name
+    assert hourly_grid.columns.name == "Weekday"
     assert all(len(label) == 5 and label.endswith(":00") and label[:2].isdigit()
                for label in hourly_grid.index), list(hourly_grid.index)
     assert set(hourly_grid.columns) <= {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"}, \
@@ -22086,6 +22689,31 @@ def _test_chart_studio_alignment_and_bins():
     assert max(red, green, blue) - min(red, green, blue) < 12, (
         f"the diverging midpoint must be neutral grey, not a hue ({midpoint})")
     assert returns_heatmap(pd.Series(dtype=float), "empty")[0] is None
+
+    # ONE CLOCK FOR EVERY HEATMAP. An Indian feed arrives stamped
+    # Asia/Kolkata and a crypto feed in UTC, so hour 14 used to mean 2pm in
+    # Mumbai on one heatmap and 7:30pm in Mumbai on the one directly beneath
+    # it. Stacking those and reading across them is the entire point, and it
+    # was wrong. A spike at a given real moment must land in the same row
+    # whichever timezone the feed happened to use to describe it.
+    moment = pd.Timestamp("2026-10-01 09:00", tz="UTC")       # 14:30 in Mumbai
+    utc_index = pd.date_range("2026-10-01", periods=120, freq="1h", tz="UTC")
+    in_utc = pd.Series(np.where(utc_index == moment, 5.0, 0.0), index=utc_index)
+    _uf, utc_grid = returns_heatmap(in_utc, "crypto feed")
+    in_ist = in_utc.copy()
+    in_ist.index = utc_index.tz_convert("Asia/Kolkata")       # same moments, new labels
+    _if, ist_grid = returns_heatmap(in_ist, "indian feed")
+    def _spike(grid):
+        return sorted({row for row in grid.index for column in grid.columns
+                       if np.isfinite(grid.loc[row, column])
+                       and grid.loc[row, column] > 1.0})
+    assert _spike(utc_grid) == _spike(ist_grid) == ["14:00"], \
+        (_spike(utc_grid), _spike(ist_grid))
+    # A naive index is read as UTC and converted like any other, rather than
+    # being left on whatever clock it implied.
+    naive_series = in_utc.copy()
+    naive_series.index = utc_index.tz_localize(None)
+    assert _spike(returns_heatmap(naive_series, "naive")[1]) == ["14:00"]
 
     # The workbook must really build, with timezones stripped -- Excel cannot
     # store a tz-aware timestamp and raises if asked to.
@@ -22844,6 +23472,8 @@ def run_selftest() -> int:
         _test_chart_studio_alignment_and_bins()
         _test_setup_drawing_and_zones()
         _test_signal_freshness_and_cell_arithmetic()
+        _test_every_chart_is_gapless()
+        _test_pulse_on_higher_timeframes()
         _test_studio_second_leg_and_insights()
         _test_sweep_progress_is_visible_and_rerun_is_deferred()
         print("-- filters --")
