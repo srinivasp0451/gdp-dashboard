@@ -9211,6 +9211,63 @@ def _geometric_hits(f: pd.DataFrame, pivots: list, wanted: set[str], tol: float)
             else:
                 add("Broadening top", "Reversal", "either", conf, close[conf], stop_up, geo)
         elif narrowing:
+            # TRIANGLES, which the wedge classification above cannot name.
+            #
+            # A wedge has both envelopes sloping the SAME way; a triangle has
+            # one of them flat, or the two sloping towards each other. They
+            # resolve differently -- an ascending triangle is a continuation
+            # that breaks up, a rising wedge is a reversal that breaks down --
+            # so calling both "narrowing" and leaving it there loses the only
+            # part a trader acts on.
+            #
+            # "Flat" is measured against the envelope's own width rather than
+            # against zero: a line that drifts less than a tenth of the range
+            # across the whole formation is flat to the eye, and an absolute
+            # slope threshold would mean something different on a 200-rupee
+            # stock and on a 24,000-point index.
+            # A line only counts if the pivots actually SIT on it, and the
+            # formation only counts if it really converges. Without both tests
+            # this fired on 60-85% of random walks -- four pivots can always be
+            # fitted with a line, and "narrower than it was" is true of most
+            # stretches of most charts. Measured, these two gates take the
+            # triangles down to a few per cent.
+            hi_x = [p[0] for p in hi3]
+            lo_x = [p[0] for p in lo3]
+            hi_res = max(abs(p[1] - (hs * p[0] + hi_c)) for p in hi3)
+            lo_res = max(abs(p[1] - (ls * p[0] + lo_c)) for p in lo3)
+            tight = max(hi_res, lo_res) <= 0.18 * width0
+            long_enough = (i1 - i0) >= 20 and len(lo3) >= 3
+            converging = width1 <= 0.55 * width0
+            # The apex must still be ahead: a triangle whose lines have already
+            # crossed is a drawing, not a formation.
+            closing_rate = (width0 - width1) / max(i1 - i0, 1)
+            bars_to_apex = width1 / closing_rate if closing_rate > 0 else float("inf")
+            live = 2 <= bars_to_apex <= 4 * (i1 - i0)
+
+            flat_enough = (width0 / max(i1 - i0, 1)) * 0.12
+            upper_flat = abs(hs) <= flat_enough
+            lower_flat = abs(ls) <= flat_enough
+            apex = stop_dn if close[conf] > stop_dn else stop_up
+            if not (tight and long_enough and converging and live
+                    and max(hi_x) > min(hi_x) and max(lo_x) > min(lo_x)):
+                pass                      # not a triangle; the wedge tests below still run
+            elif upper_flat and ls > 0:
+                # Flat resistance, rising lows: buyers paying up into a fixed
+                # supply shelf.
+                add("Ascending triangle", "Continuation", "bullish", conf, close[conf],
+                    stop_dn, geo, measured=width0)
+            elif lower_flat and hs < 0:
+                add("Descending triangle", "Continuation", "bearish", conf, close[conf],
+                    stop_up, geo, measured=width0)
+            elif hs < 0 and ls > 0:
+                # Both converging on each other: direction genuinely unknown
+                # until one side gives, which is what "either" means here.
+                add("Symmetrical triangle", "Continuation", "either", conf, close[conf],
+                    apex, geo, measured=width0)
+
+            # The existing classification is untouched and still runs, so a
+            # shape that is both a symmetrical triangle and a pennant reports
+            # as both rather than one silently replacing the other.
             if hs > 0 and ls > 0:
                 add("Rising wedge", "Reversal", "bearish", conf, close[conf], stop_up, geo)
             elif hs < 0 and ls < 0:
@@ -9407,7 +9464,8 @@ def _build_catalog() -> dict[str, str]:
                  "Island reversal top", "Island reversal bottom"):
         cat[name] = "Reversal"
     for name in ("Pennant", "Bull flag", "Bear flag", "Volatility contraction (VCP)",
-                 "Ascending channel break", "Descending channel break"):
+                 "Ascending channel break", "Descending channel break",
+                 "Ascending triangle", "Descending triangle", "Symmetrical triangle"):
         cat[name] = "Continuation"
     for name in ("Trendline breakout", "Trendline breakout + retest", "Trendline breakdown",
                  "Trendline breakdown + retest", "Fair value gap (bullish)",
@@ -16472,44 +16530,121 @@ def mb_compression(ctx: MBContext):
                         "zone": (ctx.range_low, ctx.range_high, "compression range")})
 
 
-def mb_triangle(ctx: MBContext):
-    """Converging highs and lows, with the apex close."""
-    if len(ctx.pivot_highs) < 2 or len(ctx.pivot_lows) < 2:
+def _mb_triangle(ctx: MBContext):
+    """
+    The shared measurement behind all three triangles.
+
+    Returns the fitted envelopes and which kind of triangle they describe, or
+    None. The three detectors below differ only in which kind they accept, so
+    the geometry is measured once and the classification happens once --
+    otherwise the three would be free to disagree about the same chart.
+
+    A triangle is distinguished from a WEDGE by the direction of its two
+    lines. A wedge has both sloping the same way and is a reversal; a triangle
+    has one flat or the two converging on each other, and is a continuation.
+    They break opposite ways, so the distinction is the whole point.
+    """
+    if len(ctx.pivot_highs) < 3 or len(ctx.pivot_lows) < 3:
         return None
-    hx = np.array([p for p, _v in ctx.pivot_highs], float)
-    hy = np.array([v for _p, v in ctx.pivot_highs], float)
-    lx = np.array([p for p, _v in ctx.pivot_lows], float)
-    ly = np.array([v for _p, v in ctx.pivot_lows], float)
-    try:
-        hs = float(np.polyfit(hx, hy, 1)[0])
-        ls = float(np.polyfit(lx, ly, 1)[0])
-    except Exception:                                               # noqa: BLE001
+    high_fit = _mb_fit_line(ctx.pivot_highs[-5:])
+    low_fit = _mb_fit_line(ctx.pivot_lows[-5:])
+    if high_fit is None or low_fit is None:
         return None
-    if not (np.isfinite(hs) and np.isfinite(ls)):
+    hs, hi_c, h_worst = high_fit
+    ls, lo_c, l_worst = low_fit
+    # The pivots have to SIT on their lines. Any four points can be fitted
+    # with a line; a triangle is a claim that the market respected one.
+    if max(h_worst, l_worst) > 0.9 * ctx.atr:
         return None
-    converging = (hs < 0 and ls > 0) or (abs(hs) < 1e-9 and ls > 0) or \
-                 (hs < 0 and abs(ls) < 1e-9)
-    if not converging:
-        return None
+
     gap_now = float(ctx.highs[-10:].max() - ctx.lows[-10:].min())
     gap_then = float(ctx.highs[:20].max() - ctx.lows[:20].min())
     if gap_then <= 0 or gap_now / gap_then > 0.7:
         return None
-    kind = ("Symmetrical" if hs < 0 and ls > 0 else
-            "Descending" if hs < 0 else "Ascending")
-    height = gap_then
+
+    # "Flat" against the instrument's own scale, not against zero: a line
+    # drifting under a tenth of an ATR per candle is flat to the eye, and an
+    # absolute threshold would mean different things on a stock and an index.
+    flat = 0.10 * ctx.atr / max(ctx.lookback, 1) * 10.0
+    upper_flat, lower_flat = abs(hs) <= flat, abs(ls) <= flat
+    if upper_flat and ls > flat:
+        kind, side = "Ascending", "UP"
+    elif lower_flat and hs < -flat:
+        kind, side = "Descending", "DOWN"
+    elif hs < -flat and ls > flat:
+        kind, side = "Symmetrical", "EITHER"
+    else:
+        return None                   # both sloping the same way: a wedge
+    return {"kind": kind, "side": side, "hs": hs, "ls": ls, "hi_c": hi_c, "lo_c": lo_c,
+            "gap_now": gap_now, "gap_then": gap_then}
+
+
+def _mb_triangle_hit(ctx: MBContext, want: str):
+    """One kind of triangle, or nothing."""
+    found = _mb_triangle(ctx)
+    if not found or found["kind"] != want:
+        return None
+    gap_now, gap_then = found["gap_now"], found["gap_then"]
+    top = float(ctx.highs[-10:].max())
+    bottom = float(ctx.lows[-10:].min())
     score = 50.0 + 45.0 * (1.0 - gap_now / gap_then)
-    return _hit(f"{kind} triangle at the apex", "EITHER", score,
-                f"highs sloping {hs:+.4f} and lows {ls:+.4f} per candle have narrowed the "
-                f"range from {fmt(gap_then)} to {fmt(gap_now)}",
-                trigger=float(ctx.highs[-10:].max()) + 0.25 * ctx.atr,
-                invalidation=float(ctx.lows[-10:].min()) - 0.25 * ctx.atr,
-                objective=float(ctx.highs[-10:].max()) + height,
-                bars_ago=0,                       # the apex is where it is now
-                extras={"level": float(ctx.highs[-10:].max()),
-                        "lower": float(ctx.lows[-10:].min()),
-                        "lines": [(hs, float(np.polyfit(hx, hy, 1)[1]), "upper line"),
-                                  (ls, float(np.polyfit(lx, ly, 1)[1]), "lower line")]})
+    reading = {
+        "Ascending": (f"a flat resistance shelf near {fmt(top)} with lows rising "
+                      f"{found['ls']:+.4f} per candle — buyers paying up into a fixed "
+                      f"supply, which breaks up more often than down"),
+        "Descending": (f"a flat support shelf near {fmt(bottom)} with highs falling "
+                       f"{found['hs']:+.4f} per candle — sellers accepting less each "
+                       f"time, which breaks down more often than up"),
+        "Symmetrical": (f"highs falling {found['hs']:+.4f} and lows rising "
+                        f"{found['ls']:+.4f} per candle, converging on each other with "
+                        f"no side in control"),
+    }[want]
+    return _hit(
+        f"{want} triangle at the apex", found["side"], score,
+        f"{reading}; the range has narrowed from {fmt(gap_then)} to {fmt(gap_now)}",
+        trigger=(top + 0.25 * ctx.atr) if found["side"] != "DOWN"
+        else (bottom - 0.25 * ctx.atr),
+        invalidation=(bottom - 0.25 * ctx.atr) if found["side"] != "DOWN"
+        else (top + 0.25 * ctx.atr),
+        objective=(top + gap_then) if found["side"] != "DOWN" else (bottom - gap_then),
+        bars_ago=0,                       # the apex is where it is now
+        extras={"level": top if found["side"] != "DOWN" else bottom,
+                "level_name": "apex high" if found["side"] != "DOWN" else "apex low",
+                "lower": bottom,
+                "lines": [(found["hs"], found["hi_c"], "upper line"),
+                          (found["ls"], found["lo_c"], "lower line")],
+                "marks": [(p, v, "") for p, v in ctx.pivot_highs[-5:]]
+                         + [(p, v, "") for p, v in ctx.pivot_lows[-5:]]})
+
+
+def mb_ascending_triangle(ctx: MBContext):
+    """Flat resistance, rising lows."""
+    return _mb_triangle_hit(ctx, "Ascending")
+
+
+def mb_descending_triangle(ctx: MBContext):
+    """Falling highs, flat support."""
+    return _mb_triangle_hit(ctx, "Descending")
+
+
+def mb_symmetrical_triangle(ctx: MBContext):
+    """Both lines converging, direction undecided."""
+    return _mb_triangle_hit(ctx, "Symmetrical")
+
+
+def mb_triangle(ctx: MBContext):
+    """
+    Any converging triangle, kept so the original `triangle` key still works.
+
+    Not registered in the setup list -- the three above are, so each can be
+    screened for on its own. This stays because saved sidebar selections and
+    the test bench refer to it by name.
+    """
+    for kind in ("Ascending", "Descending", "Symmetrical"):
+        hit = _mb_triangle_hit(ctx, kind)
+        if hit:
+            return hit
+    return None
 
 
 def _prior_extreme(ctx: MBContext, bars_back: int):
@@ -17307,7 +17442,9 @@ MAKE_BREAK_SETUPS = [
     ("at_support", "At support", mb_at_support),
     ("multi_touch", "Multi-touch level (3+)", mb_multi_touch),
     ("compression", "Compression / accumulation", mb_compression),
-    ("triangle", "Converging triangle at apex", mb_triangle),
+    ("triangle_asc", "Ascending triangle (flat resistance)", mb_ascending_triangle),
+    ("triangle_desc", "Descending triangle (flat support)", mb_descending_triangle),
+    ("triangle_sym", "Symmetrical triangle at apex", mb_symmetrical_triangle),
     ("breakout_retest", "Breakout + retest holding", mb_breakout_retest),
     ("breakdown_retest", "Breakdown + retest rejecting", mb_breakdown_retest),
     ("equal_highs", "Equal highs", mb_equal_highs),
@@ -17326,6 +17463,9 @@ MAKE_BREAK_SETUPS = [
     ("inv_cup_handle", "Inverted cup and handle", mb_inverted_cup_and_handle),
 ]
 MAKE_BREAK_BY_KEY = {key: (label, fn) for key, label, fn in MAKE_BREAK_SETUPS}
+# The combined triangle is still addressable by its original key, so a saved
+# selection or a stored scan row from before the split still resolves.
+MAKE_BREAK_BY_KEY.setdefault("triangle", ("Converging triangle at apex", mb_triangle))
 
 
 def mb_confirmations(ctx: MBContext, direction: str) -> tuple[float, list[str]]:
@@ -21633,6 +21773,25 @@ def _test_make_break_detectors():
         _mb_wiggle(100, 260, 18, 9) + [100 + 0.25 * math.sin(i / 4) for i in range(120)])
     triangle = [100 + 18.0 * (1 - i / 125.0) * math.sin(i / 7) for i in range(120)]
     shapes["triangle"] = _mb_fixture(_mb_wiggle(100, 180, 18, 9) + triangle)
+
+    # The three triangles, each as its own shape. They are told apart by which
+    # line is FLAT, and that is the distinction the wedge classification cannot
+    # make -- a wedge has both lines sloping the same way and breaks the other
+    # way, so mixing them up inverts the trade.
+    def _triangle(upper, lower, bars=110, period=13):
+        """Price swinging between two envelopes, touching each at the turns."""
+        closes = []
+        for i in range(bars):
+            high_at, low_at = upper(i), lower(i)
+            phase = math.sin(2 * math.pi * i / period)
+            closes.append(low_at + (high_at - low_at) * (0.5 + 0.5 * phase))
+        return _mb_fixture(closes, [c + 0.25 for c in closes],
+                           [c - 0.25 for c in closes])
+
+    shapes["triangle_asc"] = _triangle(lambda i: 120.0, lambda i: 100.0 + 0.16 * i)
+    shapes["triangle_desc"] = _triangle(lambda i: 120.0 - 0.16 * i, lambda i: 100.0)
+    shapes["triangle_sym"] = _triangle(lambda i: 120.0 - 0.085 * i,
+                                       lambda i: 100.0 + 0.085 * i)
     base = _mb_wiggle(100, 220, 6, 9)
     shapes["breakout_retest"] = _mb_fixture(
         base + list(np.linspace(106, 118, 12)) + list(np.linspace(118, 107, 10)))
@@ -21773,11 +21932,35 @@ def _test_make_break_detectors():
     trending = {"trendline_test", "parallel_channel", "trendline_retest"}
     pattern_contexts = {name: ctx for name, ctx in contexts.items()
                         if name not in trending}
-    for key in ("compression", "triangle", "breakout_retest", "breakdown_retest",
+    triangle_shapes = {"triangle", "triangle_asc", "triangle_desc", "triangle_sym"}
+    for key in ("compression", "breakout_retest", "breakdown_retest",
                 "failed_breakdown", "failed_breakout"):
         _label, fn = MAKE_BREAK_BY_KEY[key]
         fired = [name for name, ctx in pattern_contexts.items() if fn(ctx)]
         assert fired == [key], f"{key} should fire on its pattern shape alone, got {fired}"
+
+    # THE TRIANGLES. Each named kind must fire on its own shape and on no OTHER
+    # triangle: an ascending triangle has a flat ceiling and breaks up, a
+    # descending one has a flat floor and breaks down, and reading one as the
+    # other inverts the trade. The combined detector is the exception and must
+    # fire on all three, since that is what "any triangle" means.
+    for key, expected_side in (("triangle_asc", "UP"), ("triangle_desc", "DOWN"),
+                               ("triangle_sym", "EITHER")):
+        _label, fn = MAKE_BREAK_BY_KEY[key]
+        hit = fn(contexts[key])
+        assert hit, f"{key} missed its own shape"
+        assert hit["direction"] == expected_side, (key, hit["direction"])
+        others = [name for name in triangle_shapes
+                  if name not in (key, "triangle") and fn(contexts[name])]
+        assert not others, f"{key} also read {others} as its own kind of triangle"
+        # And it must not fire on the NON-triangle shapes either.
+        elsewhere = [name for name, ctx in pattern_contexts.items()
+                     if name not in triangle_shapes and fn(ctx)]
+        assert not elsewhere, f"{key} fired on unrelated shapes: {elsewhere}"
+
+    combined = MAKE_BREAK_BY_KEY["triangle"][1]
+    for name in ("triangle_asc", "triangle_desc", "triangle_sym"):
+        assert combined(contexts[name]), f"the combined triangle missed {name}"
 
     # The expected overlap, stated rather than assumed: a rising market trips
     # the breakout detector, and a channel's lower rail IS a rising trendline.
@@ -22516,6 +22699,173 @@ def pytest_approx(value, tolerance=1e-9):
         def __repr__(self):
             return f"~{value}"
     return _Close()
+
+
+def _test_triangle_patterns():
+    """
+    Triangles in the Chart Patterns engine, told apart from wedges.
+
+    The engine already saw narrowing envelopes but could only call them wedges
+    or a pennant. That loses the part a trader acts on: an ascending triangle
+    is a CONTINUATION that breaks up, a rising wedge is a REVERSAL that breaks
+    down, and the two look identical until you ask which line is flat.
+
+    The second half of this test is the one that matters. Any four pivots can
+    be fitted with a line and most stretches of most charts are narrower than
+    they were, so a naive converging test fires on everything -- measured, the
+    first version of this fired on 62%, 52% and 85% of random walks.
+    """
+    def envelope(bars, upper, lower, period=12):
+        """Price swinging between two lines, TOUCHING each at the turns."""
+        highs, lows = [], []
+        for i in range(bars):
+            top, bottom = upper(i), lower(i)
+            phase = math.sin(2 * math.pi * i / period)
+            middle = bottom + (top - bottom) * (0.5 + 0.5 * phase)
+            highs.append(middle + 0.25)
+            lows.append(middle - 0.25)
+        return highs, lows
+
+    def framed(highs, lows, breaks_up=True):
+        highs = list(highs) + [highs[-1] + (4 + j) * (1 if breaks_up else -1)
+                               for j in range(6)]
+        lows = list(lows) + [lows[-1] + (3 + j) * (1 if breaks_up else -1)
+                             for j in range(6)]
+        closes = [(h + l) / 2 for h, l in zip(highs, lows)]
+        return pd.DataFrame(
+            {"Open": closes, "High": highs, "Low": lows, "Close": closes,
+             "Volume": [1e6] * len(closes)},
+            index=pd.date_range("2026-01-01", periods=len(closes), freq="D",
+                                tz="Asia/Kolkata"))
+
+    shapes = {
+        "Ascending triangle": (envelope(80, lambda i: 120.0,
+                                        lambda i: 100.0 + 0.22 * i), True),
+        "Descending triangle": (envelope(80, lambda i: 120.0 - 0.22 * i,
+                                         lambda i: 100.0), False),
+        "Symmetrical triangle": (envelope(80, lambda i: 120.0 - 0.12 * i,
+                                          lambda i: 100.0 + 0.12 * i), True),
+        "Rising wedge": (envelope(80, lambda i: 120.0 + 0.08 * i,
+                                  lambda i: 100.0 + 0.22 * i), False),
+        "Falling wedge": (envelope(80, lambda i: 120.0 - 0.22 * i,
+                                   lambda i: 100.0 - 0.08 * i), True),
+    }
+    for name, ((highs, lows), up) in shapes.items():
+        found = {hit.pattern for hit in detect_patterns(framed(highs, lows, up))}
+        assert name in found, f"{name} missed its own shape; found {sorted(found)}"
+
+    # The flat line decides the kind, so the two flat-sided triangles must NOT
+    # be read as each other.
+    ascending = {h.pattern for h in detect_patterns(
+        framed(*shapes["Ascending triangle"][0], True))}
+    descending = {h.pattern for h in detect_patterns(
+        framed(*shapes["Descending triangle"][0], False))}
+    assert "Descending triangle" not in ascending, ascending
+    assert "Ascending triangle" not in descending, descending
+
+    # Direction: an ascending triangle is bullish, a descending one bearish,
+    # and a symmetrical one commits to neither.
+    biases = {}
+    for name, ((highs, lows), up) in shapes.items():
+        for hit in detect_patterns(framed(highs, lows, up)):
+            if hit.pattern == name:
+                biases[name] = hit.bias
+    assert biases.get("Ascending triangle") == "bullish", biases
+    assert biases.get("Descending triangle") == "bearish", biases
+    assert biases.get("Symmetrical triangle") == "either", biases
+
+    # Nothing that already worked may have been removed.
+    for name in ("Rising wedge", "Falling wedge", "Pennant", "Broadening top",
+                 "Double top", "Head and shoulders"):
+        assert name in PATTERN_CATALOG, f"{name} disappeared from the catalog"
+    for name in ("Ascending triangle", "Descending triangle", "Symmetrical triangle"):
+        assert PATTERN_CATALOG[name] == "Continuation", (name, PATTERN_CATALOG[name])
+
+    # --- selectivity, which is the whole difficulty -------------------------
+    counts = {"Ascending triangle": 0, "Descending triangle": 0,
+              "Symmetrical triangle": 0}
+    walks = 40
+    for seed in range(walks):
+        rng = np.random.default_rng(seed)
+        closes = 100 + np.cumsum(rng.normal(0, 1.0, 200))
+        walk = pd.DataFrame(
+            {"Open": closes, "High": closes + 1.2, "Low": closes - 1.2,
+             "Close": closes, "Volume": 1e6},
+            index=pd.date_range("2026-01-01", periods=200, freq="D", tz="Asia/Kolkata"))
+        names = {hit.pattern for hit in detect_patterns(walk)}
+        for key in counts:
+            if key in names:
+                counts[key] += 1
+    worst = max(counts.values()) / walks
+    assert worst <= 0.25, \
+        f"a triangle firing on {worst * 100:.0f}% of random walks is describing noise: {counts}"
+
+    print(f"   triangles: ascending/descending/symmetrical each find their own shape and "
+          f"not each other, wedges and pennant untouched, worst random-walk rate "
+          f"{worst * 100:.0f}%  OK")
+
+
+def _test_no_duplicate_widget_keys():
+    """
+    No two widgets may claim the same Streamlit key.
+
+    Streamlit refuses to draw a tab containing two widgets with one key, and
+    the failure is total: the whole tab errors out rather than the duplicate
+    widget. That is what "Strategy Optimiser could not finish drawing" was --
+    a shared-panel control named `opt_pick`, which the optimiser's own rank
+    selector already owned.
+
+    Checked against the source rather than the running app, because a
+    collision only shows up when both widgets happen to render in the same
+    pass. The templated keys are expanded with the prefixes the helpers are
+    ACTUALLY called with, read from their call sites, so the check is exact
+    rather than a guess at what a prefix might be.
+    """
+    import re as _re
+    from collections import Counter
+
+    with open(__file__, encoding="utf-8") as handle:
+        body = handle.read()
+
+    literal = _re.findall(r'key="([A-Za-z0-9_]+)"', body)
+    duplicates = {name: count for name, count in Counter(literal).items() if count > 1}
+    assert not duplicates, f"widgets sharing a literal key: {duplicates}"
+
+    # Which prefixes each key-templating helper is really called with.
+    helpers = {
+        "_multi_picker": _re.findall(
+            r'_multi_picker\(\s*[^,]+,\s*[^,]+,\s*"([A-Za-z0-9_]+)"', body),
+        "render_robust_controls": _re.findall(
+            r'render_robust_controls\("([A-Za-z0-9_]+)"\)', body),
+        "render_scan_overrides": _re.findall(
+            r'render_scan_overrides\("([A-Za-z0-9_]+)"', body),
+    }
+    assert helpers["render_robust_controls"], "the robust panel's call sites moved"
+    assert helpers["_multi_picker"], "the multi-picker's call sites moved"
+
+    # The suffixes each helper uses, taken from its own body.
+    def suffixes_of(function_name: str) -> list:
+        at = body.index(f"def {function_name}(")
+        stop = body.find("\ndef ", at + 1)
+        chunk = body[at:stop if stop > 0 else len(body)]
+        return _re.findall(r'key=f"\{prefix\}_([A-Za-z0-9_]+)"', chunk)
+
+    produced: dict = {}
+    for function_name, prefixes in helpers.items():
+        for suffix in suffixes_of(function_name):
+            for prefix in prefixes:
+                produced.setdefault(f"{prefix}_{suffix}", []).append(function_name)
+
+    clashes = {key: owners for key, owners in produced.items() if len(owners) > 1}
+    assert not clashes, f"two helpers generating the same key: {clashes}"
+
+    both = sorted(set(produced) & set(literal))
+    assert not both, (
+        f"generated key(s) colliding with a hand-written one: {both}. Give the shared "
+        f"panel its own namespace, as render_robust_controls does with `_rb_`.")
+
+    print(f"   widget keys: {len(set(literal))} literal and {len(produced)} generated, "
+          f"none colliding  OK")
 
 
 def _test_stale_results_are_discarded():
@@ -24222,6 +24572,8 @@ def run_selftest() -> int:
         _test_setup_drawing_and_zones()
         _test_signal_freshness_and_cell_arithmetic()
         _test_every_chart_is_gapless()
+        _test_triangle_patterns()
+        _test_no_duplicate_widget_keys()
         _test_stale_results_are_discarded()
         _test_robust_search_and_selection()
         _test_expiry_range_scales_with_root_time()
@@ -25364,29 +25716,35 @@ def select_portfolio(frame: pd.DataFrame, value_column: str = "Score",
 def render_robust_controls(prefix: str) -> dict:
     """
     The two opt-in layers, both unticked. Leaving them alone changes nothing.
+
+    Every key here is namespaced `<prefix>_rb_<name>`. The plain form collided:
+    this panel's "how many to pick" claimed `opt_pick`, which the Strategy
+    Optimiser already uses for its rank selector, and Streamlit refuses to draw
+    a tab with two widgets sharing a key -- so the whole tab failed rather than
+    just the duplicate.
     """
     out = {"robust": False, "select": False}
     with st.container(border=True):
         st.markdown("**Optional: harder-to-fool ranking**")
         out["robust"] = st.checkbox(
             "Robust walk-forward search (purged folds + deflation)", value=False,
-            key=f"{prefix}_robust",
+            key=f"{prefix}_rb_robust",
             help="Re-tests the shortlist on contiguous slices of history and ranks on the "
                  "MEDIAN slice rather than the total, then subtracts what a search of this "
                  "size would have produced from noise alone. Slower, and the numbers it "
                  "reports are lower — that is the point.")
         if out["robust"]:
             r1, r2, r3 = st.columns(3)
-            out["folds"] = r1.number_input("Folds", 2, 12, 4, 1, key=f"{prefix}_folds",
+            out["folds"] = r1.number_input("Folds", 2, 12, 4, 1, key=f"{prefix}_rb_folds",
                                            help="Contiguous slices of history. More folds "
                                                 "means a stricter test and fewer trades in "
                                                 "each one.")
             out["min_profitable_folds"] = r2.number_input(
-                "Must profit in at least", 1, 12, 3, 1, key=f"{prefix}_minfolds",
+                "Must profit in at least", 1, 12, 3, 1, key=f"{prefix}_rb_minfolds",
                 help="A candidate profitable in one fold out of four earned its number in "
                      "one stretch of market and lost in the rest.")
             out["dispersion_penalty"] = r3.number_input(
-                "Disagreement penalty", 0.0, 3.0, 0.5, 0.1, key=f"{prefix}_disp",
+                "Disagreement penalty", 0.0, 3.0, 0.5, 0.1, key=f"{prefix}_rb_disp",
                 help="How hard to demote a candidate whose folds disagree. 0 ranks on the "
                      "median alone.")
             st.caption("Expect the winner's numbers to FALL. A score that survives this is "
@@ -25395,7 +25753,7 @@ def render_robust_controls(prefix: str) -> dict:
 
         out["select"] = st.checkbox(
             "Constrained selection with OR-Tools (CP-SAT)", value=False,
-            key=f"{prefix}_select",
+            key=f"{prefix}_rb_select",
             help="Chooses the best FEASIBLE SET from the results under hard rules — a "
                  "drawdown budget, a cap per strategy, a reward:risk floor. Ranking takes "
                  "the top few; this solves for the best combination that satisfies every "
@@ -25405,21 +25763,21 @@ def render_robust_controls(prefix: str) -> dict:
                 st.warning(_ORTOOLS_HINT)
             s1, s2, s3 = st.columns(3)
             out["pick"] = s1.number_input("How many to pick", 1, 50, 5, 1,
-                                          key=f"{prefix}_pick")
+                                          key=f"{prefix}_rb_pick")
             out["max_per_strategy"] = s2.number_input("Max per strategy", 1, 20, 2, 1,
-                                                      key=f"{prefix}_percat")
+                                                      key=f"{prefix}_rb_percat")
             out["max_per_ticker"] = s3.number_input("Max per ticker", 1, 20, 2, 1,
-                                                    key=f"{prefix}_perticker")
+                                                    key=f"{prefix}_rb_perticker")
             t1, t2, t3 = st.columns(3)
             out["drawdown_budget"] = t1.number_input(
                 "Combined drawdown budget (0 = none)", 0.0, 1e9, 0.0, 100.0,
-                key=f"{prefix}_ddbudget",
+                key=f"{prefix}_rb_ddbudget",
                 help="The selection's drawdowns are SUMMED, which assumes the worst case "
                      "that they all happen together. Pessimistic on purpose.")
             out["min_reward_risk"] = t2.number_input("Minimum reward:risk", 0.0, 20.0, 0.0,
-                                                     0.1, key=f"{prefix}_minrr")
+                                                     0.1, key=f"{prefix}_rb_minrr")
             out["min_win"] = t3.number_input("Minimum win %", 0.0, 100.0, 0.0, 1.0,
-                                             key=f"{prefix}_minwin")
+                                             key=f"{prefix}_rb_minwin")
     return out
 
 
