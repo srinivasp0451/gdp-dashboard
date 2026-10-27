@@ -117,6 +117,23 @@ ASSET_UNIVERSE: dict[str, dict[str, str]] = {
         "Silver BeES (INR)": "SILVERBEES.NS",
         "Gold ETF — HDFC (INR)": "HDFCGOLD.NS",
     },
+    # US Treasuries. Two different things live here and they move in opposite
+    # directions: a YIELD index (^TNX and friends, quoted in percent) rises
+    # when bonds fall, while a bond ETF (TLT, IEF) is a price and falls when
+    # yields rise. Ratios against the two will have opposite signs, so the
+    # labels say which is which rather than leaving it to be discovered.
+    "US Bonds": {
+        "US 10Y yield (%)": "^TNX",
+        "US 30Y yield (%)": "^TYX",
+        "US 5Y yield (%)": "^FVX",
+        "US 13W T-bill yield (%)": "^IRX",
+        "20+ Year Treasury ETF (price)": "TLT",
+        "7–10 Year Treasury ETF (price)": "IEF",
+        "1–3 Year Treasury ETF (price)": "SHY",
+        "Total bond market ETF (price)": "BND",
+        "Corporate bond ETF (price)": "LQD",
+        "High-yield bond ETF (price)": "HYG",
+    },
     "Indian Stocks": {
         "Reliance Industries": "RELIANCE.NS",
         "Kaynes Technology": "KAYNES.NS",
@@ -7965,7 +7982,7 @@ SCREENER_UNIVERSES = [
     "All NSE equities (Dhan master)",
     "Broad indices", "Sector indices",
     "Crypto (major)", "US large caps", "Forex majors", "Commodities",
-    "Indian commodity ETFs", "Global indices",
+    "Indian commodity ETFs", "US bonds and yields", "Global indices",
     "Custom list (paste or upload)",
 ]
 
@@ -8000,6 +8017,13 @@ INDIAN_COMMODITY_ETFS = [
     "GOLDBEES.NS", "SILVERBEES.NS", "HDFCGOLD.NS", "GOLDSHARE.NS",
     "AXISGOLD.NS", "SETFGOLD.NS",
 ]
+# US Treasuries. The ^ symbols are YIELDS in percent and the rest are bond
+# ETF PRICES; the two move opposite ways, which matters the moment either is
+# used as the denominator of a ratio.
+US_BONDS = [
+    "^TNX", "^TYX", "^FVX", "^IRX",
+    "TLT", "IEF", "SHY", "BND", "LQD", "HYG", "TIP", "AGG",
+]
 GLOBAL_INDICES = [
     "^GSPC", "^DJI", "^IXIC", "^RUT", "^VIX", "^FTSE", "^GDAXI", "^FCHI",
     "^N225", "^HSI", "^STOXX50E", "^AXJO", "^BSESN", "^NSEI",
@@ -8017,6 +8041,12 @@ STATIC_UNIVERSES = {
     "Commodities": (COMMODITY_FUTURES, "Front-month futures, including WTI and Brent crude. "
                                        "Yahoo stitches contract rollovers, which puts "
                                        "artificial gaps in the history."),
+    "US bonds and yields": (US_BONDS,
+                            "Treasury yields (the ^ symbols, quoted in percent) and bond "
+                            "ETFs (prices). These move in OPPOSITE directions — a yield "
+                            "rises exactly when the bond price falls — so a ratio against "
+                            "a yield and a ratio against an ETF will disagree by "
+                            "construction. Yields also report no volume."),
     "Indian commodity ETFs": (INDIAN_COMMODITY_ETFS,
                               "NSE-listed gold and silver ETFs, priced in rupees and keeping "
                               "Indian market hours — so the session-based tests mean what "
@@ -8502,9 +8532,19 @@ def _sweep_load(prefix: str) -> dict:
 
 
 def chunked_sweep(prefix: str, jobs: list, worker, slice_seconds: float = 20.0,
-                  label: str = "jobs", describe=None):
+                  label: str = "jobs", describe=None, signature=None):
     """
     Drive a long scan as many short passes.
+
+    ``signature`` is everything the results depend on that is NOT in the job
+    list -- which setups are ticked, the readiness floor, the freshness limit.
+    When it changes, the stored results no longer describe the settings on
+    screen, so they are thrown away rather than shown under the new ones.
+
+    This was a real defect, and a quiet one: tick a different setup without
+    pressing Run and the table went on showing the PREVIOUS setup's hits, as if
+    they were the new setup's. The scan looked broken when it was in fact
+    answering a question nobody had asked any more.
 
     ``worker(job)`` returns ``(rows, errors)`` for ONE job and must not raise;
     anything it does raise is caught and recorded, so a single bad ticker cannot
@@ -8520,18 +8560,48 @@ def chunked_sweep(prefix: str, jobs: list, worker, slice_seconds: float = 20.0,
     q_key, r_key, e_key = f"{prefix}_queue", f"{prefix}_rows", f"{prefix}_errs"
     run_key, tot_key = f"{prefix}_running", f"{prefix}_total"
     rate_key = f"{prefix}_seconds_per_job"
+    sig_key, done_key = f"{prefix}_signature", f"{prefix}_completed"
     for key, default in ((q_key, []), (r_key, []), (e_key, []), (run_key, False),
-                         (tot_key, 0), (rate_key, 0.0)):
+                         (tot_key, 0), (rate_key, 0.0), (sig_key, None),
+                         (done_key, False)):
         if key not in st.session_state:
             st.session_state[key] = default
 
-    # A restart empties session state; the disk mirror puts the results back.
+    # ---- settings changed? then the old answers are not answers any more ----
+    stamp = None
+    if signature is not None:
+        try:
+            stamp = json.dumps(signature, sort_keys=True, default=str)
+        except Exception:                                           # noqa: BLE001
+            stamp = repr(signature)
+        previous = st.session_state[sig_key]
+        if previous is not None and previous != stamp:
+            had = len(st.session_state[r_key] or [])
+            st.session_state[q_key] = []
+            st.session_state[r_key] = []
+            st.session_state[e_key] = []
+            st.session_state[run_key] = False
+            st.session_state[tot_key] = 0
+            st.session_state[done_key] = False
+            _sweep_save(prefix, {})
+            if had:
+                st.info(f"The settings changed, so the previous {had} result(s) were "
+                        f"cleared — they answered the old settings, not these. Press "
+                        f"**Run** to scan again.")
+        st.session_state[sig_key] = stamp
+
+    # A restart empties session state; the disk mirror puts the results back --
+    # but only when it was produced by the settings now on screen.
     if not st.session_state[r_key] and not st.session_state[q_key]:
         saved = _sweep_load(prefix)
+        if saved.get("rows") and stamp is not None \
+                and saved.get("signature") not in (None, stamp):
+            saved = {}
         if saved.get("rows"):
             st.session_state[r_key] = saved.get("rows") or []
             st.session_state[e_key] = saved.get("errs") or []
             st.session_state[tot_key] = int(saved.get("total") or 0)
+            st.session_state[done_key] = bool(saved.get("completed"))
             st.caption(f"Recovered {len(st.session_state[r_key])} rows from the last run — the "
                        f"app restarted but the results were kept.")
 
@@ -8543,6 +8613,7 @@ def chunked_sweep(prefix: str, jobs: list, worker, slice_seconds: float = 20.0,
         st.session_state[e_key] = []
         st.session_state[tot_key] = len(jobs)
         st.session_state[run_key] = True
+        st.session_state[done_key] = False
         st.rerun()
 
     queue = list(st.session_state[q_key])
@@ -8556,6 +8627,7 @@ def chunked_sweep(prefix: str, jobs: list, worker, slice_seconds: float = 20.0,
             st.session_state[key] = []
         st.session_state[run_key] = False
         st.session_state[tot_key] = 0
+        st.session_state[done_key] = False
         _sweep_save(prefix, {})
         st.rerun()
 
@@ -8663,7 +8735,8 @@ def chunked_sweep(prefix: str, jobs: list, worker, slice_seconds: float = 20.0,
         st.session_state[q_key] = queue
         st.session_state[r_key] = rows
         st.session_state[e_key] = errs
-        _sweep_save(prefix, {"rows": rows, "errs": errs, "total": total})
+        _sweep_save(prefix, {"rows": rows, "errs": errs, "total": total,
+                             "signature": stamp, "completed": not queue})
 
     # ---- then repaint with what is ACTUALLY true now ----
     queue = list(st.session_state[q_key])
@@ -8687,6 +8760,11 @@ def chunked_sweep(prefix: str, jobs: list, worker, slice_seconds: float = 20.0,
         st.session_state["_sweep_rerun_pending"] = True
     if running and not queue:
         st.session_state[run_key] = False
+    if total and not queue:
+        # Remembered so a caller can tell "never run" from "ran, found none" --
+        # a finished scan that returned nothing used to be reported as though
+        # no scan had happened, which reads as a broken screener.
+        st.session_state[done_key] = True
 
     rows = list(st.session_state[r_key])
     errs = list(st.session_state[e_key])
@@ -8779,7 +8857,7 @@ def tab_screener(cfg: dict) -> None:
     universe = c1.selectbox("Universe", SCREENER_UNIVERSES, key="scr_universe")
     lookback = c2.number_input("Signal window (candles)", 1, 20, 3, key="scr_look",
                                help="How far back a signal still counts as recent.")
-    max_names = c3.number_input("Max tickers", 1, 2000, 50, key="scr_max",
+    max_names = c3.number_input("Max tickers", 1, 10_000_000, 50, key="scr_max",
                                 help="Lower this to keep a scan quick. It is capped by the "
                                      "size of the universe you picked.")
 
@@ -9880,7 +9958,8 @@ def tab_optimiser(cfg: dict) -> None:
     min_trades = c3.number_input("Minimum trades", 5, 1000, 30, 5, key="opt_min",
                                  help="Combinations with fewer trades are discarded: below "
                                       "roughly 30 the statistics are noise.")
-    iterations = c4.number_input("Combinations to test", 20, 2000, 150, 10, key="opt_iters")
+    iterations = c4.number_input("Combinations to test", 20, 10_000_000, 150, 10,
+                                 key="opt_iters", help="A combination is one backtest. There is no ceiling here any more — but the limit that actually bites is the clock, not the box: the scan runs in timed slices and simply takes more of them. And every extra combination makes the WINNER less trustworthy, because the best of many is partly the luckiest of many. That is what the robust search below is for.")
 
     safe_only = st.checkbox("Only search backtest-safe exits", value=True, key="opt_safe",
                             help="Excludes distance-based trailing stops, whose backtested "
@@ -9905,21 +9984,40 @@ def tab_optimiser(cfg: dict) -> None:
     batches = [(start, min(batch, int(iterations) - start))
                for start in range(0, int(iterations), batch)]
 
+    robust_options = render_robust_controls("opt")
+
     def _opt_worker(job):
         offset, size = job
         bundle = load_market_data(cfg["symbol"], period, cfg["interval"], 300.0,
                                   min_bars=WARMUP_BARS + 60)
-        part = optimise(bundle.frame, cfg["params"], cfg["quantity"], cfg["costs"],
-                        objective, int(min_trades), int(size), seed=11 + offset,
-                        safe_exits_only=safe_only, grid=grid, exhaustive=exhaustive,
-                        scale_points=scale_points, weights=obj_weights,
-                        min_percentile=obj_floor)
+        runner = robust_optimise if robust_options.get("robust") else optimise
+        extra = {}
+        if robust_options.get("robust"):
+            extra = {"folds": int(robust_options.get("folds", 4)),
+                     "min_profitable_folds": int(
+                         robust_options.get("min_profitable_folds", 3)),
+                     "dispersion_penalty": float(
+                         robust_options.get("dispersion_penalty", 0.5))}
+        part = runner(bundle.frame, cfg["params"], cfg["quantity"], cfg["costs"],
+                      objective, int(min_trades), int(size), seed=11 + offset,
+                      safe_exits_only=safe_only, grid=grid, exhaustive=exhaustive,
+                      scale_points=scale_points, weights=obj_weights,
+                      min_percentile=obj_floor, **extra)
         return (part.drop(columns=["Rank"], errors="ignore").to_dict("records")
                 if not part.empty else []), []
 
     rows, errs, _finished = chunked_sweep(
         "opt", batches, _opt_worker, _auto_slice_seconds(), "combination batches",
-        describe=lambda job: f"combinations {job[0] + 1}-{job[0] + job[1]}")
+        describe=lambda job: f"combinations {job[0] + 1}-{job[0] + job[1]}",
+        signature={"objective": objective, "robust": bool(robust_options.get("robust")),
+                   "folds": robust_options.get("folds"),
+                   "min_folds": robust_options.get("min_profitable_folds"),
+                   "disp": robust_options.get("dispersion_penalty"),
+                   "min_trades": int(min_trades), "safe": bool(safe_only),
+                   "exhaustive": bool(exhaustive), "scale": bool(scale_points),
+                   "weights": obj_weights, "floor": obj_floor,
+                   "symbol": cfg["symbol"], "interval": cfg["interval"],
+                   "period": period})
 
     results = pd.DataFrame(rows)
     if not results.empty:
@@ -9929,7 +10027,16 @@ def tab_optimiser(cfg: dict) -> None:
                                 "Filter") if c in results.columns]
         if key_cols:
             results = results.drop_duplicates(subset=key_cols)
-        if isinstance(objective, list):
+        if "Robust score" in results.columns:
+            # Robust mode ranks on the fold median, not the in-sample score, so
+            # the merged table has to be re-ranked the same way or the batches
+            # would be stitched back together on the number robust mode exists
+            # to stop trusting.
+            results = results.sort_values(
+                [c for c in ("Passes gates", "Robust score") if c in results.columns],
+                ascending=[False] * len([c for c in ("Passes gates", "Robust score")
+                                         if c in results.columns])).reset_index(drop=True)
+        elif isinstance(objective, list):
             # A percentile only means something against the set it was measured
             # in. Each batch scored its own rows against its own members, so the
             # merged table has to be re-scored across everything before the
@@ -9964,6 +10071,10 @@ def tab_optimiser(cfg: dict) -> None:
     column = target_column if target_column in results.columns else "Score"
     measured = pd.to_numeric(results[column], errors="coerce").replace([np.inf, -np.inf], np.nan)
     hits = results[measured >= target]
+    _robust_verdict(results, len(rows))
+    render_selection_panel(results, robust_options,
+                           "Robust score" if "Robust score" in results.columns else column,
+                           "opt")
     unit = OBJECTIVE_TARGETS.get(objective, {}).get("unit", "")
     st.success(f"{len(results)} combinations survived the trade-count filter. "
                f"{len(hits)} reached your target of {fmt(target)}{unit} on {objective} "
@@ -10414,7 +10525,8 @@ def run_signal_lab(tickers: list[str], cfg: dict, objective, iterations: int,
                    progress=None, grid: dict | None = None, exhaustive: bool = False,
                    scale_points: bool = True, time_budget: float = 600.0,
                    on_partial=None, weights: dict | None = None,
-                   min_percentile: float = 0.0) -> tuple[pd.DataFrame, pd.DataFrame]:
+                   min_percentile: float = 0.0,
+                   robust: dict | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     For each ticker: search for the best configuration on its own history, then
     ask whether that winning configuration is signalling right now.
@@ -10472,10 +10584,13 @@ def run_signal_lab(tickers: list[str], cfg: dict, objective, iterations: int,
         params["intraday"] = interval in INTRADAY_INTERVALS
         params["square_off_eod"] = cfg.get("square_off_eod", True)
         try:
-            table = optimise(bundle.frame, params, cfg["quantity"], costs, objective,
-                             min_trades, iterations, seed=11, safe_exits_only=safe_only,
-                             grid=grid, exhaustive=exhaustive, scale_points=scale_points,
-                             weights=weights, min_percentile=min_percentile)
+            runner = robust_optimise if (robust or {}).get("robust") else optimise
+            extra = {k: v for k, v in (robust or {}).items()
+                     if k in ("folds", "min_profitable_folds", "dispersion_penalty")}
+            table = runner(bundle.frame, params, cfg["quantity"], costs, objective,
+                           min_trades, iterations, seed=11, safe_exits_only=safe_only,
+                           grid=grid, exhaustive=exhaustive, scale_points=scale_points,
+                           weights=weights, min_percentile=min_percentile, **extra)
         except Exception as exc:                                    # noqa: BLE001
             errors.append({"Ticker": ticker, "Timeframe": interval,
                            "Problem": f"optimiser: {str(exc)[:120]}"})
@@ -10611,7 +10726,8 @@ def tab_signal_lab(cfg: dict) -> None:
     max_names = d1.number_input(f"Max tickers (of {len(tickers)} in {universe})",
                                 1, max(1, len(tickers)), max(1, len(tickers)),
                                 key=f"lab_max_{universe}")
-    iterations = d2.number_input("Combinations per ticker", 10, 500, 60, 10, key="lab_iters")
+    iterations = d2.number_input("Combinations per ticker", 10, 10_000_000, 60, 10,
+                                 key="lab_iters", help="A combination is one backtest. There is no ceiling here any more — but the limit that actually bites is the clock, not the box: the scan runs in timed slices and simply takes more of them. And every extra combination makes the WINNER less trustworthy, because the best of many is partly the luckiest of many. That is what the robust search below is for.")
     min_trades = d3.number_input("Minimum trades to qualify", 1, 200, 10, key="lab_min")
     e1, e2 = st.columns(2)
     use_gates = e1.checkbox(
@@ -10725,6 +10841,7 @@ def tab_signal_lab(cfg: dict) -> None:
     # the same guarantees: honest progress, a disk mirror that survives the
     # runtime restarting, pause and resume, and per-job isolation.
     jobs = [(t, tf) for t in tickers for tf in timeframes]
+    lab_robust = render_robust_controls("lab")
 
     def _lab_worker(job):
         ticker, interval = job
@@ -10732,12 +10849,18 @@ def tab_signal_lab(cfg: dict) -> None:
             [ticker], cfg, objective, int(iterations), int(min_trades),
             int(signal_window), safe_only, [interval], gates, None, grid,
             exhaustive, scale_points, time_budget=_sweep_job_budget(),
-            weights=obj_weights, min_percentile=obj_floor)
+            weights=obj_weights, min_percentile=obj_floor, robust=lab_robust)
         return part_rows.to_dict("records"), part_errs.to_dict("records")
 
     rows, errs, _finished = chunked_sweep(
         "lab", jobs, _lab_worker, _auto_slice_seconds(), "ticker/timeframe jobs",
-        describe=lambda job: f"{job[0]} \u00b7 {job[1]}")
+        describe=lambda job: f"{job[0]} \u00b7 {job[1]}",
+        signature={"objective": objective, "iterations": int(iterations),
+                   "min_trades": int(min_trades), "window": int(signal_window),
+                   "safe": bool(safe_only), "gates": gates, "grid": str(grid)[:400],
+                   "exhaustive": bool(exhaustive), "scale": bool(scale_points),
+                   "weights": obj_weights, "floor": obj_floor,
+                   "robust": {k: v for k, v in lab_robust.items() if k != "select"}})
     st.session_state.lab_results = (pd.DataFrame(rows), pd.DataFrame(errs))
     lab_total = int(st.session_state.get("lab_total") or 0)
     st.session_state.lab_partial = (lab_total - len(st.session_state.get("lab_queue") or []),
@@ -10753,6 +10876,11 @@ def tab_signal_lab(cfg: dict) -> None:
                                  "signal right now.")
 
     results, errors = st.session_state.lab_results
+    if isinstance(results, pd.DataFrame) and not results.empty:
+        _robust_verdict(results, int(iterations))
+        render_selection_panel(results, lab_robust,
+                               "Robust score" if "Robust score" in results.columns
+                               else "Score", "lab")
     if not lab_total:
         st.info("Pick a universe and press **Run** above. Results appear here as the scan works "
                 "\u2014 it does not wait for the whole universe to finish.")
@@ -10925,6 +11053,7 @@ def run_auto_screen(tickers: list[str], cfg: dict, min_value: float, min_trades:
                     iterations: int, timeframes: list[str], signal_window: int,
                     safe_only: bool, progress=None, metric: str = "Accuracy (win rate %)",
                     time_budget: float = 600.0, on_partial=None,
+                    robust: dict | None = None,
                     objective=None, column: str | None = None,
                     weights: dict | None = None, min_percentile: float = 0.0):
     """
@@ -10986,10 +11115,13 @@ def run_auto_screen(tickers: list[str], cfg: dict, min_value: float, min_trades:
                                                AUTO_METRICS["Accuracy (win rate %)"])
             else:
                 col, obj = (column or "Score"), objective
-            table = optimise(bundle.frame, params, cfg["quantity"], costs, obj,
-                             int(min_trades), int(iterations), seed=11,
-                             safe_exits_only=safe_only, weights=weights,
-                             min_percentile=min_percentile)
+            runner = robust_optimise if (robust or {}).get("robust") else optimise
+            extra = {k: v for k, v in (robust or {}).items()
+                     if k in ("folds", "min_profitable_folds", "dispersion_penalty")}
+            table = runner(bundle.frame, params, cfg["quantity"], costs, obj,
+                           int(min_trades), int(iterations), seed=11,
+                           safe_exits_only=safe_only, weights=weights,
+                           min_percentile=min_percentile, **extra)
         except Exception as exc:                                    # noqa: BLE001
             skipped.append({"Ticker": ticker, "Timeframe": interval,
                             "Reason": f"search failed: {str(exc)[:110]}"})
@@ -11126,7 +11258,8 @@ def tab_auto_screener(cfg: dict) -> None:
     d1, d2, d3 = st.columns(3)
     timeframes = d1.multiselect("Timeframes", INTERVALS, default=["15m", "60m", "1d"],
                                 key="auto_tfs")
-    iterations = d2.number_input("Combinations per ticker/timeframe", 10, 400, 80, 10,
+    iterations = d2.number_input("Combinations per ticker/timeframe", 10, 10_000_000, 80, 10,
+                                 help="A combination is one backtest. There is no ceiling here any more — but the limit that actually bites is the clock, not the box: the scan runs in timed slices and simply takes more of them. And every extra combination makes the WINNER less trustworthy, because the best of many is partly the luckiest of many. That is what the robust search below is for.",
                                  key="auto_iters")
     min_trades = d3.number_input("Minimum trades to qualify", 1, 200, 10, key="auto_min")
     safe_only = st.checkbox("Backtest-safe exits only", value=True, key="auto_safe")
@@ -11149,12 +11282,14 @@ def tab_auto_screener(cfg: dict) -> None:
 
     slice_seconds = _auto_slice_seconds()
 
+    auto_robust = render_robust_controls("auto")
+
     def _auto_worker(job):
         ticker, interval = job
         hot_p, quiet_p, near_p, skip_p = run_auto_screen(
             [ticker], cfg, float(min_value), int(min_trades), int(iterations),
             [interval], int(signal_window), safe_only, None, metric=metric,
-            time_budget=_sweep_job_budget(),
+            time_budget=_sweep_job_budget(), robust=auto_robust,
             objective=objective, column=column, weights=weights, min_percentile=floor)
         rows = ([dict(r, Bucket="signalling") for r in hot_p.to_dict("records")]
                 + [dict(r, Bucket="quiet") for r in quiet_p.to_dict("records")]
@@ -11162,8 +11297,13 @@ def tab_auto_screener(cfg: dict) -> None:
         return rows, skip_p.to_dict("records")
 
     jobs = [(t, tf) for t in chosen for tf in timeframes]
-    rows, errs, _finished = chunked_sweep("auto", jobs, _auto_worker, slice_seconds,
-                                          "ticker/timeframe jobs")
+    rows, errs, _finished = chunked_sweep(
+        "auto", jobs, _auto_worker, slice_seconds, "ticker/timeframe jobs",
+        signature={"metric": metric, "objective": objective, "column": column,
+                   "min_value": float(min_value), "min_trades": int(min_trades),
+                   "iterations": int(iterations), "window": int(signal_window),
+                   "safe": bool(safe_only), "weights": weights, "floor": floor,
+                   "robust": {k: v for k, v in auto_robust.items() if k != "select"}})
     frame = pd.DataFrame(rows)
     hot = frame[frame["Bucket"] == "signalling"].drop(columns=["Bucket"]) \
         if not frame.empty else pd.DataFrame()
@@ -11185,6 +11325,15 @@ def tab_auto_screener(cfg: dict) -> None:
         st.info("Nothing was returned. If the run stopped early, lower the ticker count or the "
                 "combinations per ticker and try again — the Skipped table below says what "
                 "happened to each one.")
+
+    combined = pd.concat([f for f in (hot, quiet, near) if not f.empty],
+                         ignore_index=True) if any(
+        not f.empty for f in (hot, quiet, near)) else pd.DataFrame()
+    if not combined.empty:
+        _robust_verdict(combined, int(iterations))
+        render_selection_panel(combined, auto_robust,
+                               "Robust score" if "Robust score" in combined.columns
+                               else "Score", "auto")
 
     a, b, c, d = st.columns(4)
     a.metric("Signalling now", len(hot))
@@ -13390,6 +13539,126 @@ def oi_momentum_ratio(ticker: str, spot: float, strikes_each_side: int = 5,
     return out
 
 
+# -----------------------------------------------------------------------------
+# TIME-SCALED EXPECTED RANGE
+# -----------------------------------------------------------------------------
+# The daily band answers "how far might it move by tomorrow". The question an
+# options trader actually asks is "how far by EXPIRY", and that is a different
+# number: volatility scales with the SQUARE ROOT of time, not with time.
+#
+#       sigma over T periods  =  sigma for one period  x  sqrt(T)
+#
+# Three days to expiry is therefore 1.73 times the daily move, not three times
+# it, and four days is exactly twice. Getting this wrong by using T instead of
+# sqrt(T) overstates a week's range by about 2.4x, which is the difference
+# between a sensible strike and a worthless one.
+#
+# On expiry day T is a FRACTION. With two hours left in a six-and-a-quarter
+# hour session, T is 0.32 of a day and the expected move is sqrt(0.32) = 0.57
+# of the daily figure -- still more than half the day's range with under a
+# third of the day to go, which is why expiry-day moves feel so violent
+# relative to the time remaining.
+#
+# The divisor already in use decides what "one period" means. 1600 is
+# 100 x sqrt(256), a TRADING-day convention, so T counts trading days for
+# equities and indices. 1910.5 is 100 x sqrt(365), so for crypto T counts
+# calendar days -- a market that never closes has no trading-day calendar.
+
+NSE_SESSION_MINUTES = 375.0            # 09:15 to 15:30
+
+
+def horizon_sigma(daily_sigma: float, periods: float) -> float:
+    """
+    Scale a one-period sigma to a horizon of ``periods`` periods.
+
+    Returns a fraction of spot, as ``daily_sigma`` is. Volatility goes with the
+    square root of time; this is the whole formula and the place it is most
+    often got wrong.
+    """
+    try:
+        sigma, span = float(daily_sigma), float(periods)
+    except (TypeError, ValueError):
+        return float("nan")
+    if not (np.isfinite(sigma) and np.isfinite(span)) or span <= 0:
+        return float("nan")
+    return sigma * math.sqrt(span)
+
+
+def session_fraction_remaining(now=None, session_minutes: float = NSE_SESSION_MINUTES,
+                               open_hhmm: tuple = (9, 15),
+                               close_hhmm: tuple = (15, 30)) -> float:
+    """
+    How much of today's session is still to come, as a fraction.
+
+    Before the open this is 1.0 -- the whole session is ahead. After the close
+    it is 0, and a zero horizon has no range, so callers floor it rather than
+    reporting a band of nothing.
+    """
+    moment = pd.Timestamp(now) if now is not None else pd.Timestamp.now(tz="Asia/Kolkata")
+    if moment.tz is None:
+        moment = moment.tz_localize("Asia/Kolkata")
+    else:
+        moment = moment.tz_convert("Asia/Kolkata")
+    opened = moment.normalize() + pd.Timedelta(hours=open_hhmm[0], minutes=open_hhmm[1])
+    closed = moment.normalize() + pd.Timedelta(hours=close_hhmm[0], minutes=close_hhmm[1])
+    if moment <= opened:
+        return 1.0
+    if moment >= closed:
+        return 0.0
+    return float((closed - moment).total_seconds() / 60.0) / float(session_minutes)
+
+
+def periods_to_expiry(expiry_date, now=None, trading_days: bool = True) -> float:
+    """
+    Periods remaining until an expiry, counting the part-day we are inside.
+
+    With trading days, weekends do not count -- a Friday-to-Monday gap is one
+    trading day of volatility, not three -- and the current session counts only
+    for the part of it still to come. Public holidays are NOT in this count;
+    the app has no exchange calendar, so a week containing one is overstated by
+    a day, and saying so is better than silently being wrong.
+    """
+    moment = pd.Timestamp(now) if now is not None else pd.Timestamp.now(tz="Asia/Kolkata")
+    if moment.tz is None:
+        moment = moment.tz_localize("Asia/Kolkata")
+    else:
+        moment = moment.tz_convert("Asia/Kolkata")
+    target = pd.Timestamp(expiry_date)
+    # A bare date has no zone; it means that calendar day in Mumbai, not in UTC.
+    target = (target.tz_convert("Asia/Kolkata") if target.tz is not None
+              else target.tz_localize("Asia/Kolkata"))
+    today, last_day = moment.normalize(), target.normalize()
+    if last_day < today:
+        return 0.0
+
+    part_day = session_fraction_remaining(moment)
+    if last_day == today:
+        return max(part_day, 0.0)
+    if not trading_days:
+        return float((last_day - today).days) + part_day
+
+    # Whole trading days strictly between today and expiry, plus the whole of
+    # expiry day, plus whatever is left of today.
+    between = pd.bdate_range(today + pd.Timedelta(days=1), last_day)
+    return float(len(between)) + part_day
+
+
+def expiry_range(spot: float, daily_sigma: float, periods: float,
+                 multiples=(1.0, 2.0)) -> dict:
+    """The expected band at a horizon, and the daily band it was scaled from."""
+    scaled = horizon_sigma(daily_sigma, periods)
+    out = {"periods": float(periods), "sigma_fraction": scaled,
+           "move": float(spot) * scaled if np.isfinite(scaled) else float("nan"),
+           "levels": {}}
+    for multiple in multiples:
+        if not np.isfinite(scaled):
+            out["levels"][multiple] = (float("nan"), float("nan"))
+            continue
+        move = float(spot) * scaled * float(multiple)
+        out["levels"][multiple] = (float(spot) - move, float(spot) + move)
+    return out
+
+
 def volatility_scan_one(ticker: str, vcfg: dict, broker: dict | None = None) -> dict:
     """One ticker: standard-deviation levels, ATR expansion, and the OI ratio."""
     # --- daily frame for the levels -----------------------------------------
@@ -13780,6 +14049,79 @@ def tab_volatility_levels(cfg: dict) -> None:
         st.warning(row["Caution"])
     if str(row.get("OI state", "")) not in ("", "-"):
         st.caption(f"Open interest: {row['OI state']}")
+
+    # ---- the expiry / multi-day band ---------------------------------------
+    st.markdown("##### Range to expiry")
+    st.caption("The ladder above is **one day**. Volatility grows with the square root of "
+               "time, so the range to expiry is the daily figure times √T — three days is "
+               "1.73x the daily move, not 3x, and four days is exactly 2x. Using T instead "
+               "of √T overstates a week by about two and a half times, which is the "
+               "difference between a sensible strike and a worthless one.")
+
+    sigma_fraction = None
+    try:
+        one_sd_pct = float(row.get("1 SD (%)"))
+        sigma_fraction = one_sd_pct / 100.0 if np.isfinite(one_sd_pct) else None
+    except (TypeError, ValueError):
+        sigma_fraction = None
+    spot_now = float(pd.to_numeric(pd.Series([row.get("Spot")]),
+                                   errors="coerce").fillna(0.0).iloc[0])
+
+    if not sigma_fraction or spot_now <= 0:
+        st.info("No usable daily sigma for this ticker, so no horizon band can be built.")
+    else:
+        crypto_clock = bool(dvol_currency_for(pick)) or str(pick).upper().endswith("-USD")
+        e1, e2, e3 = st.columns(3)
+        auto_days = float(days_to_weekly_expiry(pd.Timestamp.now(tz="Asia/Kolkata")))
+        use_auto = e1.checkbox("Work out the expiry myself", value=True,
+                               key="vol_exp_auto",
+                               help="Counts to the next Thursday weekly expiry, including "
+                                    "only the part of today's session still to come. "
+                                    "Untick to type a horizon.")
+        if use_auto:
+            next_expiry = (pd.Timestamp.now(tz="Asia/Kolkata").normalize()
+                           + pd.Timedelta(days=auto_days))
+            periods = periods_to_expiry(next_expiry, trading_days=not crypto_clock)
+            e2.metric("Next weekly expiry", f"{next_expiry:%a %d %b}")
+        else:
+            periods = float(e2.number_input(
+                "Periods to expiry", 0.01, 400.0, 2.0, 0.25, key="vol_exp_days",
+                help="Trading days for equities and indices, calendar days for crypto. "
+                     "Fractions are allowed: 0.3 is roughly two hours of an Indian "
+                     "session."))
+        # Expiry day: the horizon is what is LEFT of the session, not a day.
+        remaining = session_fraction_remaining()
+        if use_auto and auto_days == 0:
+            periods = max(remaining, 0.01)
+            e3.metric("Expiry day", f"{remaining * 100:.0f}% of session left")
+        else:
+            e3.metric("Horizon", f"{periods:.2f} "
+                                 f"{'calendar' if crypto_clock else 'trading'} day(s)")
+
+        if periods <= 0:
+            st.info("The session is over and expiry is today, so there is no time left "
+                    "for a range.")
+        else:
+            band = expiry_range(spot_now, sigma_fraction, periods)
+            scale = math.sqrt(periods)
+            rows_out = []
+            for multiple in (2.0, 1.0):
+                low, high = band["levels"][multiple]
+                rows_out.append({"Band": f"±{multiple:.0f} SD to expiry",
+                                 "Lower": round(low, 2), "Upper": round(high, 2),
+                                 "Width (points)": round(high - low, 2),
+                                 "Width (%)": round((high - low) / spot_now * 100.0, 2)})
+            st.dataframe(pd.DataFrame(rows_out), width="stretch", hide_index=True)
+            st.caption(
+                f"Built from the same daily sigma as the ladder — "
+                f"{fmt(row.get('1 SD (points)'))} points — scaled by √{periods:.2f} = "
+                f"{scale:.2f}. Basis: {row.get('Sigma basis')}. "
+                f"{'Calendar days, because this market never closes.' if crypto_clock else 'Trading days: a weekend is one day of volatility, not three. Public holidays are NOT in this count — the app has no exchange calendar — so a week containing one is overstated by a day.'}")
+            st.caption("**This is a one-standard-deviation band, not a forecast and not a "
+                       "guarantee.** On a normal distribution price finishes inside ±1 SD "
+                       "about two times in three; real markets breach these bands more "
+                       "often than that, and expiry-day gamma makes the last hour move "
+                       "further than any volatility figure implies.")
 
     if p2.button("Apply to the sidebar", width="stretch", key="vol_apply"):
         st.session_state.pending_ticker = pick
@@ -17422,14 +17764,37 @@ def tab_make_break(cfg: dict) -> None:
             return [], [{"Ticker": ticker, "Timeframe": interval, "Period": period,
                          "Problem": str(exc)[:140]}]
 
-    rows, errs, _done = chunked_sweep("mb", jobs, _worker, _auto_slice_seconds(),
-                                      "ticker/timeframe/period jobs",
-                                      describe=lambda j: f"{j[0]} · {j[1]} · {j[2]}")
+    rows, errs, _done = chunked_sweep(
+        "mb", jobs, _worker, _auto_slice_seconds(), "ticker/timeframe/period jobs",
+        describe=lambda j: f"{j[0]} · {j[1]} · {j[2]}",
+        # Everything the answers depend on beyond the job list. Tick a
+        # different setup and the old hits stop being an answer to anything.
+        signature={"setups": sorted(wanted), "min_score": float(min_score),
+                   "max_age": int(max_age), "lookback": int(lookback),
+                   "pivot": int(pivot), "tol": float(tol_atr)})
 
     frame = pd.DataFrame(rows)
     if frame.empty:
-        st.info("Nothing scanned yet, or nothing cleared the readiness bar. Press **Run** "
-                "above, or lower the minimum readiness.")
+        # "Not run yet" and "ran and found nothing" are different situations and
+        # used to print the same sentence, which made a working screener look
+        # broken. A finished empty scan names the filters that could explain it.
+        if st.session_state.get("mb_completed"):
+            picked = [label for key, label, _fn in MAKE_BREAK_SETUPS if key in wanted]
+            st.warning(
+                f"**The scan finished and found nothing.** {len(jobs)} ticker/timeframe/"
+                f"period job(s) were checked against {len(picked)} setup(s) "
+                f"({', '.join(picked[:4])}{'…' if len(picked) > 4 else ''}) and none "
+                f"qualified.\n\nThree settings decide this, and any one of them can empty "
+                f"the list on its own:\n\n"
+                f"- **Fired within the last {int(max_age)} candle(s)** — the usual cause. "
+                f"Most setups that exist on a chart completed a while ago; raise this to "
+                f"20 or 50 to see them.\n"
+                f"- **Minimum readiness {int(min_score)}** — lower it to see the "
+                f"half-formed ones.\n"
+                f"- **The setups ticked** — a single narrow setup across 50 tickers "
+                f"genuinely finds nothing most days.")
+        else:
+            st.info("Nothing scanned yet. Press **Run** above.")
         if errs:
             with st.expander(f"Jobs that failed ({len(errs)})"):
                 st.dataframe(pd.DataFrame(errs), width="stretch", hide_index=True)
@@ -17903,6 +18268,17 @@ def ratio_frame(joined: pd.DataFrame) -> pd.DataFrame:
     }, index=joined.index)
 
 
+def _heatmap_row_height(rows: int) -> int:
+    """Row height that keeps a tall grid on one screen without crushing it."""
+    if rows <= 14:
+        return 42
+    if rows <= 30:
+        return 30
+    if rows <= 60:
+        return 22
+    return 17
+
+
 def _compound(values) -> float:
     """
     Chain a run of percentage returns into the one return they add up to.
@@ -17958,15 +18334,51 @@ def returns_heatmap(series: pd.Series, title: str, light: bool = False,
                     < pd.Timedelta(hours=23))
 
     if intraday:
-        row_name, col_name = f"Hour ({zone})", "Weekday"
+        # Rows are the CANDLE'S OWN SLOT, not a round hour, and they are
+        # labelled with the window the candle actually covers. On a 5-minute
+        # chart "15:00" could mean any of twelve different candles; "15:00 –
+        # 15:05" names exactly one, which is the difference between a figure
+        # you can check against your chart and one you cannot.
+        gaps = (index[1:] - index[:-1])
+        step = pd.Timedelta(gaps.min())
+        if step <= pd.Timedelta(0):
+            step = pd.Timedelta(minutes=1)
+        minutes = max(int(round(step.total_seconds() / 60.0)), 1)
+
+        # One row per candle slot is the whole point -- on a 5-minute chart an
+        # Indian session is 75 slots, and that is a tall grid but a readable
+        # and checkable one. Only a timeframe fine enough to produce hundreds
+        # of rows is widened, and then the label says it was.
+        slot_minutes, widened = minutes, False
+        while True:
+            slots = {(h * 60 + mm) // slot_minutes * slot_minutes
+                     for h, mm in zip(index.hour, index.minute)}
+            if len(slots) <= 100 or slot_minutes >= 240:
+                break
+            slot_minutes = next((w for w in (2, 3, 5, 10, 15, 30, 60, 120, 240)
+                                 if w > slot_minutes), 240)
+            widened = True
+
+        bucket = (index.hour * 60 + index.minute) // slot_minutes * slot_minutes
+        row_name, col_name = f"Time ({zone})", "Weekday"
         col_labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-        grid = pd.DataFrame({"r": index.hour, "c": index.dayofweek,
+        grid = pd.DataFrame({"r": bucket, "c": index.dayofweek,
                              "v": values.to_numpy(float)})
         table = grid.pivot_table(index="r", columns="c", values="v", aggfunc="mean")
         counts = grid.pivot_table(index="r", columns="c", values="v", aggfunc="count")
         x_labels = [col_labels[c] for c in table.columns]
-        y_labels = [f"{int(h):02d}:00" for h in table.index]
-        cell_meaning = "average return of the candles in this slot"
+
+        def _clock(total_minutes: int) -> str:
+            total_minutes = int(total_minutes) % (24 * 60)
+            return f"{total_minutes // 60:02d}:{total_minutes % 60:02d}"
+
+        y_labels = [f"{_clock(start)} – {_clock(start + slot_minutes)}"
+                    for start in table.index]
+        width_text = (f"{slot_minutes} min" if slot_minutes < 60
+                      else f"{slot_minutes // 60} hr")
+        cell_meaning = (f"average return of the {width_text} candles in this slot"
+                        + (f" (widened from {minutes} min so the grid fits)"
+                           if widened else ""))
     else:
         grid = pd.DataFrame({"r": index.year, "c": index.month,
                              "v": values.to_numpy(float)})
@@ -18002,7 +18414,8 @@ def returns_heatmap(series: pd.Series, title: str, light: bool = False,
     figure = go.Figure(go.Heatmap(
         z=z, x=list(x_labels), y=list(y_labels), colorscale=_DIVERGING_RETURNS,
         zmid=0.0, zmin=-limit, zmax=limit, customdata=sample,
-        text=np.round(z, 2), texttemplate="%{text}", textfont=dict(size=10),
+        text=np.round(z, 2), texttemplate="%{text}",
+        textfont=dict(size=10 if len(table.index) <= 30 else 8),
         colorbar=dict(title="%"),
         hovertemplate=(f"{col_name} %{{x}}<br>{row_name} %{{y}}<br>"
                        f"%{{z:.2f}}%  ({cell_meaning})<br>"
@@ -18010,7 +18423,10 @@ def returns_heatmap(series: pd.Series, title: str, light: bool = False,
     figure.update_layout(
         title=dict(text=f"{title} — {cell_meaning}", x=0.01, xanchor="left",
                    font=dict(size=14)),
-        height=max(260, 42 * len(table.index) + 120),
+        # Rows shrink as they multiply: 75 slots at full height is a chart
+        # nobody scrolls to the bottom of.
+        height=int(max(260, min(1500, _heatmap_row_height(len(table.index))
+                                * len(table.index) + 130))),
         margin=dict(l=70, r=20, t=50, b=40),
         template="plotly_white" if light else None)
     figure.update_xaxes(title_text=col_name, side="top")
@@ -18688,6 +19104,13 @@ def tab_chart_studio(cfg: dict) -> None:
     st.caption("Each bin compounds the candle returns inside it, which is the correct way "
                "to add returns over time — summing them overstates a run of gains and "
                "understates a run of losses.")
+    st.caption("**The Ratio range column overlaps between bins, and that is correct.** "
+               "These bins are consecutive slices of TIME, and the column reports the "
+               "range the ratio travelled inside each slice — a ratio that wanders back "
+               "over the same levels in March and in June will show overlapping ranges, "
+               "because it really did trade there twice. For bands that do NOT overlap, "
+               "open the value-cut table below: it slices the ratio's RANGE instead of "
+               "the calendar, so each candle falls in exactly one band.")
 
     # Which bin the ratio is standing in -- in time, and in value. Those are
     # two different questions and only one of them is interesting: in time the
@@ -18735,6 +19158,78 @@ def tab_chart_studio(cfg: dict) -> None:
     st.caption("Bins are equal slices of TIME, so the current ratio is always in the last "
                "one; the useful question is which earlier slices covered the level it is "
                "at now, and that is what the note above answers.")
+
+    # ---- the same window cut by VALUE instead of by time -------------------
+    # The time bins above report the range the ratio travelled inside each
+    # slice, and those ranges overlap -- necessarily, because the ratio
+    # revisits the same levels in different weeks. That is not a fault, but it
+    # does mean they cannot be read as bands. These bands can: every candle is
+    # placed in exactly one, the edges do not overlap, and what the table shows
+    # is how much TIME the ratio has spent at each level.
+    with st.expander("Cut by value instead of by time (non-overlapping bands)",
+                     expanded=False):
+        st.caption("Each row below is a band of ratio VALUES, and the bands do not "
+                   "overlap — every candle falls in exactly one. Use this to see where "
+                   "the relationship spends its time; use the table above to see when it "
+                   "moved.")
+        mode = st.radio("Band edges", ["Equal width", "Equal count (quantiles)"],
+                        horizontal=True, key="studio_band_mode",
+                        help="Equal width splits the ratio's range into bands of the same "
+                             "size, so a band can be empty. Equal count puts the same "
+                             "number of candles in each, so the bands are narrow where "
+                             "the ratio spent most of its time.")
+        band_values = ratio["Close"].astype(float).dropna()
+        if len(band_values) < int(bins) * 2:
+            st.info("Not enough candles to form that many bands.")
+        else:
+            try:
+                if mode.startswith("Equal width"):
+                    cut = pd.cut(band_values, int(bins))
+                else:
+                    cut = pd.qcut(band_values, int(bins), duplicates="drop")
+            except Exception as exc:                                # noqa: BLE001
+                st.info(f"Could not form bands: {exc}")
+                cut = None
+            if cut is not None:
+                current_value = float(band_values.iloc[-1])
+                band_rows = []
+                for interval_band, group in band_values.groupby(cut, observed=True):
+                    if len(group) == 0:
+                        continue
+                    low_edge = float(interval_band.left)
+                    high_edge = float(interval_band.right)
+                    band_rows.append({
+                        "Band": f"{low_edge:,.4f} – {high_edge:,.4f}",
+                        "Low": round(low_edge, 6), "High": round(high_edge, 6),
+                        "Candles": int(len(group)),
+                        "Share of window %": round(len(group) / len(band_values)
+                                                   * 100.0, 1),
+                        "First seen": group.index[0], "Last seen": group.index[-1],
+                        "Holds now": low_edge < current_value <= high_edge,
+                    })
+                band_table = pd.DataFrame(band_rows).sort_values(
+                    "Low", ascending=False).reset_index(drop=True)
+                # The bands are built from one cut, so they cannot overlap --
+                # asserted here rather than assumed, because the whole point of
+                # this table is that its rows are disjoint.
+                edges = band_table.sort_values("Low")
+                overlapping = int((edges["Low"].shift(-1) < edges["High"] - 1e-12).sum())
+                live = band_table[band_table["Holds now"]]
+                styled_bands = band_table.style.apply(
+                    lambda row: ["background-color: rgba(38,166,154,0.18)"
+                                 if row["Holds now"] else ""] * len(row), axis=1)
+                st.dataframe(styled_bands, width="stretch", hide_index=True)
+                if not live.empty:
+                    row = live.iloc[0]
+                    st.success(
+                        f"**The ratio is {current_value:,.4f}, inside the "
+                        f"{row['Band']} band** (highlighted). The ratio has spent "
+                        f"{row['Share of window %']}% of this window in that band, "
+                        f"first on {row['First seen']:%d %b %H:%M} and most recently on "
+                        f"{row['Last seen']:%d %b %H:%M}.")
+                st.caption(f"{len(band_table)} bands, {overlapping} overlapping edge(s) — "
+                           f"zero by construction, since one cut cannot place a candle in "
+                           f"two bands.")
 
     b1, b2 = st.columns(2)
     b1.download_button("Bins as CSV", bin_table.to_csv(index=False).encode("utf-8"),
@@ -22023,6 +22518,257 @@ def pytest_approx(value, tolerance=1e-9):
     return _Close()
 
 
+def _test_stale_results_are_discarded():
+    """
+    Changing a setting must throw the old answers away.
+
+    The operator hit this directly: tick a different setup in Make or Break and
+    the table went on showing the PREVIOUS setup's hits. Nothing errored, the
+    progress bar read 100%, and the screen was answering a question nobody had
+    asked any more -- which is the worst kind of wrong, because it looks right.
+    """
+    real_st = globals()["st"]
+    fake = _FakeStreamlit()
+    globals()["st"] = fake
+    try:
+        def worker(job):
+            return [{"job": job}], []
+
+        jobs = ["a", "b", "c"]
+        # Pressing Run once and letting it finish.
+        fake.session_state.clear()
+        fake._buttons = {"sig_start": True}
+        chunked_sweep("sig", jobs, worker, 5.0, "things",
+                      signature={"setup": "one"})
+        fake._buttons = {}
+        rows, _errs, _done = chunked_sweep("sig", jobs, worker, 5.0, "things",
+                                           signature={"setup": "one"})
+        assert len(rows) == 3, rows
+        assert fake.session_state.get("sig_completed") is True
+
+        # Same settings: the results stand.
+        rows_again, _e, _d = chunked_sweep("sig", jobs, worker, 5.0, "things",
+                                           signature={"setup": "one"})
+        assert len(rows_again) == 3, rows_again
+
+        # A DIFFERENT setting: they must go.
+        after, _e2, _d2 = chunked_sweep("sig", jobs, worker, 5.0, "things",
+                                        signature={"setup": "two"})
+        assert after == [], f"stale rows survived a settings change: {after}"
+        assert fake.session_state.get("sig_completed") is False, \
+            "a cleared sweep must not still claim to have finished"
+
+        # And a sweep with no signature keeps its old behaviour exactly.
+        fake.session_state.clear()
+        fake._buttons = {"nosig_start": True}
+        chunked_sweep("nosig", jobs, worker, 5.0, "things")
+        fake._buttons = {}
+        first, _e3, _d3 = chunked_sweep("nosig", jobs, worker, 5.0, "things")
+        second, _e4, _d4 = chunked_sweep("nosig", jobs, worker, 5.0, "things")
+        assert len(first) == len(second) == 3, (first, second)
+        print("   stale results: a settings change clears them, the same settings keep "
+              "them, an unsigned sweep is untouched  OK")
+    finally:
+        globals()["st"] = real_st
+
+
+def _test_robust_search_and_selection():
+    """
+    The robust layer has to be harder to fool than the plain one, and the
+    solver has to beat greedy where greedy is beatable.
+    """
+    # --- folds are time-ordered, contiguous, and separated ------------------
+    windows = purged_folds(1000, 4, 0.01)
+    assert len(windows) == 4, windows
+    for (lo, hi) in windows:
+        assert hi > lo
+    for (_a, end), (start, _b) in zip(windows, windows[1:]):
+        assert start > end, f"folds {end} and {start} touch, so a trade can span both"
+    assert windows[0][0] == 0 and windows[-1][1] == 1000, windows
+    # Too little history: one window, not four meaningless ones.
+    assert len(purged_folds(50, 4)) == 1
+
+    # --- the deflation is the textbook extreme-value figure -----------------
+    assert abs(expected_best_of_n(1.0, 150) - math.sqrt(2 * math.log(150))) < 1e-9
+    assert expected_best_of_n(1.0, 1000) > expected_best_of_n(1.0, 150), \
+        "a bigger search must manufacture a bigger winner"
+    assert expected_best_of_n(0.0, 1000) == 0.0
+    # Measured against simulation: the best of N standard normals.
+    rng = np.random.default_rng(5)
+    sampled = float(np.mean([rng.normal(0, 1, 200).max() for _ in range(400)]))
+    predicted = expected_best_of_n(1.0, 200)
+    assert 0.6 * predicted <= sampled <= 1.2 * predicted, (sampled, predicted)
+
+    # --- CP-SAT must find a feasible SET greedy cannot ----------------------
+    pool = pd.DataFrame({
+        "Strategy": ["A", "A", "A", "B", "C"],
+        "Ticker": ["X", "Y", "Z", "P", "Q"],
+        "Score": [10.0, 9.0, 8.0, 7.0, 6.0],
+        "Max DD": [100.0, 90.0, 80.0, 70.0, 60.0],
+        "Trades": [50] * 5,
+        "Reward:Risk": [2.0, 0.5, 1.8, 1.6, 1.4],
+        "Win %": [60.0, 90.0, 55.0, 52.0, 51.0]})
+
+    # One per strategy: the top three all share strategy A, so the answer is
+    # the best A plus B plus C -- not the top three by score.
+    chosen, note, engine = select_portfolio(pool, "Score", pick=3, max_per_strategy=1)
+    assert len(chosen) == 3, chosen
+    assert sorted(chosen["Strategy"]) == ["A", "B", "C"], chosen["Strategy"].tolist()
+    assert float(chosen["Score"].sum()) == 23.0, chosen["Score"].tolist()
+
+    # A drawdown budget where greedy-by-score is PROVABLY worse: taking the
+    # best row first (DD 100) leaves 50 of the budget and nothing fits, for a
+    # total of 10. The optimum skips it and takes 80 + 70 for 15.
+    budgeted, _n, used = select_portfolio(pool, "Score", pick=3, max_per_strategy=1,
+                                          drawdown_budget=150.0)
+    total = float(budgeted["Score"].sum())
+    assert float(budgeted["Max DD"].sum()) <= 150.0 + 1e-9, budgeted["Max DD"].tolist()
+    if used == "cp-sat":
+        assert total >= 15.0, f"the solver settled for {total}, but 15 is feasible"
+    else:
+        assert total >= 10.0
+
+    # Per-row floors remove rows no selection could rescue.
+    filtered, _n2, _e2 = select_portfolio(pool, "Score", pick=5, max_per_strategy=5,
+                                          min_reward_risk=1.5)
+    assert float(filtered["Reward:Risk"].min()) >= 1.5, filtered["Reward:Risk"].tolist()
+    assert 0.5 not in filtered["Reward:Risk"].tolist()
+
+    # Impossible constraints must say so rather than return something wrong.
+    impossible, note3, _e3 = select_portfolio(pool, "Score", pick=3, min_win=99.0)
+    assert impossible.empty and "floors" in note3, note3
+    assert select_portfolio(pd.DataFrame(), "Score")[0].empty
+
+    # --- the robust ranking demotes a one-fold wonder -----------------------
+    # Built, not asserted: a series that trends hard in its first quarter and
+    # chops in the rest. A configuration that makes all its money in that first
+    # stretch should rank BELOW one that is steady, even though the one-stretch
+    # version has the better total.
+    scores_steady = [1.0, 1.1, 0.9, 1.0]
+    scores_lucky = [8.0, -1.0, -0.8, -0.9]
+    assert float(np.median(scores_lucky)) < float(np.median(scores_steady)), \
+        "the median is what demotes the one-fold wonder"
+    penalty = 0.5
+    steady = np.median(scores_steady) - penalty * np.std(scores_steady)
+    lucky = np.median(scores_lucky) - penalty * np.std(scores_lucky)
+    assert steady > lucky, (steady, lucky)
+    assert sum(1 for v in scores_lucky if v > 0) < 3, \
+        "and the consistency gate refuses it outright"
+    print(f"   robust search: {len(windows)} purged folds, deflation matches the "
+          f"extreme-value figure (predicted {predicted:.2f} vs {sampled:.2f} measured), "
+          f"{engine} selection beats greedy under a drawdown budget  OK")
+
+
+def _test_expiry_range_scales_with_root_time():
+    """
+    The range to expiry grows with the SQUARE ROOT of time.
+
+    Four days is exactly twice the daily move, not four times. Getting this
+    wrong is the single most common error in an expected-move calculation and
+    it overstates a week by about two and a half times.
+    """
+    sigma = 25.0 / VIX_DIVISOR_EQUITY           # India VIX 25 -> daily fraction
+    spot = 24000.0
+    one_day = expiry_range(spot, sigma, 1.0)["move"]
+    assert abs(one_day - spot * sigma) < 1e-6
+
+    for periods, expected in ((4.0, 2.0), (9.0, 3.0), (0.25, 0.5)):
+        band = expiry_range(spot, sigma, periods)
+        assert abs(band["move"] / one_day - expected) < 1e-9, (periods, band["move"])
+    # Explicitly NOT linear: a week must not be seven times a day.
+    week = expiry_range(spot, sigma, 5.0)["move"]
+    assert abs(week / one_day - math.sqrt(5)) < 1e-9
+    assert week < 5 * one_day * 0.5, "scaling linearly would be a gross overstatement"
+
+    # The band is symmetric about spot and 2 SD is twice 1 SD.
+    band = expiry_range(spot, sigma, 2.0)
+    low1, high1 = band["levels"][1.0]
+    low2, high2 = band["levels"][2.0]
+    assert abs((high1 + low1) / 2 - spot) < 1e-6
+    assert abs((high2 - low2) / (high1 - low1) - 2.0) < 1e-9
+
+    # Session fraction: before the open the whole day is ahead, after the
+    # close none of it is.
+    day = pd.Timestamp("2026-10-27", tz="Asia/Kolkata")
+    assert session_fraction_remaining(day + pd.Timedelta(hours=8)) == 1.0
+    assert session_fraction_remaining(day + pd.Timedelta(hours=16)) == 0.0
+    midday = session_fraction_remaining(day + pd.Timedelta(hours=13, minutes=30))
+    assert 0.31 < midday < 0.33, midday
+
+    # Counting to expiry: a weekend is ONE trading day of volatility, not three.
+    friday = pd.Timestamp("2026-10-30 15:00", tz="Asia/Kolkata")
+    trading = periods_to_expiry("2026-11-02", friday, trading_days=True)
+    calendar = periods_to_expiry("2026-11-02", friday, trading_days=False)
+    assert 1.0 <= trading <= 1.2, trading
+    assert 3.0 <= calendar <= 3.2, calendar
+    assert calendar > trading, "crypto counts the weekend, an index does not"
+    # Expiry day uses what is LEFT of the session.
+    on_expiry = pd.Timestamp("2026-10-29 13:30", tz="Asia/Kolkata")
+    assert abs(periods_to_expiry("2026-10-29", on_expiry) - midday) < 1e-6
+    assert periods_to_expiry("2026-10-01", friday) == 0.0, "a past expiry has no time left"
+
+    # A zero or negative horizon has no band rather than a nonsense one.
+    assert not np.isfinite(horizon_sigma(sigma, 0.0))
+    assert not np.isfinite(horizon_sigma(float("nan"), 2.0))
+    print(f"   expiry range: 4 days = 2.0x the daily move and 9 days = 3.0x (√T, not T); "
+          f"weekend counts as {trading:.2f} trading vs {calendar:.2f} calendar periods  OK")
+
+
+def _test_heatmap_slots_name_their_window():
+    """
+    A heatmap row must name the window it covers, in the operator's clock.
+
+    "15:00" on a five-minute chart could be any of twelve candles. "15:00 –
+    15:05" is one, and that is the difference between a number you can check
+    against your chart and one you have to trust.
+    """
+    def nse_index(minutes, days=20):
+        per = int(375 / minutes)
+        stamps, day, count = [], pd.Timestamp("2026-09-01 09:15", tz="Asia/Kolkata"), 0
+        while count < days:
+            if day.dayofweek < 5:
+                stamps += [day + pd.Timedelta(minutes=minutes * k) for k in range(per)]
+                count += 1
+            day = (day + pd.Timedelta(days=1)).normalize() \
+                + pd.Timedelta(hours=9, minutes=15)
+        return pd.DatetimeIndex(stamps)
+
+    rng = np.random.default_rng(8)
+    for minutes, first_label, rows in ((5, "09:15 – 09:20", 75),
+                                       (15, "09:15 – 09:30", 25),
+                                       (60, "09:00 – 10:00", 6)):
+        index = nse_index(minutes)
+        series = pd.Series(rng.normal(0, 0.3, len(index)), index=index)
+        figure, grid = returns_heatmap(series, f"{minutes}m")
+        assert len(grid.index) == rows, (minutes, len(grid.index))
+        assert grid.index[0] == first_label, (minutes, grid.index[0])
+        assert str(grid.index.name).startswith("Time ("), grid.index.name
+        assert "Kolkata" in grid.index.name
+        # The slot width must be the candle's own width.
+        start, end = grid.index[0].split(" – ")
+        width = ((int(end[:2]) * 60 + int(end[3:])) - (int(start[:2]) * 60
+                                                       + int(start[3:]))) % (24 * 60)
+        assert width == minutes, (minutes, width)
+        # And a tall grid must not be a mile high.
+        assert figure.layout.height <= 1500, figure.layout.height
+
+    # A one-minute chart is 375 slots, which is widened -- and says so.
+    fine = nse_index(1)
+    figure, grid = returns_heatmap(
+        pd.Series(rng.normal(0, 0.3, len(fine)), index=fine), "1m")
+    assert len(grid.index) <= 100, len(grid.index)
+    assert "widened" in figure.layout.title.text, figure.layout.title.text
+
+    # Crypto arrives in UTC and must be shown in the same clock as everything
+    # else, or two heatmaps stacked on a page cannot be read across.
+    utc = pd.date_range("2026-09-01", periods=600, freq="5min", tz="UTC")
+    _f, crypto_grid = returns_heatmap(
+        pd.Series(rng.normal(0, 0.3, 600), index=utc), "BTC")
+    assert "Kolkata" in str(crypto_grid.index.name), crypto_grid.index.name
+    print(f"   heatmap slots: 5m rows read '09:15 – 09:20', 15m '09:15 – 09:30', "
+          f"1m widened to {len(grid.index)} rows, crypto shown in the same clock  OK")
+
+
 def _test_every_chart_is_gapless():
     """
     EVERY candlestick in the application sits on bar positions, not a calendar.
@@ -22523,7 +23269,7 @@ def _test_studio_second_leg_and_insights():
     assert grid is not None and not grid.empty
     assert all(isinstance(label, str) for label in grid.index), list(grid.index)[:3]
     assert all(isinstance(label, str) for label in grid.columns), list(grid.columns)[:3]
-    assert grid.index.name in ("Year",) or str(grid.index.name).startswith("Hour (")
+    assert grid.index.name in ("Year",) or str(grid.index.name).startswith("Time (")
     assert grid.columns.name in ("Month", "Weekday")
 
     bins_table = pd.DataFrame({"Bin": [1, 2], "From": [index[0], index[100]],
@@ -22656,12 +23402,15 @@ def _test_chart_studio_alignment_and_bins():
     assert hourly_fig is not None
     # The grid carries the same labels the chart shows, so a cell can be named
     # in prose: "Mon / 05:00", not "0 / 5".
-    # The hour axis NAMES its timezone, because an hour number is meaningless
+    # The time axis NAMES its timezone, because a clock time is meaningless
     # without one -- and every series is converted to that one clock first.
-    assert hourly_grid.index.name.startswith("Hour ("), hourly_grid.index.name
+    # Each row is also a WINDOW, not an instant: "09:00 – 10:00", not "09:00".
+    assert str(hourly_grid.index.name).startswith("Time ("), hourly_grid.index.name
     assert "Kolkata" in hourly_grid.index.name, hourly_grid.index.name
     assert hourly_grid.columns.name == "Weekday"
-    assert all(len(label) == 5 and label.endswith(":00") and label[:2].isdigit()
+    assert all(" – " in str(label) for label in hourly_grid.index), \
+        list(hourly_grid.index)[:3]
+    assert all(len(str(label)) == 13 and str(label)[2] == ":"
                for label in hourly_grid.index), list(hourly_grid.index)
     assert set(hourly_grid.columns) <= {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"}, \
         list(hourly_grid.columns)
@@ -22707,13 +23456,13 @@ def _test_chart_studio_alignment_and_bins():
         return sorted({row for row in grid.index for column in grid.columns
                        if np.isfinite(grid.loc[row, column])
                        and grid.loc[row, column] > 1.0})
-    assert _spike(utc_grid) == _spike(ist_grid) == ["14:00"], \
-        (_spike(utc_grid), _spike(ist_grid))
+    assert _spike(utc_grid) == _spike(ist_grid), (_spike(utc_grid), _spike(ist_grid))
+    assert _spike(utc_grid) and _spike(utc_grid)[0].startswith("14:"), _spike(utc_grid)
     # A naive index is read as UTC and converted like any other, rather than
     # being left on whatever clock it implied.
     naive_series = in_utc.copy()
     naive_series.index = utc_index.tz_localize(None)
-    assert _spike(returns_heatmap(naive_series, "naive")[1]) == ["14:00"]
+    assert _spike(returns_heatmap(naive_series, "naive")[1])[0].startswith("14:")
 
     # The workbook must really build, with timezones stripped -- Excel cannot
     # store a tz-aware timestamp and raises if asked to.
@@ -23473,6 +24222,10 @@ def run_selftest() -> int:
         _test_setup_drawing_and_zones()
         _test_signal_freshness_and_cell_arithmetic()
         _test_every_chart_is_gapless()
+        _test_stale_results_are_discarded()
+        _test_robust_search_and_selection()
+        _test_expiry_range_scales_with_root_time()
+        _test_heatmap_slots_name_their_window()
         _test_pulse_on_higher_timeframes()
         _test_studio_second_leg_and_insights()
         _test_sweep_progress_is_visible_and_rerun_is_deferred()
@@ -24149,6 +24902,551 @@ def optimise(df: pd.DataFrame, base_params: dict, quantity: float, costs: CostMo
         frame = frame.sort_values("Score", ascending=False).reset_index(drop=True)
     frame.insert(0, "Rank", range(1, len(frame) + 1))
     return frame
+
+
+# =============================================================================
+# SECTION 20 -- ROBUST SEARCH AND CONSTRAINED SELECTION
+# =============================================================================
+# WHY THE WINNER OF A SEARCH SO OFTEN DISAPPOINTS.
+#
+# The plain search tries N configurations on ONE history and keeps the best
+# number. That procedure has a bias with a known size. If the configurations
+# were all worthless and their scores were pure noise with spread sigma, the
+# BEST of N still scores about
+#
+#       sigma * sqrt(2 * ln N)
+#
+# above zero -- roughly 2.6 sigma at N = 150, 3.7 sigma at N = 1000. So a
+# search over a thousand combinations manufactures an impressive winner out of
+# nothing at all, and a bigger search manufactures a better one. Raising the
+# combination count makes the reported result better and the real result worse.
+# That is not a bug in the searcher; it is what searching means.
+#
+# Three things follow, and they are the whole of this section:
+#
+#   1. Judge a candidate on data the SEARCH DID NOT CHOOSE IT ON. The folds
+#      below do that: each candidate is scored separately on contiguous slices
+#      of history, with bars around each boundary purged so one trade cannot be
+#      counted in two slices, and ranked on the MEDIAN slice rather than the
+#      total. A configuration that earns its number in one lucky quarter and
+#      loses in the other three has a poor median and a wide spread, and is
+#      demoted -- which is exactly what the plain search cannot see.
+#
+#   2. SUBTRACT what search alone would have produced. The deflation below
+#      reports the winner's score minus the expected best-of-N under the null.
+#      A positive remainder is the part the search did not manufacture.
+#
+#   3. A HIGH WIN RATE IS NOT AN EDGE. A wide stop with a tight target wins
+#      nine times in ten and loses everything on the tenth; the accuracy
+#      objective rewards precisely that geometry, so an optimiser pointed at
+#      accuracy will find it every time. Reward-to-risk and expectancy are the
+#      checks, and the robust ranking refuses a candidate that cannot clear
+#      its own breakeven win rate.
+#
+# None of this makes a backtest predictive. It makes the ranking harder to
+# fool, which is a smaller claim and an achievable one.
+
+
+def purged_folds(n: int, folds: int = 4, embargo_pct: float = 0.01) -> list:
+    """
+    Contiguous time-ordered slices with a gap between them.
+
+    Shuffled cross-validation is meaningless on a price series: it trains on
+    Thursday to predict Wednesday. These slices keep time order, and each one
+    is shortened at both ends by an embargo so a trade opened near a boundary
+    cannot be counted in the slice next door. Returns (start, stop) pairs.
+    """
+    n = int(n)
+    folds = max(2, int(folds))
+    if n < folds * 30:
+        return [(0, n)] if n > 0 else []
+    edge = max(1, int(n * float(embargo_pct)))
+    size = n // folds
+    out = []
+    for k in range(folds):
+        start = k * size
+        stop = n if k == folds - 1 else (k + 1) * size
+        # Purge the embargo from the inner edges only, so no history is lost
+        # at the very start or the very end of the series.
+        lo = start + (edge if k > 0 else 0)
+        hi = stop - (edge if k < folds - 1 else 0)
+        if hi - lo >= 30:
+            out.append((lo, hi))
+    return out or [(0, n)]
+
+
+def expected_best_of_n(spread: float, n: int) -> float:
+    """
+    How far above zero the best of N pure-noise scores lands.
+
+    The standard extreme-value approximation for the maximum of N independent
+    draws. It is what a search produces from a market with no edge in it at
+    all, and subtracting it is the difference between a result and a ranking.
+    """
+    n = max(int(n), 2)
+    spread = float(spread)
+    if not np.isfinite(spread) or spread <= 0:
+        return 0.0
+    return float(spread * math.sqrt(2.0 * math.log(n)))
+
+
+def _robust_verdict(results: pd.DataFrame, searched: int) -> None:
+    """
+    Read the winner back and say what is actually holding it up.
+
+    The operator's question -- "why do I get 90% on Ethereum and nothing like
+    it on Nifty?" -- has an answer that is visible in the results table and
+    nowhere in the ranking. A 90% win rate with a reward-to-risk of 0.2 is a
+    wide stop and a tight target: it wins small nine times and gives it all
+    back on the tenth. The accuracy objective rewards exactly that geometry, so
+    a search pointed at accuracy finds it every time, on any instrument liquid
+    enough to fill. It is not an edge, and it does not transfer.
+    """
+    if results is None or results.empty:
+        return
+    best = results.iloc[0]
+
+    def number(name, default=float("nan")):
+        try:
+            value = float(pd.to_numeric(pd.Series([best.get(name)]),
+                                        errors="coerce").iloc[0])
+        except Exception:                                           # noqa: BLE001
+            return default
+        return value if np.isfinite(value) else default
+
+    win = number("Win %")
+    reward_risk = number("Reward:Risk")
+    breakeven = number("Breakeven Win %")
+    expectancy = number("Expectancy")
+    trades = number("Trades")
+
+    notes = []
+    if np.isfinite(win) and np.isfinite(reward_risk) and win >= 75 and reward_risk < 1.0:
+        notes.append(
+            f"**A {win:.0f}% win rate at {reward_risk:.2f} : 1 reward-to-risk is a stop "
+            f"geometry, not an edge.** Winning {win:.0f}% of the time while each win is "
+            f"only {reward_risk:.2f} of each loss means the losses are "
+            f"{1 / max(reward_risk, 1e-9):.1f}x the size of the wins. This is what an "
+            f"accuracy search converges on: widen the stop far enough and almost every "
+            f"trade eventually comes back to a small target. The number that matters is "
+            f"expectancy, which is shown beside it.")
+    if np.isfinite(expectancy) and expectancy <= 0:
+        notes.append("**The top row loses money per trade** despite its ranking, which "
+                     "means the objective being maximised is not expectancy. Add "
+                     "expectancy or reward:risk to the objectives.")
+    if np.isfinite(win) and np.isfinite(breakeven) and win - breakeven < 5:
+        notes.append(
+            f"**The margin over breakeven is thin:** this configuration needs "
+            f"{breakeven:.1f}% winners to break even and got {win:.1f}%. A "
+            f"{win - breakeven:.1f}-point margin disappears with slippage, and slippage "
+            f"is not modelled anywhere in this application.")
+    if np.isfinite(trades) and trades < 30:
+        notes.append(f"**{trades:.0f} trades is too few to separate skill from luck.** "
+                     f"At this sample size a win rate carries roughly "
+                     f"±{100 * 0.5 / math.sqrt(max(trades, 1)):.0f} points of noise.")
+    if searched > 1:
+        notes.append(
+            f"**{searched} combinations were tried and the best one is being shown.** "
+            f"Even with no edge at all, the best of {searched} scores about "
+            f"{math.sqrt(2 * math.log(max(searched, 2))):.1f} standard deviations above "
+            f"the average by chance alone. That is the part of this result the search "
+            f"manufactured, and the robust option above subtracts an estimate of it.")
+
+    if "Deflated score" in results.columns:
+        survivors = int(pd.to_numeric(results.get("Beats pure search"),
+                                      errors="coerce").fillna(0).sum()) \
+            if "Beats pure search" in results.columns else 0
+        notes.append(
+            f"**Out of sample:** {survivors} of {len(results)} candidate(s) scored above "
+            f"what a search this size produces from noise. "
+            + ("That is the shortlist worth testing further."
+               if survivors else
+               "None did — on this history, this search found nothing distinguishable "
+               "from luck, which is a real and useful answer."))
+
+    if not notes:
+        return
+    with st.expander("Read the winner before trusting it", expanded=True):
+        for note in notes:
+            st.markdown(f"- {note}")
+        st.caption("Why one instrument scores far better than another is usually "
+                   "structural rather than strategic. Crypto trades continuously, so a "
+                   "given calendar window yields several times as many candles as an "
+                   "Indian index and no overnight gaps for a stop to jump; index futures "
+                   "carry gaps, expiry effects and a session break that a trend-following "
+                   "rule has to survive every single day. A configuration tuned on one "
+                   "is not evidence about the other.")
+
+
+def robust_optimise(df: pd.DataFrame, base_params: dict, quantity: float,
+                    costs: "CostModel", objective, min_trades: int, iterations: int,
+                    seed: int = 11, safe_exits_only: bool = True, progress=None,
+                    grid: dict | None = None, exhaustive: bool = False,
+                    scale_points: bool = True, weights: dict | None = None,
+                    min_percentile: float = 0.0, folds: int = 4,
+                    embargo_pct: float = 0.01, min_profitable_folds: int = 3,
+                    dispersion_penalty: float = 0.5,
+                    require_positive_expectancy: bool = True) -> pd.DataFrame:
+    """
+    The same search, scored on slices of history instead of all of it.
+
+    Two passes. The first is the ordinary search over the whole series, which
+    produces the candidate pool -- there is no cheaper way to find configurations
+    worth examining. The second re-runs the shortlist on each purged fold and
+    ranks on how the candidate behaved ACROSS them, which is the question the
+    first pass cannot answer about its own winner.
+
+    The ranking is the median fold score minus a penalty for how far the folds
+    disagree, and a candidate must be profitable in at least
+    ``min_profitable_folds`` of them. One brilliant quarter and three bad ones
+    is the signature of a curve fit, and it is the single most common way a
+    backtest flatters a strategy that will not repeat.
+    """
+    pool = optimise(df, base_params, quantity, costs, objective, min_trades,
+                    iterations, seed, safe_exits_only, progress, grid, exhaustive,
+                    scale_points, weights, min_percentile)
+    if pool.empty:
+        return pool
+
+    windows = purged_folds(len(df), folds, embargo_pct)
+    if len(windows) < 2:
+        pool["Robust note"] = ("too little history to split into folds, so this is the "
+                               "plain in-sample ranking")
+        return pool
+
+    combo = [o for o in objective] if isinstance(objective, (list, tuple, set)) else []
+    primary = combo[0] if combo else objective
+
+    # Only the shortlist is re-run: every candidate on every fold would be
+    # folds-times the cost of the search that produced them.
+    shortlist = pool.head(max(10, min(len(pool), int(max(iterations // 4, 25)))))
+    rows = []
+    for position, (_i, candidate) in enumerate(shortlist.iterrows()):
+        if progress is not None and position % 3 == 0:
+            progress.progress(min(1.0, (position + 1) / max(len(shortlist), 1)),
+                              text=f"Re-testing candidate {position + 1} of "
+                                   f"{len(shortlist)} across {len(windows)} folds")
+        filt = str(candidate.get("Filter Key") or "")
+        fcfg = default_filter_config()
+        if filt:
+            fcfg[filt]["enabled"] = True
+        risk = RiskConfig(candidate["Stop-Loss"], candidate.get("SL Value"),
+                          candidate["Target"], candidate.get("TP Value"),
+                          quantity, costs=costs)
+
+        scores, pnls, trades, win_rates, reward_risks = [], [], [], [], []
+        for lo, hi in windows:
+            slice_df = df.iloc[lo:hi]
+            if len(slice_df) < max(60, WARMUP_BARS // 2):
+                continue
+            try:
+                result = run_backtest(slice_df, candidate["Strategy"], dict(base_params),
+                                      risk, fcfg, {}, WARMUP_BARS,
+                                      square_off_eod=base_params.get("square_off_eod"))
+            except Exception:                                       # noqa: BLE001
+                continue
+            stats = result.stats
+            if not stats.get("total_trades"):
+                continue
+            scores.append(_objective_value(stats, primary))
+            pnls.append(float(stats.get("net_pnl") or 0.0))
+            trades.append(int(stats.get("total_trades") or 0))
+            win_rates.append(float(stats.get("win_rate") or 0.0))
+            reward_risks.append(float(stats.get("reward_risk") or 0.0))
+
+        if len(scores) < 2:
+            continue
+        median = float(np.median(scores))
+        spread = float(np.std(scores, ddof=0))
+        profitable = int(sum(1 for value in pnls if value > 0))
+        # The penalty is in the SAME units as the score, so a candidate that
+        # swings wildly between folds is demoted by how wildly it swings.
+        adjusted = median - float(dispersion_penalty) * spread
+
+        row = dict(candidate)
+        row.update({
+            "Folds": len(scores),
+            "Folds profitable": profitable,
+            "Fold median": round(median, 4),
+            "Fold spread": round(spread, 4),
+            "Fold worst": round(float(np.min(scores)), 4),
+            "Fold best": round(float(np.max(scores)), 4),
+            "Fold trades": int(np.sum(trades)),
+            "Fold win % median": round(float(np.median(win_rates)), 2),
+            "Fold R:R median": round(float(np.median(reward_risks)), 2),
+            "Robust score": round(adjusted, 4),
+            "Consistent": profitable >= int(min_profitable_folds),
+        })
+        rows.append(row)
+
+    if not rows:
+        pool["Robust note"] = ("no candidate produced trades in enough folds to be judged "
+                               "out of sample")
+        return pool
+
+    robust = pd.DataFrame(rows)
+
+    # The consistency gate, and the expectancy gate. A candidate that cannot
+    # clear its own breakeven win rate is a high-accuracy, poor-geometry system
+    # -- the exact shape an accuracy search is drawn to.
+    robust["Passes gates"] = robust["Consistent"]
+    if require_positive_expectancy and "Expectancy" in robust.columns:
+        robust["Passes gates"] = robust["Passes gates"] & (
+            pd.to_numeric(robust["Expectancy"], errors="coerce").fillna(-1.0) > 0)
+
+    # Deflation: how much of the best score pure search would have produced.
+    spread_across = float(pool["Score"].std(ddof=0)) if "Score" in pool.columns else 0.0
+    inflation = expected_best_of_n(spread_across, len(pool))
+    robust["Search inflation"] = round(inflation, 4)
+    robust["Deflated score"] = (robust["Robust score"] - inflation).round(4)
+    robust["Beats pure search"] = robust["Deflated score"] > 0
+
+    robust = robust.sort_values(
+        ["Passes gates", "Robust score"], ascending=[False, False]).reset_index(drop=True)
+    if "Rank" in robust.columns:
+        robust = robust.drop(columns=["Rank"])
+    robust.insert(0, "Rank", range(1, len(robust) + 1))
+    return robust
+
+
+# -----------------------------------------------------------------------------
+# CONSTRAINED SELECTION (OR-Tools CP-SAT)
+# -----------------------------------------------------------------------------
+# WHAT A SOLVER CAN AND CANNOT DO HERE. CP-SAT cannot search the parameter
+# space: the objective is the output of a backtest, which it has no way to
+# evaluate. Pointing it at that would be theatre.
+#
+# What it CAN do, and what greedy ranking does badly, is CHOOSE. Once a pool
+# has been evaluated, picking a set of configurations subject to hard rules --
+# at most two per strategy, at least one per timeframe, a combined drawdown
+# budget, a reward-to-risk floor -- is an integer program, and "take the top k
+# by score" is not an algorithm for it. Greedy takes the best, then the next
+# best, and can paint itself into a corner: three excellent rows that all share
+# a strategy fill the diversity cap and force a far worse fourth. CP-SAT
+# returns the best feasible SET, and says when none exists.
+
+_ORTOOLS_HINT = ("OR-Tools is not installed in this environment. Add `ortools` to "
+                 "requirements.txt and redeploy to enable the exact solver; until then "
+                 "the same constraints are applied greedily, which is feasible but "
+                 "not guaranteed best.")
+
+
+def ortools_available() -> bool:
+    try:
+        from ortools.sat.python import cp_model                     # noqa: F401
+        return True
+    except Exception:                                               # noqa: BLE001
+        return False
+
+
+def _selection_payload(frame: pd.DataFrame, value_column: str) -> list:
+    """The pool as plain numbers, scaled to integers for the solver."""
+    out = []
+    for position, (_i, row) in enumerate(frame.iterrows()):
+        value = pd.to_numeric(pd.Series([row.get(value_column)]),
+                              errors="coerce").fillna(0.0).iloc[0]
+        drawdown = pd.to_numeric(pd.Series([row.get("Max DD")]),
+                                 errors="coerce").fillna(0.0).iloc[0]
+        out.append({
+            "i": position,
+            "value": int(round(float(value) * 1000)),
+            "drawdown": int(round(abs(float(drawdown)) * 1000)),
+            "trades": int(pd.to_numeric(pd.Series([row.get("Trades")]),
+                                        errors="coerce").fillna(0).iloc[0]),
+            "strategy": str(row.get("Strategy") or ""),
+            "timeframe": str(row.get("Timeframe") or row.get("TF") or ""),
+            "ticker": str(row.get("Ticker") or ""),
+            "reward_risk": float(pd.to_numeric(pd.Series([row.get("Reward:Risk")]),
+                                               errors="coerce").fillna(0.0).iloc[0]),
+            "win": float(pd.to_numeric(pd.Series([row.get("Win %")]),
+                                       errors="coerce").fillna(0.0).iloc[0]),
+        })
+    return out
+
+
+def select_portfolio(frame: pd.DataFrame, value_column: str = "Score",
+                     pick: int = 5, max_per_strategy: int = 2,
+                     max_per_ticker: int = 2, drawdown_budget: float | None = None,
+                     min_reward_risk: float = 0.0, min_win: float = 0.0,
+                     min_trades: int = 0, seconds: float = 10.0) -> tuple:
+    """
+    Choose the best FEASIBLE set of configurations, not the top few by score.
+
+    Returns (chosen frame, explanation, solver used). Rows failing a per-row
+    floor are removed first, because no selection can rescue them; the solver
+    then handles the rules that couple rows to each other.
+
+    The drawdown budget treats the selection's worst case as the SUM of the
+    individual drawdowns. That is deliberately pessimistic -- real drawdowns
+    rarely coincide exactly -- and being pessimistic about risk is the right
+    direction to be wrong in.
+    """
+    if frame is None or frame.empty:
+        return pd.DataFrame(), "nothing to select from", "none"
+
+    eligible = frame.copy()
+    before = len(eligible)
+    if min_reward_risk > 0 and "Reward:Risk" in eligible.columns:
+        eligible = eligible[pd.to_numeric(eligible["Reward:Risk"],
+                                          errors="coerce").fillna(0.0) >= min_reward_risk]
+    if min_win > 0 and "Win %" in eligible.columns:
+        eligible = eligible[pd.to_numeric(eligible["Win %"],
+                                          errors="coerce").fillna(0.0) >= min_win]
+    if min_trades > 0 and "Trades" in eligible.columns:
+        eligible = eligible[pd.to_numeric(eligible["Trades"],
+                                          errors="coerce").fillna(0) >= min_trades]
+    eligible = eligible.reset_index(drop=True)
+    dropped = before - len(eligible)
+    if eligible.empty:
+        return (pd.DataFrame(),
+                f"all {before} candidate(s) failed the per-row floors "
+                f"(reward:risk {min_reward_risk}, win {min_win}%, {min_trades} trades)",
+                "none")
+
+    items = _selection_payload(eligible, value_column)
+    budget = int(round(abs(float(drawdown_budget)) * 1000)) \
+        if drawdown_budget is not None else None
+
+    if ortools_available():
+        from ortools.sat.python import cp_model
+
+        model = cp_model.CpModel()
+        take = [model.NewBoolVar(f"x{item['i']}") for item in items]
+        model.Add(sum(take) <= int(pick))
+        model.Add(sum(take) >= 1)
+        if budget is not None:
+            model.Add(sum(take[item["i"]] * item["drawdown"] for item in items) <= budget)
+        for column, cap in (("strategy", max_per_strategy), ("ticker", max_per_ticker)):
+            if not cap:
+                continue
+            groups: dict = {}
+            for item in items:
+                groups.setdefault(item[column], []).append(take[item["i"]])
+            for key, members in groups.items():
+                if key and len(members) > cap:
+                    model.Add(sum(members) <= int(cap))
+        model.Maximize(sum(take[item["i"]] * item["value"] for item in items))
+
+        solver = cp_model.CpSolver()
+        solver.parameters.max_time_in_seconds = float(seconds)
+        status = solver.Solve(model)
+        if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            picked = [item["i"] for item in items if solver.Value(take[item["i"]])]
+            quality = "proved optimal" if status == cp_model.OPTIMAL \
+                else "best found within the time limit"
+            note = (f"CP-SAT {quality}: {len(picked)} of {len(items)} candidates, "
+                    f"{dropped} removed by the per-row floors before solving.")
+            return eligible.iloc[picked].reset_index(drop=True), note, "cp-sat"
+        return (pd.DataFrame(),
+                f"CP-SAT found no feasible set: the constraints cannot all be met at once. "
+                f"Relax the drawdown budget or the per-strategy cap.", "cp-sat")
+
+    # ---- the fallback, named as one -----------------------------------------
+    chosen, used_strategy, used_ticker, spent = [], {}, {}, 0
+    for item in sorted(items, key=lambda d: -d["value"]):
+        if len(chosen) >= int(pick):
+            break
+        if max_per_strategy and used_strategy.get(item["strategy"], 0) >= max_per_strategy:
+            continue
+        if max_per_ticker and used_ticker.get(item["ticker"], 0) >= max_per_ticker:
+            continue
+        if budget is not None and spent + item["drawdown"] > budget:
+            continue
+        chosen.append(item["i"])
+        used_strategy[item["strategy"]] = used_strategy.get(item["strategy"], 0) + 1
+        used_ticker[item["ticker"]] = used_ticker.get(item["ticker"], 0) + 1
+        spent += item["drawdown"]
+    note = (f"Greedy selection ({len(chosen)} picked, {dropped} removed by the per-row "
+            f"floors). {_ORTOOLS_HINT}")
+    return eligible.iloc[chosen].reset_index(drop=True), note, "greedy"
+
+
+def render_robust_controls(prefix: str) -> dict:
+    """
+    The two opt-in layers, both unticked. Leaving them alone changes nothing.
+    """
+    out = {"robust": False, "select": False}
+    with st.container(border=True):
+        st.markdown("**Optional: harder-to-fool ranking**")
+        out["robust"] = st.checkbox(
+            "Robust walk-forward search (purged folds + deflation)", value=False,
+            key=f"{prefix}_robust",
+            help="Re-tests the shortlist on contiguous slices of history and ranks on the "
+                 "MEDIAN slice rather than the total, then subtracts what a search of this "
+                 "size would have produced from noise alone. Slower, and the numbers it "
+                 "reports are lower — that is the point.")
+        if out["robust"]:
+            r1, r2, r3 = st.columns(3)
+            out["folds"] = r1.number_input("Folds", 2, 12, 4, 1, key=f"{prefix}_folds",
+                                           help="Contiguous slices of history. More folds "
+                                                "means a stricter test and fewer trades in "
+                                                "each one.")
+            out["min_profitable_folds"] = r2.number_input(
+                "Must profit in at least", 1, 12, 3, 1, key=f"{prefix}_minfolds",
+                help="A candidate profitable in one fold out of four earned its number in "
+                     "one stretch of market and lost in the rest.")
+            out["dispersion_penalty"] = r3.number_input(
+                "Disagreement penalty", 0.0, 3.0, 0.5, 0.1, key=f"{prefix}_disp",
+                help="How hard to demote a candidate whose folds disagree. 0 ranks on the "
+                     "median alone.")
+            st.caption("Expect the winner's numbers to FALL. A score that survives this is "
+                       "not a better strategy than before — it is the same strategy, "
+                       "measured in a way that is harder to fool.")
+
+        out["select"] = st.checkbox(
+            "Constrained selection with OR-Tools (CP-SAT)", value=False,
+            key=f"{prefix}_select",
+            help="Chooses the best FEASIBLE SET from the results under hard rules — a "
+                 "drawdown budget, a cap per strategy, a reward:risk floor. Ranking takes "
+                 "the top few; this solves for the best combination that satisfies every "
+                 "rule at once, which is a different and harder question.")
+        if out["select"]:
+            if not ortools_available():
+                st.warning(_ORTOOLS_HINT)
+            s1, s2, s3 = st.columns(3)
+            out["pick"] = s1.number_input("How many to pick", 1, 50, 5, 1,
+                                          key=f"{prefix}_pick")
+            out["max_per_strategy"] = s2.number_input("Max per strategy", 1, 20, 2, 1,
+                                                      key=f"{prefix}_percat")
+            out["max_per_ticker"] = s3.number_input("Max per ticker", 1, 20, 2, 1,
+                                                    key=f"{prefix}_perticker")
+            t1, t2, t3 = st.columns(3)
+            out["drawdown_budget"] = t1.number_input(
+                "Combined drawdown budget (0 = none)", 0.0, 1e9, 0.0, 100.0,
+                key=f"{prefix}_ddbudget",
+                help="The selection's drawdowns are SUMMED, which assumes the worst case "
+                     "that they all happen together. Pessimistic on purpose.")
+            out["min_reward_risk"] = t2.number_input("Minimum reward:risk", 0.0, 20.0, 0.0,
+                                                     0.1, key=f"{prefix}_minrr")
+            out["min_win"] = t3.number_input("Minimum win %", 0.0, 100.0, 0.0, 1.0,
+                                             key=f"{prefix}_minwin")
+    return out
+
+
+def render_selection_panel(frame: pd.DataFrame, options: dict, value_column: str,
+                           prefix: str) -> None:
+    """Run the constrained selection and show what it chose, and what it refused."""
+    if not options.get("select") or frame is None or frame.empty:
+        return
+    budget = float(options.get("drawdown_budget") or 0.0)
+    chosen, note, engine = select_portfolio(
+        frame, value_column=value_column if value_column in frame.columns else "Score",
+        pick=int(options.get("pick", 5)),
+        max_per_strategy=int(options.get("max_per_strategy", 2)),
+        max_per_ticker=int(options.get("max_per_ticker", 2)),
+        drawdown_budget=budget if budget > 0 else None,
+        min_reward_risk=float(options.get("min_reward_risk", 0.0)),
+        min_win=float(options.get("min_win", 0.0)))
+    st.markdown("##### Constrained selection")
+    if chosen.empty:
+        st.warning(f"**Nothing satisfies every constraint.** {note}")
+        return
+    st.caption(note)
+    st.dataframe(chosen, width="stretch", hide_index=True)
+    if engine == "cp-sat":
+        st.caption("This is the best SET under the rules, which is not the same as the top "
+                   "few rows of the table above — the rules couple the choices together, "
+                   "so a strong row can be excluded to make room for two others.")
 
 
 if __name__ == "__main__":
