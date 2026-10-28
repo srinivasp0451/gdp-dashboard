@@ -4135,6 +4135,11 @@ class Position:
     high_since_entry: float | None = None  # highest price seen while the trade was open
     low_since_entry: float | None = None
     signal_bars_ago: int | None = None     # age of the signal at the moment of entry
+    # The exact contract the ENTRY was routed on. The exit must close this one
+    # and not whatever the panel would resolve now: if the resolved pair or the
+    # direction rule changed while the trade was open, re-deriving it would
+    # close a leg that was never opened.
+    contract: dict | None = None
     entry_route: str = "newest closed candle"
     option_leg: str | None = None          # "CE" / "PE" when routed as an option
 
@@ -4656,6 +4661,91 @@ def resolve_instrument(master: pd.DataFrame, underlying: str, instrument: str,
     }
 
 
+# -----------------------------------------------------------------------------
+# LOT SIZES
+# -----------------------------------------------------------------------------
+# SEBI and the exchanges revise these, sometimes at short notice, so every one
+# is editable in the sidebar and the resolved contract's OWN lot size always
+# wins over this table. The table is a starting point for the box, not a
+# source of truth -- check the contract note.
+DEFAULT_LOT_SIZES = {
+    "NIFTY": 65, "BANKNIFTY": 30, "FINNIFTY": 65, "MIDCPNIFTY": 120,
+    "SENSEX": 20, "BANKEX": 30, "NIFTYNXT50": 25,
+}
+
+
+def default_quantity(instrument: str, underlying: str, lot_sizes: dict | None = None,
+                     contract: dict | None = None) -> int:
+    """
+    The quantity to start the box at.
+
+    Equity is one share. An option is one lot, and the lot comes from the
+    resolved contract when there is one, because that number came from the
+    exchange's own master file and the table below is only a guess at it.
+    """
+    if str(instrument).upper() != "OPTIONS":
+        return 1
+    if contract and contract.get("lot_size"):
+        try:
+            size = int(contract["lot_size"])
+            if size > 0:
+                return size
+        except (TypeError, ValueError):
+            pass
+    table = dict(DEFAULT_LOT_SIZES)
+    table.update(lot_sizes or {})
+    return int(table.get(str(underlying or "").strip().upper(), 1))
+
+
+def resolve_option_pair(master: pd.DataFrame, underlying: str, segment: str,
+                        spot_price: float | None, expiry: Any = None,
+                        strike_override: float | None = None) -> dict:
+    """
+    Resolve BOTH sides of the ATM option at once.
+
+    A signal can go either way, so waiting until it fires to look up the
+    contract means the lookup happens in the worst possible second. Both legs
+    are resolved up front, each with its own security id, and the signal then
+    picks one that is already in hand.
+
+    ``strike_override`` asks for a specific strike instead of the one nearest
+    spot; the nearest LISTED strike to that number is used, since a strike
+    that is not listed cannot be traded however reasonable it looks.
+    """
+    out: dict = {"spot": spot_price, "requested_strike": strike_override,
+                 "CALL": None, "PUT": None, "error": None}
+    target = strike_override if (strike_override and np.isfinite(strike_override)
+                                 and strike_override > 0) else spot_price
+    if target is None or not np.isfinite(target):
+        out["error"] = ("No spot price yet, so there is no way to say which strike is "
+                        "at the money. Load the ticker on a tab first, or type a strike.")
+        return out
+    for right in ("CALL", "PUT"):
+        try:
+            out[right] = resolve_instrument(master, underlying, "OPTIONS", segment,
+                                            float(target), right, expiry)
+        except BrokerError as exc:
+            out["error"] = str(exc)
+    return out
+
+
+def contract_for_signal(broker: dict, direction: int) -> dict | None:
+    """
+    Which leg a signal buys.
+
+    Long buys the call, short buys the put -- the operator's own rule, and the
+    reason both legs are resolved in advance. With the automatic choice off,
+    or outside options, the single resolved contract is used unchanged.
+    """
+    if not broker:
+        return None
+    if str(broker.get("instrument")) != "OPTIONS" or not broker.get("auto_right"):
+        return broker.get("contract")
+    pair = broker.get("option_pair") or {}
+    leg = pair.get("CALL" if direction > 0 else "PUT")
+    return leg or broker.get("contract")
+
+
 def dhan_ltp(broker: dict, contract: dict) -> float | None:
     """
     Real-time last traded price from DhanHQ v2 Market Quote.
@@ -5108,13 +5198,17 @@ def square_off(reason: str = "Manual Square-Off", price: float | None = None) ->
     st.session_state.live_position = None
     db_clear_position()
     db_append_trade(trade)
-    err = send_email(cfg, f"EXIT {trade['Direction']} {trade['Symbol']} :: "
-                          f"{fmt_signed(trade['PnL'])}",
-                     f"Reason: {reason}\nEntry: {fmt(trade['Entry Price'])}\n"
-                     f"Exit: {fmt(trade['Exit Price'])}\nPoints: {fmt_signed(trade['Points'])}\n"
-                     f"PnL: {fmt_signed(trade['PnL'])}\nTime: {pd.Timestamp.now()}")
-    if err:
-        log_event(err, "error")
+    # Alerts go out AFTER the position is closed and recorded. A message that
+    # fails must never unwind a trade that has already happened, so every
+    # problem here is logged and nothing else.
+    for problem in dispatch_alert(
+            cfg, "exit_long" if str(trade["Direction"]).upper() == "LONG" else "exit_short",
+            {"symbol": trade["Symbol"], "interval": cfg.get("interval"),
+             "strategy": cfg.get("strategy"), "price": trade["Exit Price"],
+             "quantity": trade.get("Quantity"), "reason": reason,
+             "pnl": trade["PnL"], "time": pd.Timestamp.now(),
+             "contract": (cfg.get("broker") or {}).get("contract")}):
+        log_event(problem, "error")
     log_event(f"{reason}: {trade['Direction']} closed at {fmt(trade['Exit Price'])} "
               f"for {fmt_signed(trade['PnL'])} ({fmt_signed(trade['Points'])} pts).",
               "warn" if trade["PnL"] < 0 else "success")
@@ -5126,18 +5220,44 @@ def _maybe_route_broker(cfg: dict, position: Position, closing: bool) -> None:
     broker = cfg.get("broker") or {}
     if not broker.get("enabled"):
         return
-    contract = broker.get("contract")
+    # The ENTRY picks its leg from the signal's direction: long buys the call,
+    # short buys the put. The EXIT must close the very contract the entry
+    # opened, which is remembered on the position -- re-deriving it here would
+    # close the wrong leg if the direction rule or the resolved pair had
+    # changed in between, and "sold a put I never owned" is not recoverable.
+    if closing:
+        contract = getattr(position, "contract", None) or broker.get("contract")
+    else:
+        contract = contract_for_signal(broker, position.direction)
+        if contract is not None:
+            try:
+                position.contract = contract
+            except Exception:                                       # noqa: BLE001
+                pass
     if not contract:
         log_event("Broker routing is on but no contract is resolved; order skipped.", "error")
         return
-    side = ("SELL" if position.direction > 0 else "BUY") if closing else \
-           ("BUY" if position.direction > 0 else "SELL")
+
+    # Buying an option is a BUY whichever way the underlying signal points: the
+    # direction is already expressed by WHICH leg was chosen, and selling a put
+    # to express a short view would be a different trade with different risk.
+    buying_option = (str(broker.get("instrument")) == "OPTIONS"
+                     and bool(broker.get("auto_right")))
+    if buying_option:
+        side = "SELL" if closing else "BUY"
+    else:
+        side = ("SELL" if position.direction > 0 else "BUY") if closing else \
+               ("BUY" if position.direction > 0 else "SELL")
+
+    quantity = broker.get("quantity") or position.quantity
     try:
-        receipt = place_dhan_order(broker, contract, side, position.quantity,
+        receipt = place_dhan_order(broker, contract, side, quantity,
                                    dry_run=broker.get("dry_run", True))
         st.session_state.broker_receipts.insert(0, {
             "time": pd.Timestamp.now(), "leg": "EXIT" if closing else "ENTRY",
-            "side": side, **{k: receipt.get(k) for k in ("status", "order_id", "message")}})
+            "side": side, "contract": contract.get("trading_symbol"),
+            "security id": contract.get("security_id"), "quantity": quantity,
+            **{k: receipt.get(k) for k in ("status", "order_id", "message")}})
         del st.session_state.broker_receipts[100:]
         if not closing:
             position.broker_order_id = receipt.get("order_id")
@@ -5223,15 +5343,15 @@ def _open_live_position(cfg: dict, direction: int, price: float, ctx: BarCtx, ba
                   f"{fmt(remaining)}; risk now {fmt(mgr.risk_points)}.", "warn")
     _maybe_route_broker(cfg, position, closing=False)
     db_save_position(position, cfg)
-    err = send_email(cfg, f"ENTRY {'LONG' if direction > 0 else 'SHORT'} {cfg['symbol']} "
-                          f"@ {fmt(price)}",
-                     f"Strategy: {cfg['strategy']}\nSymbol: {cfg['symbol']} ({cfg['interval']})\n"
-                     f"Direction: {'LONG' if direction > 0 else 'SHORT'}\n"
-                     f"Entry: {fmt(price)}\nStop: {fmt(mgr.sl)}\nTarget: {fmt(mgr.tp)}\n"
-                     f"Quantity: {fmt(cfg['risk'].quantity, 0)}\n"
-                     f"Time: {pd.Timestamp.now()}")
-    if err:
-        log_event(err, "error")
+    for problem in dispatch_alert(
+            cfg, "entry_long" if direction > 0 else "entry_short",
+            {"symbol": cfg["symbol"], "interval": cfg["interval"],
+             "strategy": cfg["strategy"], "price": price, "stop": mgr.sl,
+             "target": mgr.tp, "quantity": cfg["risk"].quantity,
+             "reason": f"signal from {cfg['strategy']}",
+             "time": pd.Timestamp.now(),
+             "contract": (cfg.get("broker") or {}).get("contract")}):
+        log_event(problem, "error")
     log_event(f"ENTRY {'LONG' if direction > 0 else 'SHORT'} @ {fmt(price)} on signal from "
               f"{cfg['strategy']} (candle {fmt_time(bar_time)}) | SL {fmt(mgr.sl)} | "
               f"TGT {fmt(mgr.tp)} | qty {fmt(cfg['risk'].quantity, 0)}", "success")
@@ -5983,23 +6103,9 @@ def render_sidebar() -> dict:
     # There is exactly ONE switch for Dhan market data, and it lives in the Dhan
     # panel next to the credentials it needs. A second copy up here asked the
     # same question twice and neither copy said which one counted.
-    email_cfg = {"enabled": False}
-    with sb.expander("Email notifications (off by default)"):
-        email_cfg["enabled"] = st.checkbox("Send email on entry and exit", value=False,
-                                           key="cfg_email_on")
-        if email_cfg["enabled"]:
-            email_cfg["from"] = st.text_input("From address", "srinivasp451@gmail.com",
-                                              key="cfg_email_from")
-            email_cfg["to"] = st.text_input("To address", "srinivasp451@gmail.com",
-                                            key="cfg_email_to")
-            email_cfg["password"] = st.text_input("App password", type="password",
-                                                  key="cfg_email_pw",
-                                                  help="A Gmail App Password, not your account "
-                                                       "password. It is held in memory for this "
-                                                       "session only and never written to disk.")
-            email_cfg["host"] = st.text_input("SMTP host", "smtp.gmail.com", key="cfg_email_host")
-            email_cfg["port"] = st.number_input("SMTP port (SSL)", 1, 65535, 465,
-                                                key="cfg_email_port")
+    channels = render_alert_sidebar(
+        sb, {"symbol": symbol, "interval": interval, "strategy": strategy})
+    email_cfg = channels["email"]
 
     st.session_state["groq_cfg"] = render_groq_sidebar(sb)
     filter_cfg, filter_extras = _render_filters(sb, live)
@@ -6150,6 +6256,7 @@ def render_sidebar() -> dict:
             "candle_seconds": float(candle_seconds), "costs": costs,
             "walk_forward": bool(walk_fwd), "wf_folds": int(wf_folds),
             "use_dhan_data": bool(broker.get("use_live_ltp")), "email": email_cfg,
+            "whatsapp": channels["whatsapp"], "alerts": channels["alerts"],
             "filter_cfg": filter_cfg, "filter_extras": filter_extras, "broker": broker,
             "currency": currency_symbol(symbol),
             "hide_weekends": not trades_around_the_clock(symbol)}
@@ -6272,53 +6379,192 @@ def _render_broker(sb, live: bool, symbol: str) -> dict:
         # --- contract: needed for the LTP feed AND for order routing ---
         st.markdown("**Contract**")
         instrument = st.selectbox("Instrument", DHAN_INSTRUMENTS, key="brk_inst")
-        segment = st.selectbox("Exchange segment", DHAN_SEGMENTS,
-                               index=0 if instrument == "EQUITY" else 2, key="brk_seg")
-        underlying = st.text_input("Underlying symbol", value=_default_underlying(symbol),
-                                   key="brk_under",
-                                   help="Dhan's own name, e.g. RELIANCE, NIFTY, BANKNIFTY.")
+
+        # THE SEGMENT AND THE UNDERLYING FOLLOW THE SIDEBAR TICKER.
+        #
+        # They used to be plain widgets, and a Streamlit widget keeps whatever
+        # value it was first created with. Switch Instrument from EQUITY to
+        # OPTIONS and the segment stayed on NSE_EQ; change the ticker and the
+        # underlying stayed on the old name. Both then failed to resolve, which
+        # is the "a spot price is required" dead end -- the real fault was two
+        # boxes quietly out of step with the rest of the sidebar.
+        #
+        # Now each follows automatically and the widget's KEY carries what it
+        # is following, so it is rebuilt rather than remembered. Ticking the
+        # override hands control back.
+        wants_fno = instrument in ("OPTIONS", "FUTURES")
+        auto_underlying = _default_underlying(symbol)
+        auto_segment = ("BSE_FNO" if (wants_fno and auto_underlying in ("SENSEX", "BANKEX"))
+                        else "NSE_FNO" if wants_fno
+                        else "BSE_EQ" if str(symbol).upper().endswith(".BO") else "NSE_EQ")
+
+        override = st.checkbox(
+            "Set the segment and underlying myself", value=False, key="brk_manual",
+            help=f"Off: both follow the sidebar ticker — right now that is "
+                 f"{auto_segment} / {auto_underlying}. Tick this only for a contract "
+                 f"the mapping does not cover.")
+        if override:
+            segment = st.selectbox("Exchange segment", DHAN_SEGMENTS,
+                                   index=DHAN_SEGMENTS.index(auto_segment),
+                                   key=f"brk_seg_{auto_segment}")
+            underlying = st.text_input("Underlying symbol", value=auto_underlying,
+                                       key=f"brk_under_{auto_underlying}",
+                                       help="Dhan's own name: RELIANCE, NIFTY, BANKNIFTY.")
+        else:
+            segment, underlying = auto_segment, auto_underlying
+            st.caption(f"Segment **{segment}** · underlying **{underlying}** — taken from "
+                       f"`{symbol}`. These change with the ticker.")
+
         broker["instrument"] = instrument
         broker["segment"] = segment
         broker["underlying"] = underlying
+
+        # --- spot, which the ATM strike depends on ---------------------------
+        #
+        # Previously this only looked at a live snapshot or a finished
+        # backtest, so on a fresh page load there was no spot and no ATM could
+        # be chosen -- for a panel whose whole job is to find the ATM strike.
+        # It now falls back to the last close of the ticker's own daily data,
+        # which always exists.
+        spot = None
+        spot_source = ""
+        snapshot = st.session_state.get("live_snapshot")
+        result = st.session_state.get("backtest_result")
+        if snapshot is not None and getattr(snapshot, "ltp", None):
+            spot, spot_source = float(snapshot.ltp), "the live feed"
+        elif result is not None:
+            spot, spot_source = float(result.frame["Close"].iloc[-1]), "the last backtest"
+        else:
+            try:
+                spot = float(load_market_data(symbol, "5d", "1d", freshness_seconds=900,
+                                              min_bars=1).frame["Close"].iloc[-1])
+                spot_source = "the most recent daily close"
+            except Exception:                                       # noqa: BLE001
+                spot, spot_source = None, ""
+
         option_type = "CALL"
+        strike_override = None
         if instrument == "OPTIONS":
             broker["auto_right"] = st.checkbox(
                 "Pick the right from the signal (long -> CE, short -> PE)", value=True,
-                key="brk_auto_right")
-            option_type = st.selectbox("Option right (used when auto is off)", ["CALL", "PUT"],
-                                       key="brk_right")
+                key="brk_auto_right",
+                help="On: both legs are resolved in advance and the signal takes the "
+                     "one it needs. Off: every order uses the single right below.")
+            option_type = st.selectbox("Option right (used when auto is off)",
+                                       ["CALL", "PUT"], key="brk_right")
+            if spot:
+                st.caption(f"Spot {fmt(spot)} from {spot_source}.")
+            else:
+                st.warning("No spot price could be read for this ticker, so the ATM "
+                           "strike cannot be chosen automatically. Type a strike below.")
+            use_own_strike = st.checkbox(
+                "Choose the strike myself", value=False, key="brk_own_strike",
+                help="Off: the listed strike nearest spot, which is the ATM. On: type "
+                     "any strike and the nearest LISTED one to it is used — an "
+                     "unlisted strike cannot be traded however sensible it looks.")
+            if use_own_strike:
+                strike_override = float(st.number_input(
+                    "Strike", 0.0, 1e9, float(round(spot or 0.0, -1)), 50.0,
+                    key="brk_strike"))
         broker["option_type"] = option_type
 
-        if st.button("Resolve contract", key="brk_resolve"):
+        resolve_label = ("Resolve both CE and PE" if instrument == "OPTIONS"
+                         else "Resolve contract")
+        if st.button(resolve_label, key="brk_resolve", width="stretch"):
             try:
                 with st.spinner("Downloading the Dhan instrument master..."):
                     master = st.session_state.scrip_master
                     if master is None:
                         master = load_scrip_master()
                         st.session_state.scrip_master = master
-                spot = None
-                snap = st.session_state.get("live_snapshot")
-                res = st.session_state.get("backtest_result")
-                if snap is not None:
-                    spot = snap.ltp
-                elif res is not None:
-                    spot = float(res.frame["Close"].iloc[-1])
-                st.session_state["brk_contract"] = resolve_instrument(
-                    master, underlying, instrument, segment, spot, option_type)
+                if instrument == "OPTIONS":
+                    pair = resolve_option_pair(master, underlying, segment, spot,
+                                               strike_override=strike_override)
+                    st.session_state["brk_pair"] = pair
+                    st.session_state["brk_contract"] = (
+                        pair.get("CALL") if option_type == "CALL" else pair.get("PUT"))
+                    if pair.get("error") and not (pair.get("CALL") or pair.get("PUT")):
+                        st.error(pair["error"])
+                else:
+                    st.session_state["brk_pair"] = None
+                    st.session_state["brk_contract"] = resolve_instrument(
+                        master, underlying, instrument, segment, spot, option_type)
             except BrokerError as exc:
                 st.error(str(exc))
+            except Exception as exc:                                # noqa: BLE001
+                st.error(f"Could not resolve the contract: {exc}")
 
+        pair = st.session_state.get("brk_pair") if instrument == "OPTIONS" else None
+        broker["option_pair"] = pair
         contract = st.session_state.get("brk_contract")
-        if contract:
+
+        if pair and (pair.get("CALL") or pair.get("PUT")):
+            # BOTH legs, with their own security ids, so the signal has
+            # nothing left to look up when it fires.
+            rows = []
+            for right, label in (("CALL", "CE — taken on a BUY signal"),
+                                 ("PUT", "PE — taken on a SELL signal")):
+                leg = pair.get(right)
+                if not leg:
+                    rows.append({"Leg": label, "Strike": None, "Symbol": "not resolved",
+                                 "Security id": "--", "Expiry": "--", "Lot": None})
+                    continue
+                rows.append({"Leg": label, "Strike": leg.get("strike"),
+                             "Symbol": leg.get("trading_symbol"),
+                             "Security id": leg.get("security_id"),
+                             "Expiry": leg.get("expiry"), "Lot": leg.get("lot_size")})
+            st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+            if pair.get("error"):
+                st.warning(pair["error"])
+            st.caption("Both security ids are resolved now, before any signal. When one "
+                       "fires, the matching leg is already in hand — a lookup at the "
+                       "moment of entry is a lookup at the worst possible second.")
+            if not broker.get("auto_right"):
+                st.info(f"Automatic right is OFF, so every order uses the "
+                        f"**{option_type}** leg whichever way the signal goes.")
+            contract = contract or pair.get("CALL") or pair.get("PUT")
             broker["contract"] = contract
-            st.success(f"{contract['trading_symbol']}  (security id {contract['security_id']})")
+        elif contract:
+            broker["contract"] = contract
+            st.success(f"{contract['trading_symbol']}  "
+                       f"(security id {contract['security_id']})")
             st.json({k: v for k, v in contract.items() if v is not None})
-            if contract.get("lot_size"):
-                st.caption(f"Lot size {contract['lot_size']}. Quantity is sent in units, so set "
-                           "the sidebar quantity to a multiple of the lot.")
         else:
-            st.info("Resolve a contract to enable the Dhan LTP feed and, if switched on, order "
-                    "routing.")
+            st.info("Resolve a contract to enable the Dhan LTP feed and, if switched on, "
+                    "order routing.")
+
+        # --- quantity --------------------------------------------------------
+        st.markdown("**Quantity**")
+        lot_sizes = dict(DEFAULT_LOT_SIZES)
+        if instrument == "OPTIONS":
+            with st.expander("Lot sizes (edit when the exchange changes them)"):
+                st.caption("SEBI and the exchanges revise these, sometimes at short "
+                           "notice. A resolved contract's OWN lot size always wins over "
+                           "this table — these numbers only set the starting value of "
+                           "the box below.")
+                columns = st.columns(2)
+                for position, (name, size) in enumerate(DEFAULT_LOT_SIZES.items()):
+                    lot_sizes[name] = int(columns[position % 2].number_input(
+                        name, 1, 100000, int(size), 1, key=f"brk_lot_{name}"))
+        suggested = default_quantity(instrument, underlying, lot_sizes, contract)
+        source = ("the resolved contract" if (contract and contract.get("lot_size"))
+                  else "the table above" if instrument == "OPTIONS"
+                  else "one share")
+        quantity = st.number_input(
+            "Order quantity (units, not lots)", 1, 10_000_000, int(suggested), 1,
+            key=f"brk_qty_{instrument}_{underlying}_{suggested}",
+            help=f"Defaulted to {suggested} from {source}. Dhan takes a quantity in "
+                 f"UNITS, so two lots of Nifty is {suggested * 2}, not 2.")
+        broker["quantity"] = int(quantity)
+        if instrument == "OPTIONS" and suggested > 1:
+            whole, remainder = divmod(int(quantity), int(suggested))
+            if remainder:
+                st.error(f"{int(quantity)} is not a whole number of lots "
+                         f"({suggested} per lot). The exchange will reject it. The "
+                         f"nearest valid quantities are {whole * suggested} and "
+                         f"{(whole + 1) * suggested}.")
+            else:
+                st.caption(f"{whole} lot(s) of {suggested}.")
 
         # --- order-only settings ---
         if enable_orders:
@@ -6329,6 +6575,148 @@ def _render_broker(sb, live: bool, symbol: str) -> dict:
                                             value=True, key="brk_dry")
             broker["product_type"] = st.selectbox("Product type", DHAN_PRODUCTS, key="brk_prod")
     return broker
+
+
+def render_alert_sidebar(sb, cfg_preview: dict) -> dict:
+    """
+    One place for everything that gets sent, with the message shown first.
+
+    The preview is above the switches on purpose. Enabling alerts and then
+    discovering what they say by receiving one is the wrong order, especially
+    when somebody else is reading them.
+    """
+    alerts = {"enabled": False, "fields": [key for key, _l, d in ALERT_FIELDS if d],
+              "plain_english": True, "header": "", "footer": ""}
+    email_cfg = {"enabled": False}
+    whatsapp = {"enabled": False}
+
+    with sb.expander("Alerts: WhatsApp and email (off by default)"):
+        alerts["plain_english"] = st.checkbox(
+            "Plain English", value=True, key="alert_plain",
+            help="On: BUY, SELL, CLOSE your BUY. Off: LONG ENTRY, SHORT ENTRY, EXIT "
+                 "LONG — the trader's words. Use plain English if anyone reading these "
+                 "does not live in a terminal.")
+
+        st.markdown("**What goes in the message**")
+        chosen = []
+        columns = st.columns(2)
+        for position, (key, label, default) in enumerate(ALERT_FIELDS):
+            if columns[position % 2].checkbox(label, value=default,
+                                              key=f"alert_f_{key}"):
+                chosen.append(key)
+        alerts["fields"] = chosen
+
+        alerts["header"] = st.text_input(
+            "A line to put at the top (optional)", value="", key="alert_header",
+            help="Anything you want every message to start with — your name, which "
+                 "account it is, a warning. Left empty, nothing is added.")
+        alerts["footer"] = st.text_input("A line to put at the bottom (optional)",
+                                         value="", key="alert_footer")
+
+        st.markdown("**This is exactly what will be sent**")
+        preview_event = st.selectbox(
+            "Preview which event", ["entry_long", "entry_short", "exit_long", "exit_short"],
+            format_func=lambda e: {"entry_long": "A buy signal",
+                                   "entry_short": "A sell signal",
+                                   "exit_long": "Closing a buy",
+                                   "exit_short": "Closing a sell"}[e],
+            key="alert_preview_event")
+        sample = sample_alert_data(cfg_preview)
+        preview = build_alert(preview_event, sample, alerts["fields"],
+                              alerts["plain_english"], alerts["header"],
+                              alerts["footer"])
+        st.code(preview or "(nothing selected — the message would be empty)",
+                language=None)
+        st.caption("Sample numbers, real format. Untick anything above and it "
+                   "disappears from the message; a field with nothing behind it is "
+                   "left out rather than sent as a blank.")
+        if not chosen:
+            st.warning("Every field is unticked, so nothing would be sent.")
+
+        # ---- email -----------------------------------------------------------
+        st.divider()
+        email_cfg["enabled"] = st.checkbox("Send this by email", value=False,
+                                           key="cfg_email_on")
+        if email_cfg["enabled"]:
+            email_cfg["from"] = st.text_input("From address", "", key="cfg_email_from")
+            email_cfg["to"] = st.text_input("To address", "", key="cfg_email_to")
+            email_cfg["password"] = st.text_input(
+                "App password", type="password", key="cfg_email_pw",
+                help="A Gmail App Password, not your account password. Held in memory "
+                     "for this session only and never written to disk.")
+            email_cfg["host"] = st.text_input("SMTP host", "smtp.gmail.com",
+                                              key="cfg_email_host")
+            email_cfg["port"] = st.number_input("SMTP port (SSL)", 1, 65535, 465,
+                                                key="cfg_email_port")
+
+        # ---- whatsapp --------------------------------------------------------
+        st.divider()
+        whatsapp["enabled"] = st.checkbox("Send this on WhatsApp", value=False,
+                                          key="cfg_wa_on")
+        if whatsapp["enabled"]:
+            st.info("**WhatsApp has no open send API.** Every route below goes through "
+                    "a provider you sign up to yourself, and they are not equivalent — "
+                    "read the note under whichever you pick.")
+            whatsapp["provider"] = st.selectbox("Provider", WHATSAPP_PROVIDERS,
+                                                key="cfg_wa_provider")
+            provider = whatsapp["provider"]
+            if provider.startswith("Twilio"):
+                st.caption("A real business API: reliable and paid. For testing, join "
+                           "the Twilio sandbox from your own phone first, otherwise "
+                           "messages are rejected.")
+                whatsapp["account_sid"] = st.text_input("Account SID", key="cfg_wa_sid")
+                whatsapp["auth_token"] = st.text_input("Auth token", type="password",
+                                                       key="cfg_wa_tok")
+                whatsapp["from"] = st.text_input("From number (with country code)",
+                                                 "+14155238886", key="cfg_wa_from")
+                whatsapp["to"] = st.text_input("Your number (with country code)",
+                                               "+91", key="cfg_wa_to")
+            elif provider.startswith("Meta"):
+                st.warning("**Read this before relying on it.** Outside a 24-hour "
+                           "window after the recipient messages you, the Cloud API "
+                           "will only deliver a PRE-APPROVED TEMPLATE. A trade alert "
+                           "is free text, so it will be silently refused unless you "
+                           "have an approved template — and a refused exit alert is "
+                           "the one you find out about by missing the exit.")
+                whatsapp["phone_number_id"] = st.text_input("Phone number ID",
+                                                            key="cfg_wa_pid")
+                whatsapp["auth_token"] = st.text_input("Access token", type="password",
+                                                       key="cfg_wa_mtok")
+                whatsapp["to"] = st.text_input("Your number (with country code)",
+                                               "+91", key="cfg_wa_mto")
+            elif provider.startswith("CallMeBot"):
+                st.warning("Free and easy, and run by one person as a hobby. Fine for "
+                           "trying this out; do not depend on it for anything that "
+                           "costs money if it does not arrive.")
+                whatsapp["to"] = st.text_input("Your number (with country code)",
+                                               "+91", key="cfg_wa_cto")
+                whatsapp["api_key"] = st.text_input(
+                    "API key", key="cfg_wa_ckey",
+                    help="Message the CallMeBot number from your phone once and it "
+                         "replies with this key.")
+            else:
+                whatsapp["webhook_url"] = st.text_input("Webhook URL",
+                                                        key="cfg_wa_hook")
+                st.caption("The message is POSTed as JSON with both a `text` and a "
+                           "`message` field, so most bridges accept it unchanged.")
+
+        if (email_cfg["enabled"] or whatsapp["enabled"]) and chosen:
+            alerts["enabled"] = True
+            if st.button("Send a test message now", key="alert_test",
+                         width="stretch"):
+                probe = {"email": email_cfg, "whatsapp": whatsapp, "alerts": alerts}
+                problems = dispatch_alert(probe, preview_event, sample)
+                if problems:
+                    for problem in problems:
+                        st.error(problem)
+                else:
+                    st.success("Sent. If it has not arrived in a minute, the provider "
+                               "accepted it and then dropped it — check its own log.")
+            st.caption("A test sends the exact message above to the channels switched "
+                       "on. Alerts never block a trade: if a message fails, the "
+                       "failure is logged and the position carries on unchanged.")
+
+    return {"alerts": alerts, "email": email_cfg, "whatsapp": whatsapp}
 
 
 def _default_underlying(symbol: str) -> str:
@@ -6468,6 +6856,30 @@ def render_pnl_calendar(trades: pd.DataFrame, currency: str = "", max_months: in
 def tab_backtest(cfg: dict) -> None:
     st.subheader("Backtesting Engine Studio")
     st.caption("Historical simulation only. Nothing here can reach the live ledger in Tab 3.")
+
+    with st.expander(f"Strategy reference — what all {len(STRATEGIES)} of them do"):
+        st.caption("Written out of the code itself: the long and short conditions below "
+                   "come from the same function that prints the live status panel, and "
+                   "the parameter list for each strategy is found by running it and "
+                   "recording what it asks for. It therefore cannot drift away from what "
+                   "the app actually does — and it is regenerated with YOUR current "
+                   "parameters, not the shipped defaults.")
+        if st.button("Write the reference", key="readme_build"):
+            with st.spinner(f"Running all {len(STRATEGIES)} strategies to read their "
+                            f"own rules..."):
+                st.session_state["strategy_readme"] = build_strategy_readme(cfg["params"])
+        reference = st.session_state.get("strategy_readme")
+        if reference:
+            st.download_button("Download STRATEGIES.md", reference.encode("utf-8"),
+                               "STRATEGIES.md", "text/markdown", key="readme_dl",
+                               width="stretch")
+            current = strategy_rules(cfg["strategy"], cfg["params"])
+            if current.get("long"):
+                st.markdown(f"**{cfg['strategy']}** — the one selected now")
+                st.markdown(f"- **Long when:** {current['long']}")
+                st.markdown(f"- **Short when:** {current['short']}")
+            with st.expander("Read it here", expanded=False):
+                st.markdown(reference)
 
     left, right = st.columns([1, 3])
     run = left.button("Run Backtest Analysis", type="primary", width="stretch")
@@ -22701,6 +23113,228 @@ def pytest_approx(value, tolerance=1e-9):
     return _Close()
 
 
+def _test_alerts_say_what_they_mean():
+    """
+    An alert is read on a phone by somebody who may not think in LONG and
+    SHORT. The message has to survive that reader, and the preview has to be
+    the message -- not an approximation of it.
+    """
+    data = sample_alert_data({"symbol": "^NSEI", "interval": "15m",
+                              "strategy": "01 · Dual EMA Crossover"})
+
+    plain = build_alert("entry_long", data)
+    assert plain.startswith("BUY"), plain
+    assert "Nifty 50" in plain and "^NSEI" not in plain, \
+        "a ticker symbol is not a name anyone recognises"
+    assert "LONG" not in plain, "plain English must not leak trader vocabulary"
+
+    trader = build_alert("entry_long", data, plain_english=False)
+    assert trader.startswith("LONG ENTRY"), trader
+    assert build_alert("entry_short", data).startswith("SELL")
+    assert build_alert("exit_long", data).startswith("CLOSE your BUY")
+    assert build_alert("exit_short", data).startswith("CLOSE your SELL")
+
+    # An exit reports what it made; an entry reports where it is getting out.
+    exit_message = build_alert("exit_long", data)
+    assert "Result:" in exit_message and "profit" in exit_message
+    assert "Stop loss" not in exit_message, "a stop on a closed trade is noise"
+    entry_message = build_alert("entry_long", data)
+    assert "Stop loss" in entry_message and "Target" in entry_message
+    assert "Result:" not in entry_message
+    losing = dict(data, pnl=-4200.0)
+    assert "loss" in build_alert("exit_long", losing)
+
+    # Every field can be switched off, and switching one off removes exactly
+    # that line and nothing else.
+    # Matched on the LINE PREFIX, not on a bare substring: "Timeframe:" also
+    # contains "Time", and a looser check passes for the wrong reason.
+    for key, label_hint in (("stop", "Stop loss:"), ("target", "Target:"),
+                            ("quantity", "Quantity:"), ("contract", "Contract:"),
+                            ("time", "Time:"), ("disclaimer", "automatically")):
+        without = build_alert("entry_long", data,
+                              fields=[k for k in ALERT_FIELD_KEYS if k != key])
+        assert label_hint not in without, f"unticking {key} left {label_hint} behind"
+        assert label_hint in build_alert("entry_long", data, fields=ALERT_FIELD_KEYS)
+
+    # A field with nothing behind it is LEFT OUT, not sent as a blank. "Stop:
+    # --" on a phone is worse than no stop line.
+    thin = {"symbol": "RELIANCE.NS", "price": 1234.5}
+    message = build_alert("entry_long", thin)
+    assert "--" not in message and "None" not in message, message
+    assert "Reliance" in message or "RELIANCE" in message
+    assert "nan" not in message.lower()
+    assert "Stop loss" not in build_alert("entry_long", dict(thin, stop=float("nan")))
+
+    # Header and footer are added only when they have content.
+    assert build_alert("entry_long", thin, header="  ") == message
+    framed = build_alert("entry_long", thin, header="ACME", footer="bye")
+    assert framed.startswith("ACME") and framed.rstrip().endswith("bye")
+
+    # Nothing selected means nothing sent, rather than a mystery blank.
+    assert build_alert("entry_long", data, fields=[]).strip() == ""
+
+    # --- the channels --------------------------------------------------------
+    assert send_whatsapp({"whatsapp": {"enabled": False}}, "hi") is None, \
+        "a disabled channel must be silent, not an error"
+    for provider, missing in (("Twilio", "account SID"),
+                              ("Meta WhatsApp Cloud API", "phone number ID"),
+                              ("CallMeBot (free, best effort)", "phone number"),
+                              ("Generic webhook (POST JSON)", "webhook URL")):
+        problem = send_whatsapp(
+            {"whatsapp": {"enabled": True, "provider": provider}}, "hi")
+        assert problem and missing.split()[0].lower() in problem.lower(), (provider, problem)
+    assert send_whatsapp({"whatsapp": {"enabled": True, "provider": "Twilio",
+                                       "account_sid": "x", "auth_token": "y",
+                                       "from": "+1", "to": "+91"}}, "   ")
+
+    # A failed alert must NEVER unwind a trade: dispatch collects problems and
+    # returns them for logging rather than raising.
+    problems = dispatch_alert(
+        {"email": {"enabled": True}, "whatsapp": {"enabled": True, "provider": "Twilio"},
+         "alerts": {"fields": ALERT_FIELD_KEYS, "plain_english": True}},
+        "entry_long", data)
+    assert len(problems) == 2, problems
+    assert dispatch_alert({}, "entry_long", data) == []
+
+    print(f"   alerts: plain English says BUY/SELL/CLOSE, {len(ALERT_FIELDS)} fields each "
+          f"switchable, empty fields omitted, every provider names what it is missing, "
+          f"a failed send returns rather than raises  OK")
+
+
+def _test_option_pair_and_quantity():
+    """
+    Both legs resolved in advance, and a quantity that is a whole number of
+    lots.
+
+    The operator's panel could not reach an ATM strike at all: the segment and
+    underlying were plain widgets that kept their first value, so switching to
+    OPTIONS left the segment on NSE_EQ, and nothing resolved. Below, the two
+    things that fix it are tested directly -- a pair resolved from spot, and a
+    quantity that starts at the right lot.
+    """
+    # A small stand-in instrument master: one underlying, two rights, a
+    # ladder of strikes.
+    rows = []
+    for strike in range(23800, 24301, 50):
+        for right, suffix in (("CE", "CALL"), ("PE", "PUT")):
+            rows.append({
+                "security_id": f"{strike}{1 if right == 'CE' else 2}",
+                "trading_symbol": f"NIFTY30OCT{strike}{right}",
+                "custom_symbol": f"NIFTY 30 OCT {strike} {suffix}",
+                "name": "NIFTY", "segment": "FNO", "exchange": "NSE",
+                "instrument": "OPTIDX", "option_type": right,
+                "strike": float(strike), "lot_size": 65,
+                "expiry": pd.Timestamp("2026-10-30")})
+    master = pd.DataFrame(rows)
+
+    pair = resolve_option_pair(master, "NIFTY", "NSE_FNO", spot_price=24013.0)
+    assert pair["CALL"] and pair["PUT"], pair
+    # ATM is the nearest LISTED strike to spot, which is 24000 and not 24013.
+    assert pair["CALL"]["strike"] == 24000.0, pair["CALL"]
+    assert pair["PUT"]["strike"] == 24000.0, pair["PUT"]
+    # Two legs, two different security ids -- the point of resolving both.
+    assert pair["CALL"]["security_id"] != pair["PUT"]["security_id"]
+    assert pair["CALL"]["option_type"] == "CALL"
+    assert pair["PUT"]["option_type"] == "PUT"
+    assert pair["CALL"]["expiry"] == "2026-10-30"
+
+    # An asked-for strike is honoured, snapped to the nearest LISTED one: a
+    # strike that is not listed cannot be traded however sensible it looks.
+    asked = resolve_option_pair(master, "NIFTY", "NSE_FNO", 24013.0,
+                                strike_override=24177.0)
+    assert asked["CALL"]["strike"] == 24200.0, asked["CALL"]["strike"]
+    # And with no spot and no override there is no ATM, said in words.
+    blind = resolve_option_pair(master, "NIFTY", "NSE_FNO", None)
+    assert blind["CALL"] is None and "no way to say which strike" in blind["error"]
+    # ...but a typed strike rescues exactly that case.
+    typed = resolve_option_pair(master, "NIFTY", "NSE_FNO", None, strike_override=24100.0)
+    assert typed["CALL"] and typed["CALL"]["strike"] == 24100.0
+
+    # The signal picks the leg: long buys the call, short buys the put.
+    broker = {"instrument": "OPTIONS", "auto_right": True, "option_pair": pair,
+              "contract": pair["CALL"]}
+    assert contract_for_signal(broker, +1)["option_type"] == "CALL"
+    assert contract_for_signal(broker, -1)["option_type"] == "PUT"
+    # With the automatic choice off, both directions use the one contract.
+    manual = dict(broker, auto_right=False)
+    assert contract_for_signal(manual, +1) is pair["CALL"]
+    assert contract_for_signal(manual, -1) is pair["CALL"]
+    # And outside options the single contract is used unchanged.
+    equity = {"instrument": "EQUITY", "auto_right": True, "contract": {"security_id": "1"}}
+    assert contract_for_signal(equity, -1)["security_id"] == "1"
+    assert contract_for_signal({}, 1) is None
+
+    # --- quantity ------------------------------------------------------------
+    assert default_quantity("EQUITY", "RELIANCE") == 1, "one share, not one lot"
+    assert default_quantity("OPTIONS", "NIFTY") == DEFAULT_LOT_SIZES["NIFTY"]
+    assert default_quantity("OPTIONS", "SENSEX") == DEFAULT_LOT_SIZES["SENSEX"]
+    assert default_quantity("OPTIONS", "BANKNIFTY") == DEFAULT_LOT_SIZES["BANKNIFTY"]
+    # The table is editable, and an edit is honoured.
+    assert default_quantity("OPTIONS", "NIFTY", {"NIFTY": 75}) == 75
+    # The RESOLVED contract always wins over the table, because that number
+    # came from the exchange's own master file and the table is a guess at it.
+    assert default_quantity("OPTIONS", "NIFTY", {"NIFTY": 999},
+                            pair["CALL"]) == 65
+    # An unknown underlying falls back to 1 rather than inventing a lot.
+    assert default_quantity("OPTIONS", "SOMETHINGELSE") == 1
+
+    print(f"   option pair: both legs resolved at the 24000 ATM with separate security "
+          f"ids, a typed strike snaps to the nearest listed one, long takes CE and short "
+          f"PE, quantity defaults to {DEFAULT_LOT_SIZES['NIFTY']} for Nifty and 1 for "
+          f"equity  OK")
+
+
+def _test_strategy_reference_is_generated():
+    """
+    The reference is produced by running the strategies, so it cannot drift.
+
+    A hand-written one goes stale the first time a default changes and is then
+    worse than nothing, because it is believed.
+    """
+    reference = build_strategy_readme()
+    assert reference.count("### ") == len(STRATEGIES), \
+        (reference.count("### "), len(STRATEGIES))
+
+    # Every strategy must describe its own entries. A silent "not described"
+    # is the failure this test exists to catch.
+    undescribed = [name for name in STRATEGY_NAMES
+                   if not strategy_rules(name).get("long")]
+    assert not undescribed, f"strategies that cannot describe themselves: {undescribed}"
+    assert "not described" not in reference
+    assert "could not be described" not in reference
+
+    # The rules must be the SAME strings the live status panel prints, or the
+    # reference is a second description free to disagree with the first.
+    name = "01 · Dual EMA Crossover"
+    entry = STRATEGIES[name]
+    computed = entry.compute(_synthetic(400, seed=4), DEFAULT_PARAMS)
+    live = entry.status(computed, DEFAULT_PARAMS)
+    assert strategy_rules(name)["long"] == live.long_condition
+    assert strategy_rules(name)["short"] == live.short_condition
+    assert live.long_condition in reference
+
+    # Parameters are DISCOVERED by running the strategy, not listed by hand.
+    used = strategy_parameters(name)
+    assert used.get("ema_fast") == DEFAULT_PARAMS["ema_fast"]
+    assert used.get("ema_slow") == DEFAULT_PARAMS["ema_slow"]
+    assert "rsi_len" not in used, "a dual-EMA strategy does not read the RSI length"
+    assert "rsi_len" in strategy_parameters("02 · RSI Mean Reversion")
+
+    # Changed parameters must come through, since the file is generated with
+    # whatever is on the sidebar rather than with the shipped defaults.
+    tuned = dict(DEFAULT_PARAMS, ema_fast=5, ema_slow=34)
+    assert strategy_parameters(name, tuned)["ema_fast"] == 5
+    assert "5 EMA" in strategy_rules(name, tuned)["long"], strategy_rules(name, tuned)
+    assert "| `ema_fast` | 5 |" in build_strategy_readme(tuned)
+
+    # The caveats have to be in there: rules are not evidence.
+    for warning in ("Slippage is not modelled", "A signal is not a trade",
+                    "Nothing here is a result"):
+        assert warning in reference, f"the reference dropped: {warning}"
+    print(f"   strategy reference: all {len(STRATEGIES)} describe themselves, rules match "
+          f"the live status panel exactly, parameters discovered by running each one  OK")
+
+
 def _test_triangle_patterns():
     """
     Triangles in the Chart Patterns engine, told apart from wedges.
@@ -24573,6 +25207,9 @@ def run_selftest() -> int:
         _test_signal_freshness_and_cell_arithmetic()
         _test_every_chart_is_gapless()
         _test_triangle_patterns()
+        _test_alerts_say_what_they_mean()
+        _test_option_pair_and_quantity()
+        _test_strategy_reference_is_generated()
         _test_no_duplicate_widget_keys()
         _test_stale_results_are_discarded()
         _test_robust_search_and_selection()
@@ -24734,6 +25371,458 @@ def send_email(cfg: dict, subject: str, body: str) -> str | None:
         return None
     except Exception as exc:                                        # noqa: BLE001
         return f"Email failed: {exc}"
+
+
+# =============================================================================
+# SECTION 21 -- ALERTS: WHAT GETS SAID, AND WHO IT GETS SAID TO
+# =============================================================================
+# An alert is read on a phone, in a hurry, often by somebody who does not think
+# in LONG and SHORT. "ENTRY SHORT ^NSEI @ 24,013.20" is precise and almost
+# useless to that reader. "SELL signal on Nifty 50 at 24,013.20 — stop 24,110,
+# target 23,820" is the same fact in words they already own.
+#
+# So the message is built from NAMED PIECES, every piece can be switched off,
+# and the exact text that will be sent is shown before anything is enabled.
+# Nobody should discover what their alerts say by receiving one.
+
+ALERT_PLAIN = {
+    "entry_long": "BUY", "entry_short": "SELL",
+    "exit_long": "CLOSE your BUY", "exit_short": "CLOSE your SELL",
+}
+ALERT_TRADER = {
+    "entry_long": "LONG ENTRY", "entry_short": "SHORT ENTRY",
+    "exit_long": "EXIT LONG", "exit_short": "EXIT SHORT",
+}
+
+#: Each piece of an alert: key, label shown in the sidebar, and whether it is
+#: on by default. Order here is the order they appear in the message.
+ALERT_FIELDS = [
+    ("headline", "What to do (BUY / SELL / CLOSE)", True),
+    ("instrument", "Which instrument", True),
+    ("price", "Price", True),
+    ("stop", "Stop loss", True),
+    ("target", "Target", True),
+    ("quantity", "Quantity", True),
+    ("contract", "Option contract (strike and expiry)", True),
+    ("reason", "Why it fired / why it closed", True),
+    ("pnl", "Profit or loss (on exits)", True),
+    ("strategy", "Strategy name", False),
+    ("timeframe", "Timeframe", False),
+    ("time", "Time", True),
+    ("disclaimer", "A line saying this is automated, not advice", True),
+]
+ALERT_FIELD_KEYS = [key for key, _label, _default in ALERT_FIELDS]
+
+PRETTY_SYMBOLS = {
+    "^NSEI": "Nifty 50", "^NSEBANK": "Bank Nifty", "^BSESN": "Sensex",
+    "NIFTY_FIN_SERVICE.NS": "Fin Nifty", "^INDIAVIX": "India VIX",
+    "BTC-USD": "Bitcoin", "ETH-USD": "Ethereum",
+}
+
+
+def pretty_symbol(symbol: str) -> str:
+    """A name a person recognises, not a Yahoo ticker."""
+    raw = (symbol or "").strip()
+    if raw in PRETTY_SYMBOLS:
+        return PRETTY_SYMBOLS[raw]
+    return raw.replace(".NS", "").replace(".BO", "").replace("-USD", "").replace("^", "")
+
+
+def build_alert(event: str, data: dict, fields: list | None = None,
+                plain_english: bool = True, header: str = "",
+                footer: str = "") -> str:
+    """
+    Compose the message for one event from the pieces that are switched on.
+
+    ``event`` is entry_long, entry_short, exit_long or exit_short. ``data``
+    carries whatever is known; a piece with nothing behind it is left out
+    rather than printed empty, because "Stop: --" on a phone is worse than no
+    stop line at all.
+    """
+    wanted = set(fields if fields is not None else
+                 [key for key, _l, default in ALERT_FIELDS if default])
+    words = ALERT_PLAIN if plain_english else ALERT_TRADER
+    is_exit = event.startswith("exit")
+    lines = []
+
+    if header.strip():
+        lines.append(header.strip())
+
+    name = pretty_symbol(data.get("symbol", ""))
+    if "headline" in wanted:
+        action = words.get(event, event.replace("_", " ").upper())
+        if "instrument" in wanted and name:
+            lines.append(f"{action} — {name}")
+        else:
+            lines.append(action)
+    elif "instrument" in wanted and name:
+        lines.append(name)
+
+    def add(key: str, label: str, value, formatter=None) -> None:
+        if key not in wanted or value is None:
+            return
+        try:
+            if isinstance(value, float) and not np.isfinite(value):
+                return
+        except (TypeError, ValueError):
+            return
+        text = formatter(value) if formatter else str(value)
+        if not str(text).strip() or str(text).strip() == "--":
+            return
+        lines.append(f"{label}: {text}")
+
+    contract = data.get("contract") or {}
+    if "contract" in wanted and contract.get("trading_symbol"):
+        pieces = [str(contract["trading_symbol"])]
+        if contract.get("strike"):
+            right = str(contract.get("option_type") or "")
+            pieces.append(f"{fmt(contract['strike'], 0)} "
+                          f"{'CE' if right.upper().startswith('C') else 'PE'}")
+        if contract.get("expiry"):
+            pieces.append(f"expiry {contract['expiry']}")
+        lines.append("Contract: " + " · ".join(pieces))
+
+    add("price", "Exit price" if is_exit else "Entry price", data.get("price"), fmt)
+    if not is_exit:
+        add("stop", "Stop loss", data.get("stop"), fmt)
+        add("target", "Target", data.get("target"), fmt)
+    add("quantity", "Quantity", data.get("quantity"), lambda v: fmt(v, 0))
+    add("reason", "Reason", data.get("reason"))
+    if is_exit:
+        value = data.get("pnl")
+        if "pnl" in wanted and value is not None and np.isfinite(float(value)):
+            verdict = "profit" if float(value) > 0 else \
+                ("loss" if float(value) < 0 else "flat")
+            lines.append(f"Result: {fmt(value)} ({verdict})")
+    add("strategy", "Strategy", data.get("strategy"))
+    add("timeframe", "Timeframe", data.get("interval"))
+    add("time", "Time", data.get("time"),
+        lambda v: pd.Timestamp(v).strftime("%d %b %Y, %I:%M %p"))
+
+    if "disclaimer" in wanted:
+        lines.append("")
+        lines.append("Sent automatically by my own trading app. "
+                     "Not advice, and not a recommendation to anyone else.")
+    if footer.strip():
+        lines.append(footer.strip())
+    return "\n".join(lines)
+
+
+def sample_alert_data(cfg: dict | None = None) -> dict:
+    """
+    Realistic stand-in values, so a preview looks like a real message.
+
+    Marked as a sample in the sidebar rather than in the text, because the
+    whole point of the preview is to show EXACTLY what will arrive.
+    """
+    cfg = cfg or {}
+    return {
+        "symbol": cfg.get("symbol") or "^NSEI",
+        "interval": cfg.get("interval") or "15m",
+        "strategy": cfg.get("strategy") or "01 · Dual EMA Crossover",
+        "price": 24013.20, "stop": 23910.55, "target": 24218.50,
+        "quantity": 75, "reason": "9 EMA crossed above the 21 EMA",
+        "pnl": 7695.00, "time": pd.Timestamp.now(),
+        "contract": {"trading_symbol": "NIFTY 30 OCT 24000 CALL",
+                     "strike": 24000.0, "option_type": "CALL",
+                     "expiry": "2026-10-30"},
+    }
+
+
+# -----------------------------------------------------------------------------
+# WHATSAPP
+# -----------------------------------------------------------------------------
+# WhatsApp has no open send API. Every route below goes through a provider the
+# operator signs up to themselves, and the differences matter:
+#
+#   Twilio       a real business API, reliable, paid. A sandbox number works
+#                for testing after you join it from your own phone.
+#   Meta Cloud   WhatsApp's own API. Free tier, but outside a 24-hour window
+#                it only sends pre-approved TEMPLATES, so a trade alert needs
+#                a template approved before it will arrive.
+#   CallMeBot    a free hobby relay. Easy, no account, and NOT something to
+#                depend on for anything that matters -- it is one person's
+#                service and can stop at any time.
+#   Webhook      anything else that accepts a JSON POST, including a self-run
+#                bridge.
+#
+# This is said plainly in the sidebar too. Picking a provider that silently
+# drops messages outside a time window is the kind of thing you find out by
+# missing an exit.
+WHATSAPP_PROVIDERS = ["Twilio", "Meta WhatsApp Cloud API", "CallMeBot (free, best effort)",
+                      "Generic webhook (POST JSON)"]
+
+
+def send_whatsapp(cfg: dict, message: str) -> str | None:
+    """Send one WhatsApp message. Returns an error string, or None on success."""
+    settings = (cfg or {}).get("whatsapp") or {}
+    if not settings.get("enabled"):
+        return None
+    if not str(message or "").strip():
+        return "Nothing to send: the message is empty."
+    provider = str(settings.get("provider") or "")
+    import requests
+
+    try:
+        if provider.startswith("Twilio"):
+            sid = str(settings.get("account_sid", "")).strip()
+            token = str(settings.get("auth_token", "")).strip()
+            sender = str(settings.get("from", "")).strip()
+            to = str(settings.get("to", "")).strip()
+            if not (sid and token and sender and to):
+                return "Twilio needs an account SID, auth token, from number and to number."
+            response = requests.post(
+                f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json",
+                auth=(sid, token), timeout=20,
+                data={"From": f"whatsapp:{sender}", "To": f"whatsapp:{to}",
+                      "Body": message})
+            if response.status_code >= 300:
+                return f"Twilio refused the message ({response.status_code}): {response.text[:200]}"
+            return None
+
+        if provider.startswith("Meta"):
+            phone_id = str(settings.get("phone_number_id", "")).strip()
+            token = str(settings.get("auth_token", "")).strip()
+            to = str(settings.get("to", "")).strip().lstrip("+")
+            if not (phone_id and token and to):
+                return "The Cloud API needs a phone number ID, a token and a recipient."
+            response = requests.post(
+                f"https://graph.facebook.com/v21.0/{phone_id}/messages",
+                headers={"Authorization": f"Bearer {token}",
+                         "Content-Type": "application/json"}, timeout=20,
+                data=json.dumps({"messaging_product": "whatsapp", "to": to,
+                                 "type": "text", "text": {"body": message}}))
+            if response.status_code >= 300:
+                return (f"The Cloud API refused the message ({response.status_code}): "
+                        f"{response.text[:200]}. Outside a 24-hour conversation window it "
+                        f"only accepts an approved template, which a trade alert is not.")
+            return None
+
+        if provider.startswith("CallMeBot"):
+            phone = str(settings.get("to", "")).strip()
+            api_key = str(settings.get("api_key", "")).strip()
+            if not (phone and api_key):
+                return "CallMeBot needs your phone number and the API key it sent you."
+            response = requests.get("https://api.callmebot.com/whatsapp.php", timeout=20,
+                                    params={"phone": phone, "text": message,
+                                            "apikey": api_key})
+            if response.status_code >= 300:
+                return f"CallMeBot refused the message ({response.status_code})."
+            return None
+
+        url = str(settings.get("webhook_url", "")).strip()
+        if not url:
+            return "No webhook URL."
+        response = requests.post(url, timeout=20,
+                                 headers={"Content-Type": "application/json"},
+                                 data=json.dumps({"text": message, "message": message}))
+        if response.status_code >= 300:
+            return f"The webhook refused the message ({response.status_code})."
+        return None
+    except Exception as exc:                                        # noqa: BLE001
+        return f"WhatsApp failed: {exc}"
+
+
+def dispatch_alert(cfg: dict, event: str, data: dict) -> list:
+    """
+    Build the message once and send it everywhere that is switched on.
+
+    Returns the list of errors, so the caller can log them. A failure to notify
+    must never stop or unwind a trade that has already been placed -- the
+    position is real whether or not the message arrived.
+    """
+    alerts = (cfg or {}).get("alerts") or {}
+    fields = alerts.get("fields", [key for key, _l, d in ALERT_FIELDS if d])
+    message = build_alert(event, data, fields,
+                          bool(alerts.get("plain_english", True)),
+                          str(alerts.get("header", "")),
+                          str(alerts.get("footer", "")))
+    which = {"entry_long": "BUY", "entry_short": "SELL",
+             "exit_long": "EXIT", "exit_short": "EXIT"}.get(event, "ALERT")
+    subject = f"{which} {pretty_symbol(data.get('symbol', ''))} @ {fmt(data.get('price'))}"
+    problems = []
+    for sender in (lambda: send_email(cfg, subject, message),
+                   lambda: send_whatsapp(cfg, message)):
+        try:
+            problem = sender()
+        except Exception as exc:                                    # noqa: BLE001
+            problem = str(exc)
+        if problem:
+            problems.append(problem)
+    return problems
+
+
+# =============================================================================
+# SECTION 22 -- THE STRATEGY REFERENCE, GENERATED FROM THE CODE
+# =============================================================================
+# A hand-written reference goes stale the first time a default changes, and
+# then it is worse than nothing because it is believed. This one is produced
+# by RUNNING each strategy and asking it to describe itself: the long and
+# short conditions come from the same status function the live tab prints, and
+# the parameters are read out of the running defaults. If the code changes,
+# this changes with it or it fails loudly.
+
+
+def strategy_parameters(name: str, params: dict | None = None) -> dict:
+    """
+    The parameters one strategy actually reads, with their current values.
+
+    Found by running the strategy's compute step against a recording stand-in
+    for the parameter dictionary, so what comes back is what the code asked
+    for -- not what somebody once wrote down that it asked for.
+    """
+    params = dict(params or DEFAULT_PARAMS)
+    entry = STRATEGIES.get(name)
+    if entry is None:
+        return {}
+
+    class _Recorder(dict):
+        def __init__(self, source):
+            super().__init__(source)
+            self.seen: list = []
+
+        def get(self, key, default=None):
+            if key not in self.seen:
+                self.seen.append(key)
+            return super().get(key, default)
+
+        def __getitem__(self, key):
+            if key not in self.seen:
+                self.seen.append(key)
+            return super().__getitem__(key)
+
+    recorder = _Recorder(params)
+    try:
+        entry.compute(_synthetic(max(entry.min_bars + 80, 300), seed=4), recorder)
+    except Exception:                                               # noqa: BLE001
+        pass
+    return {key: params[key] for key in recorder.seen
+            if key in params and not isinstance(params[key], (dict, list))}
+
+
+def strategy_rules(name: str, params: dict | None = None) -> dict:
+    """What makes this strategy go long, and what makes it go short."""
+    params = dict(params or DEFAULT_PARAMS)
+    entry = STRATEGIES.get(name)
+    if entry is None:
+        return {}
+    out = {"name": name, "key": entry.key, "blurb": entry.blurb,
+           "min_bars": entry.min_bars, "immediate": bool(entry.immediate),
+           "overlays": list(entry.overlays or ()),
+           "oscillator": entry.oscillator or "",
+           "long": "", "short": "", "note": ""}
+    try:
+        frame = _synthetic(max(entry.min_bars + 120, 400), seed=4)
+        computed = entry.compute(frame, params)
+        report = entry.status(computed, params)
+        out["long"] = str(getattr(report, "long_condition", "") or "")
+        out["short"] = str(getattr(report, "short_condition", "") or "")
+    except Exception as exc:                                        # noqa: BLE001
+        out["note"] = f"could not be described automatically: {str(exc)[:120]}"
+    return out
+
+
+def build_strategy_readme(params: dict | None = None) -> str:
+    """The whole reference, as Markdown."""
+    params = dict(params or DEFAULT_PARAMS)
+    lines = [
+        "# Strategy reference",
+        "",
+        f"Generated from the code on {pd.Timestamp.now():%d %B %Y}. "
+        f"{len(STRATEGIES)} strategies.",
+        "",
+        "Every rule below is read out of the strategy itself -- the same function "
+        "that prints the live status panel -- so this file cannot drift away from "
+        "what the app does. The parameter list for each strategy is likewise "
+        "discovered by running it and recording which parameters it asks for.",
+        "",
+        "## How to read this",
+        "",
+        "- **Long** and **Short** are the conditions that FIRE A SIGNAL. They are "
+        "evaluated on the last CLOSED candle, never the forming one.",
+        "- A signal is not a trade. The entry filters, the session rules and the "
+        "stop/target settings all sit between a signal and a position, and any of "
+        "them can veto it.",
+        "- **Warm-up** is how many candles the strategy needs before its first valid "
+        "reading. Ask for less history than this and it refuses rather than "
+        "answering from a half-filled indicator.",
+        "- Fills: a signal on candle N enters at the OPEN of candle N+1 in the "
+        "backtest. Live, it enters at the current traded price, because candle "
+        "N+1's open has already happened by the time the signal is seen.",
+        "- Parameters are the sidebar's **Advanced indicator parameters**, shared "
+        "across strategies. Changing `ema_fast` changes it for every strategy that "
+        "reads it.",
+        "",
+        "## The shared defaults",
+        "",
+        "| Parameter | Default | What it is |",
+        "|---|---|---|",
+    ]
+    meanings = {
+        "ema_fast": "fast EMA length", "ema_slow": "slow EMA length",
+        "ema_mid": "intermediate EMA length", "ema_macro": "long-term EMA length",
+        "rsi_len": "RSI lookback", "atr_len": "ATR lookback",
+        "atr_mult": "ATR multiple for bands and stops",
+        "channel_mult": "width of channel bands, in ATRs",
+        "vol_len": "volume average lookback",
+        "vol_mult": "how many times the average volume counts as a spike",
+        "breakout_len": "lookback for the breakout box",
+        "squeeze_mult": "how much ATR must expand to count as a squeeze release",
+        "orb_bars": "candles in the opening range",
+        "gap_pct": "how big a gap must be, in percent",
+        "structure_len": "lookback for structural highs and lows",
+        "pivot_left": "candles to the left of a swing pivot",
+        "pivot_right": "candles to the right of a swing pivot",
+        "zigzag_pct": "minimum swing size for a zigzag pivot, in percent",
+        "st_mult": "SuperTrend ATR multiple",
+    }
+    for key, value in params.items():
+        if isinstance(value, (dict, list, bool)) or key not in meanings:
+            continue
+        lines.append(f"| `{key}` | {value} | {meanings[key]} |")
+
+    lines += ["", "## The strategies", ""]
+    for name in STRATEGY_NAMES:
+        rules = strategy_rules(name, params)
+        used = strategy_parameters(name, params)
+        lines.append(f"### {name}")
+        lines.append("")
+        lines.append(f"*{rules.get('blurb', '')}*")
+        lines.append("")
+        if rules.get("note"):
+            lines.append(f"> This strategy {rules['note']}.")
+            lines.append("")
+        lines.append(f"- **Long when:** {rules.get('long') or 'not described'}")
+        lines.append(f"- **Short when:** {rules.get('short') or 'not described'}")
+        lines.append(f"- **Warm-up:** {rules.get('min_bars')} candles")
+        if rules.get("immediate"):
+            lines.append("- **Acts on the forming candle**, not only on closed ones. "
+                         "Faster, and able to change its mind before the candle ends.")
+        if used:
+            readable = ", ".join(f"`{key}` = {value}" for key, value in used.items())
+            lines.append(f"- **Parameters it reads:** {readable}")
+        else:
+            lines.append("- **Parameters it reads:** none beyond price and volume")
+        if rules.get("overlays"):
+            lines.append(f"- **Drawn on the chart:** "
+                         f"{', '.join(str(o) for o in rules['overlays'])}")
+        lines.append("")
+
+    lines += [
+        "## What this reference does not tell you",
+        "",
+        "Which of these makes money. Nothing here is a result: these are the rules, "
+        "not evidence that following them pays. The app can measure any of them on "
+        "past data, and a past measurement is a weak and easily-fooled guide to the "
+        "next trade -- the more configurations you search, the weaker it gets.",
+        "",
+        "Slippage is not modelled anywhere. Brokerage and taxes are, if you set them "
+        "in the sidebar; the gap between the price a signal fires at and the price "
+        "you actually get is not, and on a fast instrument it is the largest cost "
+        "you will pay.",
+        "",
+    ]
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------- #
