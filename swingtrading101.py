@@ -5186,6 +5186,7 @@ _STATE_DEFAULTS = {
     "scrip_master": None, "broker_receipts": [], "feed_log": [],
     "live_frame": None, "live_frame_at": 0.0, "live_reports": [],
     "live_frame_warnings": [], "live_vix": None, "candle_refreshes": 0,
+    "tick_store": {}, "tick_built_bars": 0, "tick_built_note": "",
     "ltp_note": None, "screener_results": None, "screener_error": None,
     "last_seen_ltp": None, "last_ltp_change_ts": 0.0, "pending_ticker": None,
     "last_closed_bar": None, "option_metrics": None, "live_last_signal_time": None,
@@ -5349,6 +5350,195 @@ class LiveSnapshot:
     def frozen(self) -> bool:
         """Truly dead: candles lagging AND the price is not moving either."""
         return self.stale and not self.quote_live
+
+
+# =============================================================================
+# SECTION 24 -- CANDLES BUILT FROM THE LIVE QUOTE
+# =============================================================================
+# THE PROBLEM THIS SOLVES, EXACTLY.
+#
+# Yahoo serves two different things for the same symbol, and for Indian indices
+# they do not agree. The QUOTE endpoint ticks continuously. The CANDLE arrays
+# can stop dead and stay dead for hours while the quote keeps moving. The
+# operator caught this precisely: two screenshots 2.5 hours apart showed the
+# identical closed EMA values -- 23,912.80 and 23,915.38 to the paisa -- while
+# the quote had travelled from 23,934 down to 23,819.
+#
+# No indicator can survive that, and this is the answer to "is it only the
+# EMA?": it is EVERY indicator, EVERY strategy and EVERY screener, because
+# they all read the same candles. The EMA simply made it visible.
+#
+# A frozen candle feed cannot be fixed by arithmetic, but it CAN be worked
+# around, because the app is already polling a live price several times a
+# second and throwing it away after it draws it. Those ticks are a price
+# series. Bucketed by the chart's own interval they are candles -- real ones,
+# built from prices that actually printed.
+#
+# WHAT THIS IS NOT. A tick-built candle is sampled, not consolidated: it sees
+# the price at the moments the app happened to look, so its high and low are
+# the extremes OF THOSE SAMPLES and can be inside the true range. It carries no
+# volume, because a quote carries none. And it only exists for the time the
+# app has been watching. So these bars are labelled wherever they appear, they
+# never overwrite a real bar that arrives later, and the operator is told how
+# many of the candles on screen are built this way.
+
+TICK_STORE_LIMIT = 20000          # ~100 minutes at 0.3s, per symbol
+TICK_STORE_MAX_AGE = 6 * 3600.0   # a trading day, generously
+
+
+def record_tick(symbol: str, price: float, when: float | None = None) -> int:
+    """
+    Remember one observed price. Returns how many ticks are held.
+
+    Kept in session state, which is per-user, so one person's tick history
+    cannot leak into another's candles.
+    """
+    if st is None or not symbol:
+        return 0
+    try:
+        value = float(price)
+    except (TypeError, ValueError):
+        return 0
+    if not (np.isfinite(value) and value > 0):
+        return 0
+    moment = float(when if when is not None else time.time())
+    store = st.session_state.setdefault("tick_store", {})
+    series = store.setdefault(str(symbol).upper(), [])
+    # Identical consecutive prices at the same instant add nothing.
+    if series and series[-1][0] == moment:
+        series[-1] = (moment, value)
+    else:
+        series.append((moment, value))
+    cutoff = moment - TICK_STORE_MAX_AGE
+    if len(series) > TICK_STORE_LIMIT or (series and series[0][0] < cutoff):
+        trimmed = [point for point in series if point[0] >= cutoff][-TICK_STORE_LIMIT:]
+        store[str(symbol).upper()] = trimmed
+        series = trimmed
+    return len(series)
+
+
+def tick_candles(symbol: str, interval: str, tz: Any = "Asia/Kolkata",
+                 include_forming: bool = False) -> pd.DataFrame:
+    """
+    The recorded ticks, bucketed into candles of the chart's own interval.
+
+    Open is the first price seen in the bucket, close the last, high and low
+    the extremes of what was sampled. Volume is zero because a quote does not
+    carry one -- reporting a made-up volume would quietly arm every
+    volume-gated filter in the application on fiction.
+
+    The bucket still forming is withheld unless asked for. That rule lives
+    HERE rather than in the caller, because a half-built candle can fire a
+    signal and then un-fire it as the bar fills in, and a guarantee that every
+    caller has to remember is a guarantee that one of them eventually will
+    not.
+    """
+    if st is None:
+        return pd.DataFrame()
+    series = (st.session_state.get("tick_store") or {}).get(str(symbol).upper()) or []
+    if len(series) < 2:
+        return pd.DataFrame()
+    seconds = float(INTERVAL_SECONDS.get(interval, 60))
+    if seconds <= 0:
+        return pd.DataFrame()
+    frame = pd.DataFrame(series, columns=["at", "price"])
+    frame["bucket"] = (frame["at"] // seconds) * seconds
+    grouped = frame.groupby("bucket")["price"].agg(["first", "max", "min", "last", "count"])
+    out = pd.DataFrame({
+        "Open": grouped["first"].astype(float),
+        "High": grouped["max"].astype(float),
+        "Low": grouped["min"].astype(float),
+        "Close": grouped["last"].astype(float),
+        "Volume": 0.0,
+    })
+    out.index = pd.to_datetime(grouped.index, unit="s", utc=True).tz_convert(tz)
+    out["_ticks"] = grouped["count"].astype(int).to_numpy()
+    out = out.sort_index()
+    if not include_forming:
+        current_bucket = (time.time() // seconds) * seconds
+        keep = [stamp.timestamp() < current_bucket for stamp in out.index]
+        out = out[keep]
+    return out
+
+
+def splice_tick_candles(downloaded: pd.DataFrame, symbol: str, interval: str,
+                        min_ticks: int = 3) -> tuple:
+    """
+    Carry a stalled candle feed forward with candles built from the quote.
+
+    Returns ``(frame, built, note)``. Rules, in order of importance:
+
+      * A REAL candle always wins. Tick-built bars are only used for periods
+        the download has not delivered, and the moment a real one turns up for
+        that period it replaces the built one.
+      * The newest bucket is still forming and is left out, exactly as the
+        rest of the application treats a forming candle -- a half-built bar
+        that fires a signal is a signal that can un-fire.
+      * A bucket with barely any ticks in it is not a candle. Three samples
+        across a minute say almost nothing about its range, so thin buckets
+        are dropped rather than drawn.
+    """
+    if downloaded is None or downloaded.empty:
+        return downloaded, 0, ""
+    built = tick_candles(symbol, interval, tz=getattr(downloaded.index, "tz", None)
+                         or "Asia/Kolkata")
+    if built.empty:
+        return downloaded, 0, ""
+
+    # The forming bucket is already withheld by tick_candles; only the
+    # thin-bucket rule is applied here.
+    built = built[built["_ticks"] >= int(min_ticks)]
+    if built.empty:
+        return downloaded, 0, ""
+
+    last_real = pd.Timestamp(downloaded.index[-1])
+    try:
+        fresh = built[built.index > last_real]
+    except TypeError:                     # tz-naive against tz-aware
+        built.index = built.index.tz_localize(None) if built.index.tz is not None \
+            else built.index.tz_localize("Asia/Kolkata")
+        fresh = built[built.index > last_real]
+    if fresh.empty:
+        return downloaded, 0, ""
+
+    merged = pd.concat([downloaded, fresh[["Open", "High", "Low", "Close", "Volume"]]])
+    merged = merged[~merged.index.duplicated(keep="first")].sort_index()
+    note = (f"{len(fresh)} candle(s) on this chart were BUILT FROM THE LIVE QUOTE, "
+            f"because the downloaded feed stopped at {last_real:%H:%M}. They are made "
+            f"of prices that really printed, but they are sampled rather than "
+            f"consolidated — the high and low are the extremes the app happened to "
+            f"see — and they carry no volume. A real candle replaces a built one the "
+            f"moment it arrives.")
+    return merged, int(len(fresh)), note
+
+
+def feed_is_stale(frame: pd.DataFrame, interval: str, tolerance: int = 3) -> tuple:
+    """
+    Is this frame too old to trade on? Returns (stale, candles_behind, message).
+
+    ``tolerance`` is how many candles behind is survivable. Beyond it the
+    numbers on screen describe a market that has moved on, and acting on them
+    is worse than not acting at all.
+    """
+    if frame is None or frame.empty:
+        return True, 0, "There are no candles at all."
+    try:
+        last = pd.Timestamp(frame.index[-1])
+        now = pd.Timestamp.now(tz=last.tz) if last.tz is not None else pd.Timestamp.now()
+        behind = int((now - last).total_seconds()
+                     // max(float(INTERVAL_SECONDS.get(interval, 60)), 1.0))
+    except Exception:                                               # noqa: BLE001
+        return False, 0, ""
+    if behind <= int(tolerance):
+        return False, max(behind, 0), ""
+    minutes = behind * float(INTERVAL_SECONDS.get(interval, 60)) / 60.0
+    return True, behind, (
+        f"**The candle feed is {behind} candles behind** (about {minutes:.0f} minutes). "
+        f"This is not an indicator problem and it is not confined to the EMA: every "
+        f"indicator, every strategy and every screener in this application reads these "
+        f"same candles, so all of them describe the market as it was {minutes:.0f} "
+        f"minutes ago. Yahoo's Indian intraday candle feed stalls like this while its "
+        f"quote keeps ticking, which is why the price above still moves.")
 
 
 def refresh_candles(cfg: dict):
@@ -5765,6 +5955,33 @@ def run_cycle(cfg: dict) -> None:
             st.session_state.candle_refreshes += 1
         frame = st.session_state.live_frame
         ltp, ltp_source = fetch_live_ltp(cfg, frame)
+
+        # EVERY observed price is kept. The app was already polling this
+        # several times a second and discarding it; those ticks are the only
+        # live record of the market when the candle feed stalls.
+        record_tick(cfg["symbol"], ltp)
+
+        # Carry a stalled feed forward with candles built from those ticks,
+        # then recompute the indicators on the spliced frame -- otherwise the
+        # new candles would be drawn but not actually used, which is worse
+        # than not having them.
+        built, splice_note = 0, ""
+        if cfg.get("tick_candles", True):
+            spliced, built, splice_note = splice_tick_candles(
+                frame, cfg["symbol"], cfg["interval"])
+            if built:
+                try:
+                    extras = dict(cfg.get("filter_extras") or {})
+                    if cfg.get("filter_cfg", {}).get("vix", {}).get("enabled"):
+                        extras["vix"] = st.session_state.live_vix
+                    frame, recomputed = prepare(spliced, cfg["strategy"], cfg["params"],
+                                                cfg.get("filter_cfg"), extras)
+                    st.session_state.live_reports = recomputed
+                except Exception:                                   # noqa: BLE001
+                    frame, built, splice_note = st.session_state.live_frame, 0, ""
+        st.session_state.tick_built_bars = int(built)
+        st.session_state.tick_built_note = splice_note
+
         snapshot = build_snapshot(cfg, frame, st.session_state.live_reports,
                                   st.session_state.live_frame_warnings,
                                   st.session_state.live_vix, ltp, ltp_source)
@@ -6386,6 +6603,16 @@ def render_sidebar() -> dict:
                                      help="How often the full candle history is re-downloaded and "
                                           "indicators recomputed. The price, PnL, stop and target "
                                           "refresh on every tick regardless of this.")
+    tick_candles_on = sb.checkbox(
+        "Build candles from the live quote when the feed stalls", value=True,
+        key="cfg_tick_candles",
+        help="On by default. Yahoo's Indian intraday CANDLES can freeze for hours "
+             "while its QUOTE keeps ticking — two readings of the same symbol that do "
+             "not agree. When that happens every indicator on screen is computed on a "
+             "dead chart. This records the prices the app observes anyway and buckets "
+             "them into candles to carry the series forward. They are sampled rather "
+             "than consolidated, carry no volume, and a real candle always replaces a "
+             "built one. Turn it off to see the raw downloaded feed exactly as it is.")
     prefer_candle_open = sb.checkbox(
         "Live: prefer the N+1 candle open as the fill price", value=False, disabled=live,
         key="cfg_fill_open",
@@ -6620,6 +6847,7 @@ def render_sidebar() -> dict:
             "reverse_on_opposite": bool(reverse_on_opposite),
             "square_off_on_stop": bool(square_off_on_stop),
             "candle_seconds": float(candle_seconds), "costs": costs,
+            "tick_candles": bool(tick_candles_on),
             "walk_forward": bool(walk_fwd), "wf_folds": int(wf_folds),
             "use_dhan_data": bool(broker.get("use_live_ltp")), "email": email_cfg,
             "whatsapp": channels["whatsapp"], "alerts": channels["alerts"],
@@ -8012,11 +8240,30 @@ def _feed_banner(cfg: dict, snapshot: LiveSnapshot) -> None:
             f"sits at exactly 0.00 PnL. The engine keeps polling and will pick up the first live "
             f"tick by itself.")
     elif snapshot.stale:
-        st.warning(
-            f"**Candles are lagging, but the price is live.** The newest `{cfg['symbol']}` candle "
-            f"is {human} old while the quote is still ticking — normal for a delayed feed during "
-            f"market hours. Trading continues: PnL, stop and target track the live price, but "
-            f"SIGNALS are only as fresh as the candles. Shorten the interval for fresher signals.")
+        behind = int(age // max(float(INTERVAL_SECONDS.get(cfg["interval"], 60)), 1.0))
+        built = int(st.session_state.get("tick_built_bars") or 0)
+        if built:
+            st.success(
+                f"**The downloaded candle feed stalled, so {built} candle(s) were built "
+                f"from the live quote.** Yahoo's Indian intraday candles stop while its "
+                f"quote keeps ticking; rather than show you indicators computed on a "
+                f"frozen chart, the app has carried the series forward using the prices "
+                f"it actually observed. Those bars are sampled, not consolidated, and "
+                f"carry no volume — a real candle replaces a built one as soon as it "
+                f"arrives.")
+        else:
+            st.error(
+                f"**EVERY indicator on this screen is {behind} candle(s) out of date.** "
+                f"The newest `{cfg['symbol']}` candle is {human} old while the quote keeps "
+                f"ticking — Yahoo's Indian intraday candle feed stalls like this.\n\n"
+                f"This is **not** an EMA problem. Every indicator, every strategy and "
+                f"every screener in this application reads these same candles, so all of "
+                f"them currently describe the market as it was {human} ago. The price, "
+                f"PnL, stop and target all track the live quote and are current; the "
+                f"SIGNALS are not.\n\n"
+                f"Two ways out: switch on **Dhan candles** in the sidebar for a real-time "
+                f"feed, or leave this tab running — the app records every tick it sees "
+                f"and will start building candles from them within a minute or two.")
 
 
 def _heartbeat(cfg: dict, snapshot: LiveSnapshot) -> None:
@@ -8054,6 +8301,41 @@ def _heartbeat(cfg: dict, snapshot: LiveSnapshot) -> None:
                f"between requests.")
     if st.session_state.get("ltp_note"):
         st.caption(":warning: " + str(st.session_state.ltp_note))
+
+    built = int(st.session_state.get("tick_built_bars") or 0)
+    if built:
+        st.caption(f":white_check_mark: **{built} of the candles above were built from "
+                   f"the live quote** because the download stalled. "
+                   + str(st.session_state.get("tick_built_note") or ""))
+
+    # The panel that makes "is the feed stuck?" answerable instead of
+    # something to argue about. The operator spotted a 2.5-hour freeze by
+    # noticing two screenshots carried identical EMA values to the paisa;
+    # that should not take a human comparing screenshots.
+    with st.expander("Feed diagnostics — is the candle feed actually moving?"):
+        ticks_held = len((st.session_state.get("tick_store") or {}).get(
+            str(cfg["symbol"]).upper()) or [])
+        d1, d2, d3 = st.columns(3)
+        d1.metric("Candle downloads", f"{st.session_state.candle_refreshes:,}")
+        d2.metric("Newest candle", fmt_time(snapshot.frame.index[-1]))
+        d3.metric("Ticks recorded", f"{ticks_held:,}",
+                  help="Observed prices held for building candles when the download "
+                       "stalls. Cleared when the symbol changes.")
+        st.caption(
+            "**How to read this.** If *Candle downloads* keeps climbing while *Newest "
+            "candle* stands still, the app is doing its job and the FEED is frozen — "
+            "that is a Yahoo problem, not a calculation problem, and no indicator can "
+            "be right on a chart that stopped. If *Candle downloads* is also stuck, "
+            "the refresh loop is wedged and that one is mine.")
+        log = list(st.session_state.get("feed_log") or [])
+        if log:
+            st.dataframe(pd.DataFrame(log[:20]), width="stretch", hide_index=True)
+            moved = sum(1 for row in log if row.get("Changed") == "yes")
+            distinct = len({str(row.get("Newest candle")) for row in log})
+            st.caption(f"Across the last {len(log)} ticks the quote changed {moved} "
+                       f"time(s) and the newest candle took {distinct} distinct "
+                       f"value(s). A moving quote beside a single candle value is "
+                       f"exactly the split this page exists to show.")
 
 
 def _human_age(seconds: float) -> str:
@@ -23573,6 +23855,124 @@ def pytest_approx(value, tolerance=1e-9):
     return _Close()
 
 
+def _test_frozen_feed_is_detected_and_carried():
+    """
+    The failure the operator caught, reproduced and repaired.
+
+    Two screenshots 2.5 hours apart carried the IDENTICAL closed EMA values --
+    23,912.80 and 23,915.38 to the paisa -- while the quote travelled from
+    23,934 to 23,819. Yahoo's Indian intraday CANDLES had stopped while its
+    QUOTE kept ticking. No arithmetic can survive that, so the test is in two
+    parts: prove the freeze is detected, and prove the live quote can carry
+    the series forward.
+    """
+    real_st = globals()["st"]
+    fake = _FakeStreamlit()
+    globals()["st"] = fake
+    try:
+        base = pd.Timestamp("2026-11-04 10:02", tz="Asia/Kolkata")
+        # A frame that stopped at 10:02 -- exactly the reported freeze.
+        index = pd.date_range(base - pd.Timedelta(minutes=120), base, freq="1min",
+                              tz="Asia/Kolkata")
+        closes = pd.Series(np.linspace(23900.0, 23913.0, len(index)), index=index)
+        frozen = pd.DataFrame({"Open": closes, "High": closes + 2, "Low": closes - 2,
+                               "Close": closes, "Volume": 0.0}, index=index)
+
+        # --- part one: is the freeze SEEN? ---------------------------------
+        now = pd.Timestamp.now(tz="Asia/Kolkata")
+        recent = frozen.copy()
+        recent.index = pd.date_range(now - pd.Timedelta(minutes=len(index) - 1),
+                                     now, freq="1min", tz="Asia/Kolkata")
+        stale, behind, _msg = feed_is_stale(recent, "1m")
+        assert not stale and behind <= 1, (stale, behind)
+
+        # The real case: the newest candle is 2.5 HOURS old, not the frame.
+        old = frozen.copy()
+        old.index = pd.date_range(end=now - pd.Timedelta(minutes=150),
+                                  periods=len(index), freq="1min", tz="Asia/Kolkata")
+        stale, behind, message = feed_is_stale(old, "1m")
+        assert stale and 148 <= behind <= 152, (stale, behind)
+        # It must say the thing the operator actually asked: is it only the EMA?
+        assert "every strategy" in message and "every screener" in message, message
+        assert "not an indicator problem" in message, message
+        assert feed_is_stale(pd.DataFrame(), "1m")[0] is True
+
+        # --- part two: can the live quote carry it forward? ----------------
+        fake.session_state["tick_store"] = {}
+        moment = time.time() - 300.0
+        # Five minutes of observed prices falling from 23,930 to 23,819, which
+        # is roughly what the quote actually did while the candles sat still.
+        for step in range(1000):
+            when = moment + step * 0.3
+            price = 23930.0 - (step / 1000.0) * 111.0
+            record_tick("^NSEI", price, when)
+        held = len(fake.session_state["tick_store"]["^NSEI"])
+        assert held == 1000, held
+
+        built = tick_candles("^NSEI", "1m")
+        assert len(built) >= 4, len(built)
+        assert list(built.columns[:5]) == ["Open", "High", "Low", "Close", "Volume"]
+        assert (built["High"] >= built[["Open", "Close"]].max(axis=1) - 1e-9).all()
+        assert (built["Low"] <= built[["Open", "Close"]].min(axis=1) + 1e-9).all()
+        # Volume is ZERO, never invented: a quote carries none, and a made-up
+        # figure would arm every volume-gated filter in the app on fiction.
+        assert float(built["Volume"].abs().sum()) == 0.0
+        # The prices are real: the built range sits inside what was observed.
+        assert 23819.0 - 1 <= float(built["Close"].iloc[-1]) <= 23930.0 + 1
+
+        # Splicing: built bars fill only what the download has not delivered.
+        merged, count, note = splice_tick_candles(old, "^NSEI", "1m")
+        assert count >= 4, count
+        assert len(merged) == len(old) + count
+        assert merged.index.is_monotonic_increasing
+        assert not merged.index.has_duplicates
+        # Everything the download DID deliver is untouched.
+        assert merged.loc[old.index, "Close"].equals(old["Close"])
+        assert "BUILT FROM THE LIVE QUOTE" in note and "no volume" in note
+
+        # A REAL candle always wins over a built one for the same period.
+        overlap = old.copy()
+        extra_index = built.index[:2]
+        overlap = pd.concat([old, pd.DataFrame(
+            {"Open": 1.0, "High": 1.0, "Low": 1.0, "Close": 999.0, "Volume": 5.0},
+            index=extra_index)])
+        merged2, _c2, _n2 = splice_tick_candles(overlap, "^NSEI", "1m")
+        assert float(merged2.loc[extra_index[0], "Close"]) == 999.0, \
+            "a tick-built bar overwrote a real one"
+
+        # The bar still forming is left out, exactly as the rest of the app
+        # treats a forming candle -- a half-built bar can un-fire its signal.
+        current_bucket = (time.time() // 60.0) * 60.0
+        assert all(stamp.timestamp() < current_bucket for stamp in built.index), \
+            "the forming bucket was published as a finished candle"
+
+        # Thin buckets are dropped: three samples across a minute say nothing
+        # about its range.
+        fake.session_state["tick_store"] = {}
+        for step in range(2):
+            record_tick("THIN.NS", 100.0 + step, time.time() - 400 + step)
+        thin_frame = old.copy()
+        _m3, count3, _n3 = splice_tick_candles(thin_frame, "THIN.NS", "1m", min_ticks=5)
+        assert count3 == 0, "a bucket with two ticks in it is not a candle"
+
+        # Nothing recorded at all is not an error, it is simply no help.
+        fake.session_state["tick_store"] = {}
+        assert tick_candles("NOTHING", "1m").empty
+        assert splice_tick_candles(old, "NOTHING", "1m")[1] == 0
+        assert splice_tick_candles(pd.DataFrame(), "^NSEI", "1m")[1] == 0
+        # Junk prices are refused rather than stored.
+        assert record_tick("X", float("nan")) == 0
+        assert record_tick("X", -5) == 0
+        assert record_tick("X", None) == 0
+
+        print(f"   frozen feed: a {behind}-candle freeze is detected and named as "
+              f"affecting every indicator, {count} candles rebuilt from {held} observed "
+              f"ticks, real candles always win, forming bucket withheld, volume never "
+              f"invented  OK")
+    finally:
+        globals()["st"] = real_st
+
+
 def _test_indicators_match_tradingview():
     """
     The indicator kernel against TradingView's published definition, and the
@@ -25898,6 +26298,7 @@ def run_selftest() -> int:
         _test_signal_freshness_and_cell_arithmetic()
         _test_every_chart_is_gapless()
         _test_triangle_patterns()
+        _test_frozen_feed_is_detected_and_carried()
         _test_indicators_match_tradingview()
         _test_dhan_candle_feed()
         _test_order_types_and_trade_kinds()
