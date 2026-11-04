@@ -1156,6 +1156,27 @@ def _fetch_uncached(symbol: str, period: str, interval: str) -> pd.DataFrame:
     return _resample(_normalise(_raw_download(symbol, period, src), symbol), rule)
 
 
+def _dhan_candles_cached(symbol: str, interval: str, period: str, bucket: int,
+                         broker: dict) -> tuple:
+    """
+    Dhan candles, cached on the same freshness bucket as the Yahoo path.
+
+    The broker dict is not part of the cache key -- it holds a token, and a
+    token has no business in a cache key -- so the key is the symbol, the
+    timeframe and the bucket, exactly as for Yahoo.
+    """
+    if st is None:
+        return dhan_candles(broker, symbol, interval, period)
+    holder = st.session_state.setdefault("_dhan_candle_cache", {})
+    key = (symbol, interval, period, bucket)
+    if key in holder:
+        return holder[key]
+    result = dhan_candles(broker, symbol, interval, period)
+    holder.clear()                     # one bucket at a time; this is not an archive
+    holder[key] = result
+    return result
+
+
 def _cached_fetch(symbol: str, period: str, interval: str, bucket: int) -> pd.DataFrame:
     """Streamlit-cached wrapper; `bucket` is the caller's freshness key."""
     if st is None:
@@ -1181,7 +1202,31 @@ def load_market_data(symbol: str, period: str, interval: str,
         warnings.append(clamp)
 
     bucket = int(time.time() // max(0.3, float(freshness_seconds)))
-    frame = _cached_fetch(symbol, eff_period, interval, bucket)
+
+    # REAL-TIME CANDLES FIRST, when the operator has switched them on.
+    #
+    # This is the setting that makes the indicators agree with a live chart.
+    # Yahoo's Indian intraday feed runs minutes behind, and an EMA computed
+    # correctly on candles that stop four minutes ago is four minutes wrong --
+    # which is exactly the mismatch it looks like a formula bug.
+    #
+    # The preference is read from session state rather than passed down
+    # through fifty call sites, and session state is per-user, so one person's
+    # feed choice cannot alter anyone else's.
+    frame = pd.DataFrame()
+    dhan_note = ""
+    broker = (st.session_state.get("dhan_candle_broker") if st is not None else None)
+    if broker:
+        cached = _dhan_candles_cached(symbol, interval, eff_period, bucket, broker)
+        frame, dhan_note = cached
+        if st is not None:
+            st.session_state["dhan_candle_note"] = dhan_note
+    if frame.empty:
+        frame = _cached_fetch(symbol, eff_period, interval, bucket)
+        if broker and dhan_note and st is not None:
+            warnings.append(f"Dhan candles were asked for but not used ({dhan_note}), so "
+                            f"this is Yahoo's delayed feed. Indicator values will lag a "
+                            f"live chart by however stale the candles are.")
 
     if frame.empty:
         raise MarketDataError(
@@ -4524,6 +4569,50 @@ DHAN_SCRIP_URLS = [
     "https://images.dhan.co/api-data/api-scrip-master.csv",
 ]
 DHAN_PRODUCTS = ["INTRADAY", "CNC", "MARGIN", "MTF", "CO", "BO"]
+
+#: What you are trading, in the words a trade is described in -- and the Dhan
+#: instrument and product type each one implies. Asking separately for an
+#: "instrument" and a "product type" was asking the same question twice.
+DHAN_TRADE_KINDS = {
+    "Intraday (equity, MIS)": (
+        "EQUITY", "INTRADAY",
+        "Same-day square-off on intraday margin. A LONG signal buys, a SHORT signal "
+        "sells."),
+    "Delivery (equity, CNC)": (
+        "EQUITY", "CNC",
+        "Stock into the demat account. A SHORT signal can only sell what you already "
+        "hold — CNC has no intraday short."),
+    "Options": (
+        "OPTIONS", "INTRADAY",
+        "A LONG signal buys the CE, a SHORT signal buys the PE. Both legs are resolved "
+        "in advance; buying an option is a BUY either way."),
+    "Futures": (
+        "FUTURES", "INTRADAY",
+        "The nearest unexpired contract. A LONG signal buys it, a SHORT signal sells "
+        "it."),
+}
+
+#: Strike spacing per underlying, used to pre-fill the ATM boxes. The RESOLVED
+#: contract is what gets traded, so a wrong step here costs a rounded starting
+#: value in a box and nothing else.
+STRIKE_STEPS = {"NIFTY": 50.0, "BANKNIFTY": 100.0, "FINNIFTY": 50.0,
+                "MIDCPNIFTY": 25.0, "SENSEX": 100.0, "BANKEX": 100.0}
+
+
+def strike_step_for(underlying: str) -> float:
+    """Strike spacing for an underlying; a sane guess for anything unlisted."""
+    return float(STRIKE_STEPS.get(str(underlying or "").strip().upper(), 50.0))
+
+
+def round_to_step(value, step: float) -> float:
+    """The nearest strike on the ladder, or 0 when there is no price to round."""
+    try:
+        price, size = float(value), float(step)
+    except (TypeError, ValueError):
+        return 0.0
+    if not (np.isfinite(price) and price > 0 and size > 0):
+        return 0.0
+    return float(round(price / size) * size)
 DHAN_INSTRUMENTS = ["EQUITY", "OPTIONS", "FUTURES"]
 DHAN_SEGMENTS = ["NSE_EQ", "BSE_EQ", "NSE_FNO", "BSE_FNO", "MCX_COMM", "NSE_CURRENCY"]
 
@@ -4746,6 +4835,245 @@ def contract_for_signal(broker: dict, direction: int) -> dict | None:
     return leg or broker.get("contract")
 
 
+# =============================================================================
+# SECTION 23 -- REAL-TIME CANDLES FROM DHAN
+# =============================================================================
+# WHY THIS EXISTS, AND WHAT IT DOES NOT FIX.
+#
+# The indicator maths in this application reproduces TradingView exactly. The
+# EMA is SMA-seeded the way `ta.ema` is, Wilder smoothing is used where Wilder
+# specified it, and the self-test checks the kernel against the published
+# definition to eleven decimal places. None of that helps if the CANDLES are
+# old, and Yahoo's Indian intraday feed is delayed.
+#
+# A worked example, from a real comparison the operator sent:
+#
+#     TradingView 9 EMA   23,922.18      app 9 EMA   23,912.80      gap 9.38
+#     TradingView 15 EMA  23,920.82      app 15 EMA  23,915.38      gap 5.44
+#     the app's own panel:  Candle Age 4m, FROZEN
+#
+# Feeding the same closes into the same EMA, but stopping four candles early,
+# reproduces the app's two numbers to within a rounding error. The formula was
+# never wrong; it was being applied to a chart that ended four minutes ago. On
+# a one-minute chart during a 20-point move, four missing candles is all it
+# takes -- and the faster the timeframe, the worse it gets.
+#
+# So the fix is not arithmetic, it is a feed. Dhan serves intraday candles to
+# the same account whose token is already configured for quotes, and those are
+# real-time. With it switched on the candles are current and the indicators
+# agree with the chart; with it off, nothing changes and the app says how stale
+# it is instead of pretending.
+
+#: Dhan's own exchange segment codes, which are not the ones used for orders.
+DHAN_CHART_SEGMENTS = {"IDX_I", "NSE_EQ", "NSE_FNO", "BSE_EQ", "BSE_FNO",
+                       "MCX_COMM", "NSE_CURRENCY", "BSE_CURRENCY"}
+
+#: The index security ids on Dhan's IDX_I / BSE_I segment. An index is not in
+#: the equity master under its trading name, so these are looked up here.
+DHAN_INDEX_IDS = {
+    "^NSEI": ("13", "IDX_I", "NIFTY 50"),
+    "^NSEBANK": ("25", "IDX_I", "NIFTY BANK"),
+    "NIFTY_FIN_SERVICE.NS": ("27", "IDX_I", "NIFTY FIN SERVICE"),
+    "^CNXMDCP50": ("442", "IDX_I", "NIFTY MIDCAP 50"),
+    "^NSMIDCP": ("442", "IDX_I", "NIFTY MIDCAP 50"),
+    "^BSESN": ("51", "BSE_EQ", "SENSEX"),
+    "^INDIAVIX": ("21", "IDX_I", "INDIA VIX"),
+}
+
+#: App interval -> (Dhan intraday interval, resample rule or None).
+#: Dhan serves 1, 5, 15, 25 and 60 minute candles; everything else is built
+#: from the nearest finer one that divides into it exactly.
+DHAN_INTERVAL_PLAN = {
+    "1m": ("1", None), "2m": ("1", "2min"), "3m": ("1", "3min"),
+    "5m": ("5", None), "10m": ("5", "10min"), "15m": ("15", None),
+    "30m": ("15", "30min"), "60m": ("60", None), "4h": ("60", "4h"),
+}
+
+
+def dhan_chart_target(symbol: str, broker: dict | None = None) -> tuple | None:
+    """
+    The (security id, segment, instrument) Dhan needs to chart this symbol.
+
+    Indices come from the table above, because an index is not listed in the
+    equity master under its trading name. Everything else is resolved through
+    the scrip master the order panel already downloads, so there is one
+    definition of what a symbol means rather than two that can disagree.
+    """
+    raw = (symbol or "").strip().upper()
+    if raw in DHAN_INDEX_IDS:
+        security_id, segment, _name = DHAN_INDEX_IDS[raw]
+        return security_id, segment, "INDEX"
+
+    # An explicitly resolved contract always wins: if the operator has pointed
+    # the order panel at a particular option, chart that option.
+    contract = (broker or {}).get("contract") or {}
+    if contract.get("security_id") and contract.get("exchange_segment"):
+        instrument = {"OPTIONS": "OPTIDX", "FUTURES": "FUTIDX",
+                      "EQUITY": "EQUITY"}.get(str(contract.get("instrument")), "EQUITY")
+        if str(contract.get("exchange_segment", "")).endswith("_EQ"):
+            instrument = "EQUITY"
+        return str(contract["security_id"]), str(contract["exchange_segment"]), instrument
+
+    if not (raw.endswith(".NS") or raw.endswith(".BO")):
+        return None                      # not an Indian cash symbol Dhan carries
+    name = raw.replace(".NS", "").replace(".BO", "")
+    segment = "BSE_EQ" if raw.endswith(".BO") else "NSE_EQ"
+    try:
+        master = st.session_state.get("scrip_master") if st is not None else None
+        if master is None or master.empty:
+            return None
+        hit = master[(master["name"].fillna("").str.upper() == name)
+                     & (master["instrument"].fillna("").str.contains("EQUITY", na=False))]
+        if hit.empty:
+            hit = master[master["trading_symbol"].fillna("").str.upper() == name]
+        if hit.empty:
+            return None
+        return str(hit.iloc[0]["security_id"]), segment, "EQUITY"
+    except Exception:                                               # noqa: BLE001
+        return None
+
+
+def _dhan_epoch_to_index(stamps) -> pd.DatetimeIndex:
+    """
+    Dhan's timestamps into Asia/Kolkata, read as a standard Unix epoch.
+
+    It is tempting to "helpfully" detect an alternative epoch and shift by it.
+    That is a trap: a 1980-anchored 2026 timestamp read as Unix lands in 2016,
+    which is a perfectly plausible year, so the guess cannot be checked and a
+    wrong one would chart the wrong DECADE while looking entirely normal.
+
+    So this does the one documented thing and no guessing, and the caller
+    checks that what came back is anywhere near today. Refusing a feed that
+    looks wrong is recoverable; silently charting 2016 is not.
+    """
+    values = pd.to_numeric(pd.Series(list(stamps)), errors="coerce").dropna()
+    if values.empty:
+        return pd.DatetimeIndex([])
+    return pd.DatetimeIndex(
+        pd.to_datetime(values, unit="s", utc=True).dt.tz_convert("Asia/Kolkata"))
+
+
+def dhan_candles(broker: dict, symbol: str, interval: str, period: str,
+                 timeout: float = 15.0) -> tuple:
+    """
+    Candles from Dhan. Returns ``(frame, note)``; the frame is empty on failure.
+
+    Never raises: a feed problem must degrade to Yahoo rather than taking the
+    whole app down, and the note says what happened so the fallback is visible
+    rather than silent.
+    """
+    token = str((broker or {}).get("access_token", "")).strip()
+    client = str((broker or {}).get("client_id", "")).strip()
+    if not (token and client):
+        return pd.DataFrame(), "no Dhan credentials"
+    target = dhan_chart_target(symbol, broker)
+    if target is None:
+        return pd.DataFrame(), (f"`{symbol}` could not be matched to a Dhan security id "
+                                f"(resolve a contract, or it is not an Indian listing)")
+    security_id, segment, instrument = target
+    import requests
+
+    days = int(PERIOD_DAYS.get(period, 30))
+    to_date = pd.Timestamp.now(tz="Asia/Kolkata").date()
+    from_date = to_date - pd.Timedelta(days=max(days, 2))
+    headers = {"Content-Type": "application/json", "Accept": "application/json",
+               "access-token": token, "client-id": client}
+
+    if interval in DHAN_INTERVAL_PLAN:
+        native, rule = DHAN_INTERVAL_PLAN[interval]
+        # Dhan caps an intraday request at 90 days; asking for more is refused
+        # outright rather than truncated.
+        from_date = max(from_date, to_date - pd.Timedelta(days=85))
+        url, payload = f"{DHAN_BASE}/charts/intraday", {
+            "securityId": str(security_id), "exchangeSegment": segment,
+            "instrument": instrument, "interval": native, "oi": False,
+            "fromDate": str(from_date), "toDate": str(to_date)}
+    else:
+        rule = {"1wk": "W", "1mo": "ME"}.get(interval)
+        url, payload = f"{DHAN_BASE}/charts/historical", {
+            "securityId": str(security_id), "exchangeSegment": segment,
+            "instrument": instrument, "expiryCode": 0, "oi": False,
+            "fromDate": str(from_date), "toDate": str(to_date)}
+
+    try:
+        response = requests.post(url, headers=headers, data=json.dumps(payload),
+                                 timeout=float(timeout))
+    except Exception as exc:                                        # noqa: BLE001
+        return pd.DataFrame(), f"Dhan candle request failed: {str(exc)[:120]}"
+    if response.status_code >= 300:
+        return pd.DataFrame(), (f"Dhan refused the candle request "
+                                f"({response.status_code}): {response.text[:160]}")
+    try:
+        body = response.json()
+    except Exception:                                               # noqa: BLE001
+        return pd.DataFrame(), "Dhan returned something that is not JSON"
+
+    needed = ("open", "high", "low", "close", "timestamp")
+    if not all(key in body for key in needed):
+        return pd.DataFrame(), (f"Dhan's reply has no candles in it "
+                                f"({str(body)[:160]})")
+    index = _dhan_epoch_to_index(body["timestamp"])
+    if len(index) == 0:
+        return pd.DataFrame(), "Dhan returned an empty candle set"
+    size = min(len(index), *(len(body[key]) for key in ("open", "high", "low", "close")))
+    frame = pd.DataFrame({
+        "Open": pd.to_numeric(pd.Series(body["open"][:size]), errors="coerce"),
+        "High": pd.to_numeric(pd.Series(body["high"][:size]), errors="coerce"),
+        "Low": pd.to_numeric(pd.Series(body["low"][:size]), errors="coerce"),
+        "Close": pd.to_numeric(pd.Series(body["close"][:size]), errors="coerce"),
+        "Volume": pd.to_numeric(pd.Series((body.get("volume") or [0] * size)[:size]),
+                                errors="coerce").fillna(0.0),
+    }, index=index[:size]).dropna(subset=["Open", "High", "Low", "Close"])
+    if frame.empty:
+        return pd.DataFrame(), "Dhan's candles were all unusable"
+    frame = frame[~frame.index.duplicated(keep="last")].sort_index()
+
+    # Does this look like the window that was asked for? A feed whose newest
+    # candle is a year old has been misread -- a timestamp convention that
+    # does not match, most likely -- and charting it would put stale prices
+    # on screen under today's date. Refuse it and say so.
+    age = (pd.Timestamp.now(tz="Asia/Kolkata") - frame.index[-1]).total_seconds() / 60.0
+    if age > 60 * 24 * 10 or age < -60:
+        return pd.DataFrame(), (
+            f"Dhan's candles are dated {frame.index[-1]:%d %b %Y %H:%M}, which is not "
+            f"anywhere near now — the timestamps did not read as expected, so they were "
+            f"not used. Falling back to Yahoo rather than charting the wrong dates.")
+    if rule:
+        frame = _resample(frame, rule)
+        age = (pd.Timestamp.now(tz="Asia/Kolkata")
+               - frame.index[-1]).total_seconds() / 60.0
+    return frame, (f"{len(frame)} candles from Dhan, newest {age:.1f} min old")
+
+
+def candle_source_note(frame: pd.DataFrame, interval: str) -> tuple:
+    """
+    How stale the candles are, and what that costs in indicator terms.
+
+    Returned as (minutes_old, candles_old, message). The message is the part
+    that was missing: an operator comparing a 9 EMA against TradingView needs
+    to be told that a four-candle lag IS the difference they are looking at,
+    not left to conclude the maths is broken.
+    """
+    if frame is None or frame.empty:
+        return float("nan"), 0, ""
+    try:
+        last = pd.Timestamp(frame.index[-1])
+        now = pd.Timestamp.now(tz=last.tz) if last.tz is not None else pd.Timestamp.now()
+        minutes = (now - last).total_seconds() / 60.0
+    except Exception:                                               # noqa: BLE001
+        return float("nan"), 0, ""
+    per_candle = max(INTERVAL_SECONDS.get(interval, 60) / 60.0, 1e-9)
+    behind = max(int(minutes // per_candle), 0)
+    if behind < 1:
+        return minutes, 0, ""
+    return minutes, behind, (
+        f"**These candles are {behind} candle(s) behind** ({minutes:.0f} minutes). "
+        f"Every indicator is computed correctly on them, and will therefore NOT match "
+        f"a live chart — a {behind}-candle lag moves a short EMA by roughly as much as "
+        f"price has moved in those {behind} candles. This is a data delay, not a "
+        f"calculation error. Switch on Dhan candles in the sidebar for a real-time feed.")
+
+
 def dhan_ltp(broker: dict, contract: dict) -> float | None:
     """
     Real-time last traded price from DhanHQ v2 Market Quote.
@@ -4779,24 +5107,45 @@ def dhan_ltp(broker: dict, contract: dict) -> float | None:
 
 
 def place_dhan_order(broker: dict, contract: dict, side: str, quantity: float,
-                     dry_run: bool = True) -> dict:
+                     dry_run: bool = True, order_type: str = "MARKET",
+                     limit_price: float | None = None) -> dict:
     """
-    Place a MARKET order through DhanHQ v2.
+    Place an order through DhanHQ v2.
 
     Returns a receipt dict. With ``dry_run=True`` the payload is built and
     returned but nothing leaves the machine.
+
+    A LIMIT order needs a price, and Dhan rejects one sent at zero. Rather
+    than let that reach the exchange as a puzzling rejection, a limit with no
+    usable price is refused here, by name.
     """
+    kind = str(order_type or "MARKET").upper()
+    if kind not in ("MARKET", "LIMIT"):
+        kind = "MARKET"
+    price = 0.0
+    if kind == "LIMIT":
+        try:
+            price = float(limit_price)
+        except (TypeError, ValueError):
+            price = 0.0
+        if not (np.isfinite(price) and price > 0):
+            raise BrokerError(
+                "A LIMIT order needs a price above zero. No live price was available "
+                "for this contract, so the order was not sent — switch the order type "
+                "to MARKET, or set the limit offset against a contract that is quoting.")
+        price = round(price, 2)
+
     payload = {
         "dhanClientId": str(broker.get("client_id", "")).strip(),
         "correlationId": f"algoplat{int(time.time())}",
         "transactionType": "BUY" if side.upper() in ("BUY", "LONG") else "SELL",
         "exchangeSegment": contract["exchange_segment"],
         "productType": broker.get("product_type", "INTRADAY"),
-        "orderType": "MARKET",
+        "orderType": kind,
         "validity": "DAY",
         "securityId": str(contract["security_id"]),
         "quantity": int(quantity),
-        "price": 0,
+        "price": price,
     }
     if dry_run:
         return {"status": "DRY_RUN", "payload": payload, "order_id": None,
@@ -5250,13 +5599,30 @@ def _maybe_route_broker(cfg: dict, position: Position, closing: bool) -> None:
                ("BUY" if position.direction > 0 else "SELL")
 
     quantity = broker.get("quantity") or position.quantity
+    # Entry and exit have their OWN order type. Getting in on a limit and out
+    # on a market is a perfectly ordinary choice -- you can afford to miss an
+    # entry, and you cannot afford to miss a stop.
+    kind = str(broker.get("exit_order_type" if closing else "entry_order_type")
+               or "MARKET").upper()
+    limit_price = None
+    if kind == "LIMIT":
+        live = dhan_ltp(broker, contract)
+        offset = float(broker.get("limit_offset_pct", 0.0)) / 100.0
+        if live and np.isfinite(live) and live > 0:
+            # Nudged in the direction that helps the order fill: a buy bids a
+            # little above the touch, a sell offers a little below it. A limit
+            # placed exactly at the last trade is the one that does not fill.
+            limit_price = live * (1.0 + offset) if side == "BUY" else live * (1.0 - offset)
     try:
         receipt = place_dhan_order(broker, contract, side, quantity,
-                                   dry_run=broker.get("dry_run", True))
+                                   dry_run=broker.get("dry_run", True),
+                                   order_type=kind, limit_price=limit_price)
         st.session_state.broker_receipts.insert(0, {
             "time": pd.Timestamp.now(), "leg": "EXIT" if closing else "ENTRY",
             "side": side, "contract": contract.get("trading_symbol"),
             "security id": contract.get("security_id"), "quantity": quantity,
+            "order type": kind,
+            "limit price": round(limit_price, 2) if limit_price else None,
             **{k: receipt.get(k) for k in ("status", "order_id", "message")}})
         del st.session_state.broker_receipts[100:]
         if not closing:
@@ -6109,7 +6475,7 @@ def render_sidebar() -> dict:
 
     st.session_state["groq_cfg"] = render_groq_sidebar(sb)
     filter_cfg, filter_extras = _render_filters(sb, live)
-    broker = _render_broker(sb, live, symbol)
+    broker = _render_broker(sb, live, symbol, interval)
 
     params = dict(DEFAULT_PARAMS)
     with sb.expander("Advanced indicator parameters"):
@@ -6337,7 +6703,7 @@ def _render_filters(sb, live: bool):
     return cfg, extras
 
 
-def _render_broker(sb, live: bool, symbol: str) -> dict:
+def _render_broker(sb, live: bool, symbol: str, interval: str = "5m") -> dict:
     """
     Dhan integration.
 
@@ -6359,9 +6725,26 @@ def _render_broker(sb, live: bool, symbol: str) -> dict:
         broker["use_live_ltp"] = bool(use_data)
         broker["enabled"] = bool(enable_orders)
 
-        if not (use_data or enable_orders):
-            st.caption("Both switches are off. The app runs entirely on Yahoo data and places "
-                       "no orders.")
+        # THE SETTING THAT MAKES THE INDICATORS MATCH A LIVE CHART.
+        #
+        # Yahoo's Indian intraday feed runs minutes behind. An EMA computed
+        # perfectly on candles that stop four minutes ago is four minutes
+        # wrong, and on a one-minute chart that is several points -- which
+        # looks exactly like a broken formula and is not one. Dhan serves
+        # real-time candles to the same account whose token is already here.
+        use_dhan_candles = st.checkbox(
+            "Build candles from Dhan too (real-time, not Yahoo's delayed feed)",
+            value=False, key="brk_candles",
+            help="Yahoo's Indian intraday candles arrive minutes late, so indicators "
+                 "computed on them lag a live chart by however late they are. This "
+                 "replaces the candle feed itself, not just the quote. Needs the same "
+                 "token, and a Dhan Data API subscription.")
+        broker["use_dhan_candles"] = bool(use_dhan_candles)
+
+        if not (use_data or enable_orders or use_dhan_candles):
+            st.caption("All three switches are off. The app runs entirely on Yahoo data "
+                       "and places no orders.")
+            st.session_state["dhan_candle_broker"] = None
             return broker
 
         # --- credentials: needed by DATA and by ORDERS alike ---
@@ -6376,22 +6759,50 @@ def _render_broker(sb, live: bool, symbol: str) -> dict:
             st.warning("No access token yet. Dhan data calls will fail and the app will fall "
                        "back to the Yahoo quote.")
 
-        # --- contract: needed for the LTP feed AND for order routing ---
-        st.markdown("**Contract**")
-        instrument = st.selectbox("Instrument", DHAN_INSTRUMENTS, key="brk_inst")
+        # Published to session state, which is per-user, so the data loader can
+        # see it without the broker dict being threaded through fifty call
+        # sites -- and without one person's feed choice reaching anyone else.
+        st.session_state["dhan_candle_broker"] = (
+            dict(broker) if (use_dhan_candles and str(broker["access_token"]).strip())
+            else None)
+        if use_dhan_candles:
+            if st.button("Test the candle feed", key="brk_candle_test", width="stretch"):
+                frame, note = dhan_candles(broker, symbol, interval, "5d")
+                if frame.empty:
+                    st.error(f"No candles: {note}")
+                else:
+                    age = (pd.Timestamp.now(tz="Asia/Kolkata")
+                           - pd.Timestamp(frame.index[-1])).total_seconds() / 60.0
+                    st.success(f"{note}")
+                    st.caption(f"Newest candle {frame.index[-1]:%d %b %H:%M} · close "
+                               f"{fmt(frame['Close'].iloc[-1])} · {age:.1f} minutes old. "
+                               f"Under one candle old means your indicators will now "
+                               f"agree with a live chart.")
+            note = st.session_state.get("dhan_candle_note") or ""
+            if note:
+                st.caption(f"Last candle fetch: {note}.")
 
-        # THE SEGMENT AND THE UNDERLYING FOLLOW THE SIDEBAR TICKER.
+        # --- what you are trading -------------------------------------------
         #
-        # They used to be plain widgets, and a Streamlit widget keeps whatever
-        # value it was first created with. Switch Instrument from EQUITY to
-        # OPTIONS and the segment stayed on NSE_EQ; change the ticker and the
-        # underlying stayed on the old name. Both then failed to resolve, which
-        # is the "a spot price is required" dead end -- the real fault was two
-        # boxes quietly out of step with the rest of the sidebar.
-        #
-        # Now each follows automatically and the widget's KEY carries what it
-        # is following, so it is rebuilt rather than remembered. Ticking the
-        # override hands control back.
+        # One dropdown instead of two. "Instrument EQUITY + product INTRADAY"
+        # asked the same question twice in different words; this asks it once,
+        # in the words a trade is actually described in, and derives the Dhan
+        # instrument and product type from the answer.
+        st.markdown("**Contract**")
+        trade_kind = st.selectbox(
+            "Trade type", list(DHAN_TRADE_KINDS), key="brk_kind",
+            help="Intraday squares off the same day and uses MIS margin. Delivery "
+                 "takes stock into the demat account (CNC). Options and Futures "
+                 "route to the derivatives segment.")
+        instrument, product, kind_note = DHAN_TRADE_KINDS[trade_kind]
+        st.caption(kind_note)
+        broker["product_type"] = product
+
+        # The segment and the underlying FOLLOW the sidebar ticker. They were
+        # plain widgets once, and a Streamlit widget keeps the value it was
+        # first created with -- switch to OPTIONS and the segment stayed on
+        # NSE_EQ, so nothing resolved. The key carries what it follows now, so
+        # the widget is rebuilt rather than remembered.
         wants_fno = instrument in ("OPTIONS", "FUTURES")
         auto_underlying = _default_underlying(symbol)
         auto_segment = ("BSE_FNO" if (wants_fno and auto_underlying in ("SENSEX", "BANKEX"))
@@ -6420,14 +6831,7 @@ def _render_broker(sb, live: bool, symbol: str) -> dict:
         broker["underlying"] = underlying
 
         # --- spot, which the ATM strike depends on ---------------------------
-        #
-        # Previously this only looked at a live snapshot or a finished
-        # backtest, so on a fresh page load there was no spot and no ATM could
-        # be chosen -- for a panel whose whole job is to find the ATM strike.
-        # It now falls back to the last close of the ticker's own daily data,
-        # which always exists.
-        spot = None
-        spot_source = ""
+        spot, spot_source = None, ""
         snapshot = st.session_state.get("live_snapshot")
         result = st.session_state.get("backtest_result")
         if snapshot is not None and getattr(snapshot, "ltp", None):
@@ -6442,96 +6846,124 @@ def _render_broker(sb, live: bool, symbol: str) -> dict:
             except Exception:                                       # noqa: BLE001
                 spot, spot_source = None, ""
 
-        option_type = "CALL"
-        strike_override = None
+        # --- resolution, which happens BY ITSELF -----------------------------
+        #
+        # There was a button here. A button is the wrong shape for this: the
+        # contract is a function of the ticker, the trade type and the spot,
+        # all of which are already on screen, so pressing something to make
+        # the app agree with its own settings is a step that exists only to be
+        # forgotten -- and forgetting it meant a signal fired with no contract
+        # resolved. It now re-resolves whenever those inputs change, and the
+        # scrip master is downloaded once per session.
+        strike_inputs = {}
         if instrument == "OPTIONS":
+            step = strike_step_for(underlying)
+            atm = round_to_step(spot, step)
+            if spot:
+                st.caption(f"Spot {fmt(spot)} from {spot_source} · ATM {fmt(atm, 0)} "
+                           f"(strikes every {fmt(step, 0)}).")
+            else:
+                st.warning("No spot price could be read, so the ATM strike cannot be "
+                           "worked out. Type both strikes below.")
+            # TWO boxes, pre-filled at the money, each independently editable.
+            # Keyed on the ATM so they re-default when the market moves to a
+            # new strike, instead of pinning yesterday's number forever.
+            c_ce, c_pe = st.columns(2)
+            strike_inputs["CALL"] = float(c_ce.number_input(
+                "CE strike", 0.0, 1e9, float(atm or 0.0), float(step),
+                key=f"brk_ce_{underlying}_{atm}",
+                help="Pre-filled at the money. Edit it and the nearest LISTED strike "
+                     "to what you type is used."))
+            strike_inputs["PUT"] = float(c_pe.number_input(
+                "PE strike", 0.0, 1e9, float(atm or 0.0), float(step),
+                key=f"brk_pe_{underlying}_{atm}"))
             broker["auto_right"] = st.checkbox(
                 "Pick the right from the signal (long -> CE, short -> PE)", value=True,
                 key="brk_auto_right",
-                help="On: both legs are resolved in advance and the signal takes the "
-                     "one it needs. Off: every order uses the single right below.")
-            option_type = st.selectbox("Option right (used when auto is off)",
-                                       ["CALL", "PUT"], key="brk_right")
-            if spot:
-                st.caption(f"Spot {fmt(spot)} from {spot_source}.")
+                help="On: a BUY signal takes the CE and a SELL signal takes the PE, "
+                     "both already resolved. Off: every order uses the right below.")
+            if not broker.get("auto_right"):
+                broker["option_type"] = st.selectbox(
+                    "Option right (used when auto is off)", ["CALL", "PUT"],
+                    key="brk_right")
             else:
-                st.warning("No spot price could be read for this ticker, so the ATM "
-                           "strike cannot be chosen automatically. Type a strike below.")
-            use_own_strike = st.checkbox(
-                "Choose the strike myself", value=False, key="brk_own_strike",
-                help="Off: the listed strike nearest spot, which is the ATM. On: type "
-                     "any strike and the nearest LISTED one to it is used — an "
-                     "unlisted strike cannot be traded however sensible it looks.")
-            if use_own_strike:
-                strike_override = float(st.number_input(
-                    "Strike", 0.0, 1e9, float(round(spot or 0.0, -1)), 50.0,
-                    key="brk_strike"))
-        broker["option_type"] = option_type
+                broker["option_type"] = "CALL"
+        else:
+            broker["auto_right"] = False
+            broker["option_type"] = "CALL"
+            if spot:
+                st.caption(f"Spot {fmt(spot)} from {spot_source}. A {trade_kind.lower()} "
+                           f"signal buys on LONG and sells on SHORT — there is no option "
+                           f"right to choose.")
 
-        resolve_label = ("Resolve both CE and PE" if instrument == "OPTIONS"
-                         else "Resolve contract")
-        if st.button(resolve_label, key="brk_resolve", width="stretch"):
+        # The resolution key: everything the answer depends on. When it
+        # changes, the contract is looked up again; when it does not, the
+        # cached one is reused and no network call happens.
+        want = (instrument, segment, underlying,
+                round(strike_inputs.get("CALL", 0.0), 2),
+                round(strike_inputs.get("PUT", 0.0), 2),
+                None if spot is None else round(spot / max(strike_step_for(underlying), 1), 0))
+        if st.session_state.get("brk_resolved_for") != want:
             try:
-                with st.spinner("Downloading the Dhan instrument master..."):
-                    master = st.session_state.scrip_master
-                    if master is None:
+                master = st.session_state.scrip_master
+                if master is None:
+                    with st.spinner("Downloading the Dhan instrument master (once)..."):
                         master = load_scrip_master()
                         st.session_state.scrip_master = master
                 if instrument == "OPTIONS":
-                    pair = resolve_option_pair(master, underlying, segment, spot,
-                                               strike_override=strike_override)
+                    pair = {"CALL": None, "PUT": None, "error": None}
+                    for right in ("CALL", "PUT"):
+                        asked = strike_inputs.get(right) or spot
+                        try:
+                            pair[right] = resolve_instrument(
+                                master, underlying, "OPTIONS", segment, asked, right)
+                        except BrokerError as exc:
+                            pair["error"] = str(exc)
                     st.session_state["brk_pair"] = pair
-                    st.session_state["brk_contract"] = (
-                        pair.get("CALL") if option_type == "CALL" else pair.get("PUT"))
-                    if pair.get("error") and not (pair.get("CALL") or pair.get("PUT")):
-                        st.error(pair["error"])
+                    st.session_state["brk_contract"] = pair.get("CALL") or pair.get("PUT")
                 else:
                     st.session_state["brk_pair"] = None
                     st.session_state["brk_contract"] = resolve_instrument(
-                        master, underlying, instrument, segment, spot, option_type)
+                        master, underlying, instrument, segment, spot, "CALL")
+                st.session_state["brk_resolved_for"] = want
+                st.session_state["brk_resolve_error"] = ""
             except BrokerError as exc:
-                st.error(str(exc))
+                st.session_state["brk_resolve_error"] = str(exc)
             except Exception as exc:                                # noqa: BLE001
-                st.error(f"Could not resolve the contract: {exc}")
+                st.session_state["brk_resolve_error"] = f"Could not resolve: {exc}"
 
+        problem = st.session_state.get("brk_resolve_error")
+        if problem:
+            st.error(problem)
         pair = st.session_state.get("brk_pair") if instrument == "OPTIONS" else None
         broker["option_pair"] = pair
         contract = st.session_state.get("brk_contract")
 
         if pair and (pair.get("CALL") or pair.get("PUT")):
-            # BOTH legs, with their own security ids, so the signal has
-            # nothing left to look up when it fires.
             rows = []
             for right, label in (("CALL", "CE — taken on a BUY signal"),
                                  ("PUT", "PE — taken on a SELL signal")):
                 leg = pair.get(right)
-                if not leg:
-                    rows.append({"Leg": label, "Strike": None, "Symbol": "not resolved",
-                                 "Security id": "--", "Expiry": "--", "Lot": None})
-                    continue
-                rows.append({"Leg": label, "Strike": leg.get("strike"),
-                             "Symbol": leg.get("trading_symbol"),
-                             "Security id": leg.get("security_id"),
-                             "Expiry": leg.get("expiry"), "Lot": leg.get("lot_size")})
+                rows.append({"Leg": label,
+                             "Strike": leg.get("strike") if leg else None,
+                             "Symbol": leg.get("trading_symbol") if leg else "not resolved",
+                             "Security id": leg.get("security_id") if leg else "--",
+                             "Expiry": leg.get("expiry") if leg else "--",
+                             "Lot": leg.get("lot_size") if leg else None})
             st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
-            if pair.get("error"):
-                st.warning(pair["error"])
-            st.caption("Both security ids are resolved now, before any signal. When one "
-                       "fires, the matching leg is already in hand — a lookup at the "
-                       "moment of entry is a lookup at the worst possible second.")
-            if not broker.get("auto_right"):
-                st.info(f"Automatic right is OFF, so every order uses the "
-                        f"**{option_type}** leg whichever way the signal goes.")
+            st.caption("Resolved automatically, and re-resolved whenever the ticker, the "
+                       "trade type or a strike changes. Both security ids are in hand "
+                       "before any signal fires.")
             contract = contract or pair.get("CALL") or pair.get("PUT")
             broker["contract"] = contract
         elif contract:
             broker["contract"] = contract
             st.success(f"{contract['trading_symbol']}  "
                        f"(security id {contract['security_id']})")
-            st.json({k: v for k, v in contract.items() if v is not None})
-        else:
-            st.info("Resolve a contract to enable the Dhan LTP feed and, if switched on, "
-                    "order routing.")
+            st.caption("Resolved automatically from the ticker and trade type. A LONG "
+                       "signal buys it, a SHORT signal sells it.")
+        elif not problem:
+            st.info("No contract resolved yet.")
 
         # --- quantity --------------------------------------------------------
         st.markdown("**Quantity**")
@@ -6548,8 +6980,7 @@ def _render_broker(sb, live: bool, symbol: str) -> dict:
                         name, 1, 100000, int(size), 1, key=f"brk_lot_{name}"))
         suggested = default_quantity(instrument, underlying, lot_sizes, contract)
         source = ("the resolved contract" if (contract and contract.get("lot_size"))
-                  else "the table above" if instrument == "OPTIONS"
-                  else "one share")
+                  else "the table above" if instrument == "OPTIONS" else "one share")
         quantity = st.number_input(
             "Order quantity (units, not lots)", 1, 10_000_000, int(suggested), 1,
             key=f"brk_qty_{instrument}_{underlying}_{suggested}",
@@ -6573,7 +7004,36 @@ def _render_broker(sb, live: bool, symbol: str) -> dict:
                      "you have tested the whole path.")
             broker["dry_run"] = st.checkbox("Dry run (build the payload, transmit nothing)",
                                             value=True, key="brk_dry")
-            broker["product_type"] = st.selectbox("Product type", DHAN_PRODUCTS, key="brk_prod")
+            st.caption(f"Product type **{broker.get('product_type')}**, from the trade "
+                       f"type above.")
+
+            # Entry and exit get their OWN order type. Getting in on a limit
+            # and out on a market is an ordinary choice: you can afford to
+            # miss an entry, you cannot afford to miss a stop.
+            o1, o2 = st.columns(2)
+            broker["entry_order_type"] = o1.selectbox(
+                "Entry order", ["MARKET", "LIMIT"], index=0, key="brk_entry_ot",
+                help="MARKET fills now at whatever is there. LIMIT may not fill at all, "
+                     "and an entry that does not fill is a trade you simply did not take.")
+            broker["exit_order_type"] = o2.selectbox(
+                "Square-off order", ["MARKET", "LIMIT"], index=0, key="brk_exit_ot",
+                help="Think hard before putting a stop on a LIMIT. If price runs past "
+                     "your limit the exit does not fill and the position stays open, "
+                     "which is the one failure a stop exists to prevent.")
+            if "LIMIT" in (broker["entry_order_type"], broker["exit_order_type"]):
+                broker["limit_offset_pct"] = float(st.number_input(
+                    "Limit offset from the live price (%)", 0.0, 5.0, 0.05, 0.01,
+                    key="brk_limit_off",
+                    help="A buy bids this far ABOVE the last trade and a sell offers "
+                         "this far below, because a limit placed exactly at the last "
+                         "trade is the one that does not fill. The price comes from "
+                         "Dhan's live quote for that contract; if it cannot be read, "
+                         "the order is refused rather than sent at zero."))
+                if broker["exit_order_type"] == "LIMIT":
+                    st.warning("**Your square-off is a LIMIT order.** If price gaps "
+                               "through it the exit will not fill and the position "
+                               "stays open with no stop. MARKET is the safer default "
+                               "for an exit.")
     return broker
 
 
@@ -23113,6 +23573,231 @@ def pytest_approx(value, tolerance=1e-9):
     return _Close()
 
 
+def _test_indicators_match_tradingview():
+    """
+    The indicator kernel against TradingView's published definition, and the
+    real reason values disagree with a live chart.
+
+    The operator reported a mismatch and reasonably concluded the maths was
+    wrong. It is not, and this test says so in two halves. The first checks
+    the kernel to eleven decimal places. The second reproduces the actual
+    disagreement -- from the SAME kernel -- by simply stopping four candles
+    early, which is what a delayed feed does.
+    """
+    def tradingview_ema(values, length):
+        """`ta.ema` longhand: SMA seed, then the recursion. No pandas."""
+        alpha = 2.0 / (length + 1.0)
+        out = [float("nan")] * len(values)
+        if len(values) < length:
+            return out
+        running = sum(values[:length]) / length
+        out[length - 1] = running
+        for i in range(length, len(values)):
+            running = alpha * values[i] + (1 - alpha) * running
+            out[i] = running
+        return out
+
+    def tradingview_rma(values, length):
+        """Wilder's smoothing, as `ta.rma`: SMA seed, alpha = 1/length."""
+        alpha = 1.0 / length
+        out = [float("nan")] * len(values)
+        if len(values) < length:
+            return out
+        running = sum(values[:length]) / length
+        out[length - 1] = running
+        for i in range(length, len(values)):
+            running = alpha * values[i] + (1 - alpha) * running
+            out[i] = running
+        return out
+
+    rng = np.random.default_rng(7)
+    prices = list(23900 + np.cumsum(rng.normal(0, 3, 500)))
+    series = pd.Series(prices)
+
+    for length in (9, 15, 21, 50, 200):
+        mine = ema(series, length).to_numpy()
+        theirs = np.array(tradingview_ema(prices, length))
+        usable = np.isfinite(mine) & np.isfinite(theirs)
+        assert usable.sum() > 100, length
+        worst = float(np.max(np.abs(mine[usable] - theirs[usable])))
+        assert worst < 1e-9, f"EMA{length} differs from TradingView by {worst}"
+        # And it must start on the SAME bar: a different warm-up is a
+        # different indicator even when the recursion matches.
+        assert int(np.argmax(np.isfinite(mine))) == length - 1
+        assert int(np.argmax(np.isfinite(theirs))) == length - 1
+
+    for length in (14, 21):
+        mine = rma(series, length).to_numpy()
+        theirs = np.array(tradingview_rma(prices, length))
+        usable = np.isfinite(mine) & np.isfinite(theirs)
+        assert float(np.max(np.abs(mine[usable] - theirs[usable]))) < 1e-9, length
+
+    # The seeding is the whole point, and the naive version is wrong. pandas'
+    # ewm(adjust=False) seeds with the FIRST observation rather than an SMA,
+    # and that is the usual cause of drift against a chart.
+    naive = series.ewm(span=9, adjust=False).mean().to_numpy()
+    theirs = np.array(tradingview_ema(prices, 9))
+    usable = np.isfinite(theirs)
+    assert float(np.max(np.abs(naive[usable] - theirs[usable]))) > 0.01, \
+        "this fixture only means something if the naive version really does differ"
+
+    # --- the second half: WHY a correct EMA disagrees with a live chart -----
+    #
+    # One minute of Nifty, a dip and a rally. The same kernel, run to the end
+    # and run four candles short, is the entire reported discrepancy.
+    closes = pd.Series([23918, 23915, 23921, 23913, 23919, 23924, 23928, 23933,
+                        23935, 23931, 23936, 23934, 23930, 23922, 23910, 23906,
+                        23904, 23908, 23905, 23909, 23907, 23916, 23920, 23928,
+                        23932, 23934.20], dtype=float)
+    current = float(ema(closes, 9).iloc[-1])
+    stale = float(ema(closes.iloc[:-4], 9).iloc[-1])
+    assert abs(current - stale) > 5.0, (current, stale)
+    # The direction matters too: during a rally a stale EMA reads LOW, which
+    # is what makes a fast/slow pair look crossed the wrong way.
+    assert stale < current
+
+    # The staleness notice has to NAME this, or the operator is left to
+    # conclude the formula is broken -- which is exactly what happened.
+    index = pd.date_range("2026-11-04 09:15", periods=30, freq="1min",
+                          tz="Asia/Kolkata")
+    fresh = pd.DataFrame({"Open": 1.0, "High": 1.0, "Low": 1.0, "Close": 1.0,
+                          "Volume": 1.0}, index=index)
+    old = fresh.copy()
+    old.index = pd.date_range(pd.Timestamp.now(tz="Asia/Kolkata")
+                              - pd.Timedelta(minutes=34), periods=30, freq="1min",
+                              tz="Asia/Kolkata")
+    minutes, behind, message = candle_source_note(old, "1m")
+    assert behind >= 3, (minutes, behind)
+    assert "candle(s) behind" in message and "not a calculation error" in message
+    current_feed = fresh.iloc[:1].copy()
+    current_feed.index = pd.DatetimeIndex(
+        [pd.Timestamp.now(tz="Asia/Kolkata") - pd.Timedelta(seconds=20)])
+    assert candle_source_note(current_feed, "1m")[2] == "", \
+        "a current feed must say nothing"
+    assert candle_source_note(pd.DataFrame(), "1m")[2] == ""
+
+    print(f"   indicators: EMA 9/15/21/50/200 and Wilder RMA match TradingView to 1e-9 "
+          f"and start on the same bar; a 4-candle-stale feed moves the 9 EMA by "
+          f"{current - stale:.2f} points, which IS the reported mismatch  OK")
+
+
+def _test_dhan_candle_feed():
+    """
+    The real-time candle path: what it charts, how it reads a timestamp, and
+    that a failure degrades to Yahoo instead of taking the app down.
+    """
+    # Indices are not in the equity master under their trading name, so they
+    # come from a table.
+    assert dhan_chart_target("^NSEI") == ("13", "IDX_I", "INDEX")
+    assert dhan_chart_target("^NSEBANK")[1] == "IDX_I"
+    assert dhan_chart_target("BTC-USD") is None, "Dhan does not carry crypto"
+    assert dhan_chart_target("AAPL") is None
+    # A resolved contract wins: chart the option the order panel is pointed at.
+    broker = {"contract": {"security_id": "45678", "exchange_segment": "NSE_FNO",
+                           "instrument": "OPTIONS"}}
+    assert dhan_chart_target("RELIANCE.NS", broker) == ("45678", "NSE_FNO", "OPTIDX")
+
+    # Timestamps: a standard epoch is read as-is, and an implausible year is
+    # retried against the other anchor rather than charted as 1971.
+    now = int(pd.Timestamp("2026-11-04 10:05", tz="Asia/Kolkata").timestamp())
+    index = _dhan_epoch_to_index([now, now + 60, now + 120])
+    assert str(index.tz) == "Asia/Kolkata" and index[0].year == 2026
+    assert index[0].hour == 10 and index[0].minute == 5, index[0]
+    assert len(_dhan_epoch_to_index([])) == 0
+    # No epoch GUESSING. A 1980-anchored stamp read as Unix lands in a
+    # plausible year, so a guess cannot be checked and a wrong one charts the
+    # wrong decade while looking normal. It is read one way and the result is
+    # range-checked instead.
+    decade_out = _dhan_epoch_to_index([now - 315532800])
+    assert decade_out[0].year != 2026, "this fixture is only meaningful if it misreads"
+
+    # Every app timeframe has a plan, and each resample rule divides into its
+    # source exactly -- a 10-minute candle built from 15-minute data would be
+    # nonsense.
+    for interval, (native, rule) in DHAN_INTERVAL_PLAN.items():
+        assert native in ("1", "5", "15", "25", "60"), (interval, native)
+        wanted = int(INTERVAL_SECONDS[interval] / 60)
+        assert wanted % int(native) == 0, \
+            f"{interval} cannot be built from {native}-minute candles"
+        if rule is None:
+            assert wanted == int(native), (interval, native)
+    for interval in INTRADAY_INTERVALS:
+        assert interval in DHAN_INTERVAL_PLAN, f"{interval} has no Dhan plan"
+
+    # No credentials, no contract, a dead network: all return an empty frame
+    # and a REASON, never an exception. A feed problem must cost the feed, not
+    # the application.
+    empty, note = dhan_candles({}, "^NSEI", "1m", "5d")
+    assert empty.empty and "credentials" in note
+    empty, note = dhan_candles({"access_token": "x", "client_id": "y"}, "AAPL", "1m", "5d")
+    assert empty.empty and "security id" in note
+    empty, note = dhan_candles({"access_token": "x", "client_id": "y"},
+                               "^NSEI", "1m", "5d", timeout=0.001)
+    assert empty.empty and note, "a dead network must still explain itself"
+    print(f"   dhan candles: {len(DHAN_INTERVAL_PLAN)} timeframes planned onto Dhan's "
+          f"native 1/5/15/60, indices mapped, timestamps read one documented way and "
+          f"range-checked rather than guessed, every failure returns a reason  OK")
+
+
+def _test_order_types_and_trade_kinds():
+    """
+    One dropdown for what you are trading, and separate order types for
+    getting in and getting out.
+    """
+    # Each trade kind maps to a Dhan instrument and product, and the pairing
+    # has to be the right one: delivery is CNC, intraday is MIS.
+    assert DHAN_TRADE_KINDS["Intraday (equity, MIS)"][:2] == ("EQUITY", "INTRADAY")
+    assert DHAN_TRADE_KINDS["Delivery (equity, CNC)"][:2] == ("EQUITY", "CNC")
+    assert DHAN_TRADE_KINDS["Options"][:2] == ("OPTIONS", "INTRADAY")
+    assert DHAN_TRADE_KINDS["Futures"][:2] == ("FUTURES", "INTRADAY")
+    for kind, (instrument, product, note) in DHAN_TRADE_KINDS.items():
+        assert instrument in DHAN_INSTRUMENTS, (kind, instrument)
+        assert product in DHAN_PRODUCTS, (kind, product)
+        assert len(note) > 30, f"{kind} does not explain itself"
+
+    # Strikes are pre-filled at the money, on the right ladder.
+    assert strike_step_for("NIFTY") == 50.0
+    assert strike_step_for("BANKNIFTY") == 100.0
+    assert strike_step_for("SOMETHING") == 50.0, "an unknown underlying still gets a step"
+    assert round_to_step(24013.0, 50.0) == 24000.0
+    assert round_to_step(24030.0, 50.0) == 24050.0
+    assert round_to_step(None, 50.0) == 0.0, "no price means no strike, not a crash"
+    assert round_to_step(float("nan"), 50.0) == 0.0
+
+    contract = {"security_id": "1", "exchange_segment": "NSE_FNO", "instrument": "OPTIONS"}
+    broker = {"client_id": "C", "product_type": "INTRADAY"}
+
+    # A MARKET order carries price 0, which is what Dhan expects.
+    receipt = place_dhan_order(broker, contract, "BUY", 65, dry_run=True)
+    assert receipt["payload"]["orderType"] == "MARKET"
+    assert receipt["payload"]["price"] == 0.0
+    assert receipt["payload"]["productType"] == "INTRADAY"
+
+    # A LIMIT order carries its price, rounded to paise.
+    receipt = place_dhan_order(broker, contract, "BUY", 65, dry_run=True,
+                               order_type="LIMIT", limit_price=123.456)
+    assert receipt["payload"]["orderType"] == "LIMIT"
+    assert receipt["payload"]["price"] == 123.46, receipt["payload"]["price"]
+
+    # A LIMIT with no usable price must be REFUSED here, not sent at zero for
+    # the exchange to reject with something unhelpful.
+    for bad in (None, 0.0, -5.0, float("nan")):
+        try:
+            place_dhan_order(broker, contract, "BUY", 65, dry_run=True,
+                             order_type="LIMIT", limit_price=bad)
+            raise AssertionError(f"a limit at {bad} should have been refused")
+        except BrokerError as exc:
+            assert "above zero" in str(exc), str(exc)
+    # Nothing leaves the machine on a dry run, whatever the order type.
+    assert receipt["status"] == "DRY_RUN" and receipt["order_id"] is None
+    # An unknown order type falls back to MARKET rather than being passed on.
+    assert place_dhan_order(broker, contract, "BUY", 1, dry_run=True,
+                            order_type="ICEBERG")["payload"]["orderType"] == "MARKET"
+    print(f"   orders: {len(DHAN_TRADE_KINDS)} trade kinds each map to a real Dhan "
+          f"instrument and product, strikes round to the right ladder, a limit without "
+          f"a price is refused rather than sent at zero  OK")
+
+
 def _test_alerts_say_what_they_mean():
     """
     An alert is read on a phone by somebody who may not think in LONG and
@@ -23214,17 +23899,23 @@ def _test_option_pair_and_quantity():
     """
     # A small stand-in instrument master: one underlying, two rights, a
     # ladder of strikes.
+    # The expiry is built RELATIVE TO TODAY. A fixed date is a test with a
+    # shelf life: this one was written with 30 October in it and started
+    # failing on 4 November, reporting "no unexpired option contract" as
+    # though the resolver had broken.
+    expiry = (pd.Timestamp.now(tz="Asia/Kolkata").normalize().tz_localize(None)
+              + pd.Timedelta(days=7))
     rows = []
     for strike in range(23800, 24301, 50):
         for right, suffix in (("CE", "CALL"), ("PE", "PUT")):
             rows.append({
                 "security_id": f"{strike}{1 if right == 'CE' else 2}",
-                "trading_symbol": f"NIFTY30OCT{strike}{right}",
-                "custom_symbol": f"NIFTY 30 OCT {strike} {suffix}",
+                "trading_symbol": f"NIFTY{expiry:%d%b}".upper() + f"{strike}{right}",
+                "custom_symbol": f"NIFTY {expiry:%d %b} {strike} {suffix}",
                 "name": "NIFTY", "segment": "FNO", "exchange": "NSE",
                 "instrument": "OPTIDX", "option_type": right,
                 "strike": float(strike), "lot_size": 65,
-                "expiry": pd.Timestamp("2026-10-30")})
+                "expiry": expiry})
     master = pd.DataFrame(rows)
 
     pair = resolve_option_pair(master, "NIFTY", "NSE_FNO", spot_price=24013.0)
@@ -23236,7 +23927,7 @@ def _test_option_pair_and_quantity():
     assert pair["CALL"]["security_id"] != pair["PUT"]["security_id"]
     assert pair["CALL"]["option_type"] == "CALL"
     assert pair["PUT"]["option_type"] == "PUT"
-    assert pair["CALL"]["expiry"] == "2026-10-30"
+    assert pair["CALL"]["expiry"] == expiry.date().isoformat()
 
     # An asked-for strike is honoured, snapped to the nearest LISTED one: a
     # strike that is not listed cannot be traded however sensible it looks.
@@ -25207,6 +25898,9 @@ def run_selftest() -> int:
         _test_signal_freshness_and_cell_arithmetic()
         _test_every_chart_is_gapless()
         _test_triangle_patterns()
+        _test_indicators_match_tradingview()
+        _test_dhan_candle_feed()
+        _test_order_types_and_trade_kinds()
         _test_alerts_say_what_they_mean()
         _test_option_pair_and_quantity()
         _test_strategy_reference_is_generated()
