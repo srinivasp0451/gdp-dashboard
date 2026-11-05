@@ -319,7 +319,7 @@ INTERVAL_SECONDS = {"1m": 60, "2m": 120, "3m": 180, "5m": 300, "10m": 600, "15m"
                     "1wk": 604800, "1mo": 2592000}
 
 DEFAULT_PARAMS: dict[str, float] = {
-    "ema_fast": 9, "ema_slow": 21, "ema_mid": 50, "ema_macro": 200,
+    "ema_fast": 9, "ema_slow": 15, "ema_mid": 50, "ema_macro": 200,
     "rsi_len": 14, "atr_len": 14, "atr_mult": 2.0, "channel_mult": 2.0,
     "vol_len": 20, "vol_mult": 1.5, "breakout_len": 20, "squeeze_mult": 1.2,
     "orb_bars": 3, "gap_pct": 0.30, "pullback_tol": 0.15,
@@ -4068,23 +4068,45 @@ class ExitManager:
         d = self.d
         if d > 0:
             if self.sl is not None and ctx.open <= self.sl:
-                return ctx.open, "Stop-Loss (Gap)"
+                return ctx.open, self.stop_reason(gap=True)
             if self.target_is_live and ctx.open >= self.tp:
                 return ctx.open, "Target (Gap)"
             if self.sl is not None and ctx.low <= self.sl:
-                return self.sl, "Stop-Loss"
+                return self.sl, self.stop_reason()
             if self.target_is_live and ctx.high >= self.tp:
                 return self.tp, "Target"
         else:
             if self.sl is not None and ctx.open >= self.sl:
-                return ctx.open, "Stop-Loss (Gap)"
+                return ctx.open, self.stop_reason(gap=True)
             if self.target_is_live and ctx.open <= self.tp:
                 return ctx.open, "Target (Gap)"
             if self.sl is not None and ctx.high >= self.sl:
-                return self.sl, "Stop-Loss"
+                return self.sl, self.stop_reason()
             if self.target_is_live and ctx.low <= self.tp:
                 return self.tp, "Target"
         return None
+
+    @property
+    def stop_has_trailed(self) -> bool:
+        """Has the stop moved away from where it was placed at entry?"""
+        if self.initial_sl is None or self.sl is None:
+            return False
+        return abs(float(self.sl) - float(self.initial_sl)) > 1e-9
+
+    def stop_reason(self, gap: bool = False) -> str:
+        """
+        Name the stop that actually fired.
+
+        THE CONFUSION THIS REMOVES. A trailing stop exits at the TRAILED level,
+        not at the number printed beside the entry, so the log read "ENTRY
+        SHORT @ 24,398.95 | SL 24,413.95" and then "Stop-Loss: closed at
+        24,410.15" -- a price the original stop never reached. The exit was
+        right and the label was wrong. A trailed stop now says so, and the
+        ledger groups the two kinds apart, because "my initial stop was hit"
+        and "I gave back open profit" are different things to fix.
+        """
+        base = "Trailing Stop" if self.stop_has_trailed else "Stop-Loss"
+        return f"{base} (Gap)" if gap else base
 
     def check_tick(self, ltp: float):
         """
@@ -4099,12 +4121,12 @@ class ExitManager:
             return None
         if self.d > 0:
             if self.sl is not None and p <= self.sl:
-                return p, "Stop-Loss"
+                return p, self.stop_reason()
             if self.target_is_live and p >= self.tp:
                 return p, "Target"
         else:
             if self.sl is not None and p >= self.sl:
-                return p, "Stop-Loss"
+                return p, self.stop_reason()
             if self.target_is_live and p <= self.tp:
                 return p, "Target"
         return None
@@ -5753,8 +5775,16 @@ def square_off(reason: str = "Manual Square-Off", price: float | None = None) ->
              "pnl": trade["PnL"], "time": pd.Timestamp.now(),
              "contract": (cfg.get("broker") or {}).get("contract")}):
         log_event(problem, "error")
+    # A trailed stop fires at a level that is nowhere in the entry line, so the
+    # exit line has to carry it or the log looks self-contradictory.
+    detail = ""
+    if str(reason).startswith("Trailing Stop") \
+            and trade.get("Initial Stop") is not None and trade.get("Final Stop") is not None:
+        detail = (f" The stop trailed from {fmt(trade['Initial Stop'])} to "
+                  f"{fmt(trade['Final Stop'])}; that trailed level is what fired, not the "
+                  f"one set at entry.")
     log_event(f"{reason}: {trade['Direction']} closed at {fmt(trade['Exit Price'])} "
-              f"for {fmt_signed(trade['PnL'])} ({fmt_signed(trade['Points'])} pts).",
+              f"for {fmt_signed(trade['PnL'])} ({fmt_signed(trade['Points'])} pts).{detail}",
               "warn" if trade["PnL"] < 0 else "success")
     return trade
 
@@ -5913,8 +5943,13 @@ def _open_live_position(cfg: dict, direction: int, price: float, ctx: BarCtx, ba
              "time": pd.Timestamp.now(),
              "contract": (cfg.get("broker") or {}).get("contract")}):
         log_event(problem, "error")
+    # Naming the stop TYPE here is what stops the next line being misread: with
+    # a trailing stop the number below is only where the stop STARTS.
+    sl_kind = str(cfg["risk"].sl_type)
+    sl_note = f"{fmt(mgr.sl)} ({sl_kind}" + (", moves with price)"
+                                             if sl_kind in TRAILING_SL_TYPES else ")")
     log_event(f"ENTRY {'LONG' if direction > 0 else 'SHORT'} @ {fmt(price)} on signal from "
-              f"{cfg['strategy']} (candle {fmt_time(bar_time)}) | SL {fmt(mgr.sl)} | "
+              f"{cfg['strategy']} (candle {fmt_time(bar_time)}) | SL {sl_note} | "
               f"TGT {fmt(mgr.tp)} | qty {fmt(cfg['risk'].quantity, 0)}", "success")
     for note in mgr.notes:
         log_event("Exit engine: " + note, "warn")
@@ -6504,7 +6539,8 @@ def render_sidebar() -> dict:
 
     # ------------------------------------------------------------ risk ------
     sb.subheader("Stop-Loss")
-    sl_type = sb.selectbox("Stop-Loss type", SL_TYPES, disabled=live, key="cfg_sl_type")
+    sl_type = sb.selectbox("Stop-Loss type", SL_TYPES, disabled=live, key="cfg_sl_type",
+                           index=SL_TYPES.index("Fixed Points"))
     sl_value, step_trigger = 0.0, 0.0
     if sl_type not in _SL_NO_VALUE:
         default = {"Fixed Percentage": 1.0, "Trailing Percentage": 1.0,
@@ -6525,7 +6561,8 @@ def render_sidebar() -> dict:
                    "the intrabar path.")
 
     sb.subheader("Target")
-    tp_type = sb.selectbox("Target type", TP_TYPES, disabled=live, key="cfg_tp_type")
+    tp_type = sb.selectbox("Target type", TP_TYPES, disabled=live, key="cfg_tp_type",
+                           index=TP_TYPES.index("Fixed Points"))
     tp_value = 0.0
     if tp_type not in _TP_NO_VALUE:
         default = {"Fixed Percentage": 2.0, "ATR Multiple": 3.0,
@@ -11432,11 +11469,10 @@ def tab_optimiser(cfg: dict) -> None:
             help="The average percentile across every ticked measure."), "Score"
     else:
         target, target_column = objective_target_input(c2, "opt", objective)
-    min_trades = c3.number_input("Minimum trades", 5, 1000, 30, 5, key="opt_min",
-                                 help="Combinations with fewer trades are discarded: below "
-                                      "roughly 30 the statistics are noise.")
-    iterations = c4.number_input("Combinations to test", 20, 10_000_000, 150, 10,
-                                 key="opt_iters", help="A combination is one backtest. There is no ceiling here any more — but the limit that actually bites is the clock, not the box: the scan runs in timed slices and simply takes more of them. And every extra combination makes the WINNER less trustworthy, because the best of many is partly the luckiest of many. That is what the robust search below is for.")
+    min_trades = c3.number_input("Minimum trades", min_value=0, max_value=None, value=30,
+                                 step=5, key="opt_min", help="No ceiling: pass whatever number you want. Combinations with fewer trades than this are discarded. Below roughly 30 the statistics are mostly noise, so a low number here buys results that will not repeat -- that is a judgement, not a limit, and the choice is yours.")
+    iterations = c4.number_input("Combinations to test", min_value=1, max_value=None,
+                                 value=150, step=10, key="opt_iters", help="A combination is one backtest. No ceiling: pass whatever number you want. What actually bites is the clock, not the box -- the scan runs in timed slices and simply takes more of them. Every extra combination also makes the WINNER less trustworthy, because the best of many is partly the luckiest of many. That is what the robust search below is for.")
 
     safe_only = st.checkbox("Only search backtest-safe exits", value=True, key="opt_safe",
                             help="Excludes distance-based trailing stops, whose backtested "
@@ -12203,9 +12239,10 @@ def tab_signal_lab(cfg: dict) -> None:
     max_names = d1.number_input(f"Max tickers (of {len(tickers)} in {universe})",
                                 1, max(1, len(tickers)), max(1, len(tickers)),
                                 key=f"lab_max_{universe}")
-    iterations = d2.number_input("Combinations per ticker", 10, 10_000_000, 60, 10,
-                                 key="lab_iters", help="A combination is one backtest. There is no ceiling here any more — but the limit that actually bites is the clock, not the box: the scan runs in timed slices and simply takes more of them. And every extra combination makes the WINNER less trustworthy, because the best of many is partly the luckiest of many. That is what the robust search below is for.")
-    min_trades = d3.number_input("Minimum trades to qualify", 1, 200, 10, key="lab_min")
+    iterations = d2.number_input("Combinations per ticker", min_value=1, max_value=None,
+                                 value=60, step=10, key="lab_iters", help="A combination is one backtest. No ceiling: pass whatever number you want. What actually bites is the clock, not the box -- the scan runs in timed slices and simply takes more of them. Every extra combination also makes the WINNER less trustworthy, because the best of many is partly the luckiest of many. That is what the robust search below is for.")
+    min_trades = d3.number_input("Minimum trades to qualify", min_value=0, max_value=None,
+                                 value=10, step=1, key="lab_min", help="No ceiling: pass whatever number you want. Combinations with fewer trades than this are discarded. Below roughly 30 the statistics are mostly noise, so a low number here buys results that will not repeat -- that is a judgement, not a limit, and the choice is yours.")
     e1, e2 = st.columns(2)
     use_gates = e1.checkbox(
         "Apply quality thresholds", value=False, key="lab_use_gates",
@@ -12735,10 +12772,11 @@ def tab_auto_screener(cfg: dict) -> None:
     d1, d2, d3 = st.columns(3)
     timeframes = d1.multiselect("Timeframes", INTERVALS, default=["15m", "60m", "1d"],
                                 key="auto_tfs")
-    iterations = d2.number_input("Combinations per ticker/timeframe", 10, 10_000_000, 80, 10,
-                                 help="A combination is one backtest. There is no ceiling here any more — but the limit that actually bites is the clock, not the box: the scan runs in timed slices and simply takes more of them. And every extra combination makes the WINNER less trustworthy, because the best of many is partly the luckiest of many. That is what the robust search below is for.",
-                                 key="auto_iters")
-    min_trades = d3.number_input("Minimum trades to qualify", 1, 200, 10, key="auto_min")
+    iterations = d2.number_input("Combinations per ticker/timeframe", min_value=1,
+                                 max_value=None, value=80, step=10, key="auto_iters",
+                                 help="A combination is one backtest. No ceiling: pass whatever number you want. What actually bites is the clock, not the box -- the scan runs in timed slices and simply takes more of them. Every extra combination also makes the WINNER less trustworthy, because the best of many is partly the luckiest of many. That is what the robust search below is for.")
+    min_trades = d3.number_input("Minimum trades to qualify", min_value=0, max_value=None,
+                                 value=10, step=1, key="auto_min", help="No ceiling: pass whatever number you want. Combinations with fewer trades than this are discarded. Below roughly 30 the statistics are mostly noise, so a low number here buys results that will not repeat -- that is a judgement, not a limit, and the choice is yours.")
     safe_only = st.checkbox("Backtest-safe exits only", value=True, key="auto_safe")
 
     auto_over = render_scan_overrides("auto", cfg)
@@ -21013,7 +21051,12 @@ def _test_step_trail():
     assert m.sl == 51.0, f"at 61 the stop must be 51, got {m.sl}"
     m.update(58.0, _ctx(close=58.0))
     assert m.sl == 51.0, f"the stop must never loosen, got {m.sl}"
-    assert m.check_tick(51.0) == (51.0, "Stop-Loss")
+    # The stop has moved from 40 to 51, so it is NOT the stop set at entry and
+    # must not be reported as one -- that mislabelling is what made correct
+    # trailing exits look like the engine was firing at the wrong price.
+    assert m.check_tick(51.0) == (51.0, "Trailing Stop"), \
+        "a stop that has trailed away from its entry level must be reported as a " \
+        "trailing stop, not as the original stop-loss"
     # Mirrored short
     ms = ExitManager(risk, 50.0, -1, _ctx(close=50.0, atr=2.0, prev_high=55.0, swing_high=60.0))
     assert ms.sl == 60.0
@@ -21042,8 +21085,14 @@ def _test_trail_uses_live_price():
     assert m.sl == 20060.0, f"trail must follow the live price, got {m.sl}"
     m.update(20050.0, stale)
     assert m.sl == 20060.0, "the trail must not loosen when price pulls back"
-    assert m.check_tick(20050.0) == (20050.0, "Stop-Loss"), \
-        "a stop already passed by price must fire, not be suppressed"
+    assert m.check_tick(20050.0) == (20050.0, "Trailing Stop"), \
+        "a stop already passed by price must fire, not be suppressed, and a trailed " \
+        "stop must say that is what it is"
+    # An UNtrailed stop keeps the plain name, so the two stay distinguishable.
+    fresh = ExitManager(RiskConfig("Fixed Points", 40.0, "No Target", 0.0, 1.0), 20000.0, 1,
+                        _ctx(close=20000.0, atr=10.0))
+    assert fresh.check_tick(19960.0) == (19960.0, "Stop-Loss"), \
+        "a stop that never moved is the stop set at entry and keeps that name"
     print("   distance trails follow the live price, not the last closed candle  OK")
 
 
@@ -22817,6 +22866,112 @@ def _test_live_entry_is_not_poll_dependent():
         assert poll(cross + 2) is None, "the same signal bar must not re-enter"
         print("   live entry: newest bar, mid-burst, forming-then-closed, stale refused, "
               "no double entry  OK")
+    finally:
+        globals()["st"] = real_st
+        globals().update(saved)
+
+
+def _test_trailing_exit_is_labelled_and_counted():
+    """
+    A trailing stop exits at the TRAILED level, says so, and counts as a win
+    when it is one.
+
+    THE REPORT THIS EXISTS FOR, with the operator's own numbers. The feed read
+    "ENTRY SHORT @ 24,398.95 ... SL 24,413.95" and then "Stop-Loss: SHORT
+    closed at 24,410.15 for -11.20" -- an exit at a price the stated stop never
+    reached, so the engine looked like it was firing at the wrong level. It was
+    not. With a 15-point trail, price fell to 24,395.15, the stop ratcheted
+    down to 24,410.15, price came back and hit it. Every number was right and
+    the LABEL was wrong, which is indistinguishable from broken.
+
+    Three things are asserted, because all three were doubted:
+      1. that exact sequence reproduces, to the paisa;
+      2. a trailed stop is named "Trailing Stop", an untouched one "Stop-Loss",
+         so the ledger's breakdown separates "my stop was hit" from "I gave
+         back open profit";
+      3. a trailing exit taken in PROFIT is journalled as a winner -- the
+         ledger reporting 0 winners is only ever allowed to mean there were
+         none.
+    """
+    real_st = globals()["st"]
+    fake = _FakeStreamlit()
+    globals()["st"] = fake
+    saved = {k: globals()[k] for k in
+             ("db_save_position", "db_clear_position", "db_append_trade",
+              "_maybe_route_broker", "send_email")}
+    try:
+        for stub in saved:
+            globals()[stub] = lambda *a, **k: None
+        for k, v in _STATE_DEFAULTS.items():
+            fake.session_state[k] = (list(v) if isinstance(v, list)
+                                     else dict(v) if isinstance(v, dict) else v)
+
+        n = 60
+        flat = np.full(n, 24398.95)
+        idx = pd.date_range(end=pd.Timestamp.now(tz=DISPLAY_TZ), periods=n, freq="1min",
+                            tz=DISPLAY_TZ)
+        df = pd.DataFrame({"Open": flat, "High": flat + 5, "Low": flat - 5,
+                           "Close": flat, "Volume": 1e5}, index=idx)
+        frame, _ = prepare(df, "01 · Dual EMA Crossover",
+                           dict(DEFAULT_PARAMS, ema_fast=9, ema_slow=15), None, {})
+        ctx = bar_ctx(frame, len(frame) - 1)
+
+        # ---- 1. the operator's SHORT, reproduced ----
+        risk = RiskConfig("Trailing Points", 15.0, "Fixed Points", 40.0, 1.0, costs=CostModel())
+        mgr = ExitManager(risk, 24398.95, -1, ctx)
+        assert abs(mgr.sl - 24413.95) < 1e-6, \
+            f"a 15-point trail on a short starts 15 above entry, got {mgr.sl}"
+        hit = None
+        for px in (24398.0, 24397.0, 24396.0, 24395.15, 24400.0, 24405.0, 24409.0, 24410.15):
+            hit = mgr.check_tick(px)
+            if hit:
+                break
+            mgr.update(px, ctx)
+        assert hit is not None, "the trailed stop must fire when price comes back to it"
+        price, reason = hit
+        assert abs(price - 24410.15) < 1e-6, \
+            f"the trail should have ratcheted to 24,410.15, fired at {price}"
+        assert reason == "Trailing Stop", \
+            (f"a stop that trailed from 24,413.95 to {mgr.sl:.2f} must not be reported as "
+             f"'Stop-Loss' -- that is the label that made a correct exit look wrong; "
+             f"got {reason!r}")
+        assert abs((price - 24398.95) * -1 + 11.20) < 1e-6, \
+            "the operator's -11.20 must reproduce exactly"
+
+        # ---- 2. an untouched stop keeps the plain name ----
+        plain = ExitManager(RiskConfig("Fixed Points", 15.0, "Fixed Points", 40.0, 1.0),
+                            24398.95, -1, ctx)
+        assert plain.check_tick(24413.95)[1] == "Stop-Loss", \
+            "a stop that never moved is the one set at entry and keeps that name"
+
+        # ---- 3. a PROFITABLE trailing exit is journalled as a win ----
+        cfg = {"symbol": "^NSEI", "interval": "1m", "strategy": "01 · Dual EMA Crossover",
+               "params": dict(DEFAULT_PARAMS, ema_fast=9, ema_slow=15), "risk": risk,
+               "quantity": 1.0, "currency": "\u20b9", "costs": CostModel(),
+               "broker": {}, "poll_seconds": 5, "candle_seconds": 15.0,
+               "filter_cfg": {}, "filter_extras": {}, "alerts": {}, "email": {},
+               "whatsapp": {}}
+        fake.session_state["live_config"] = cfg
+        pos = _open_live_position(cfg, 1, 24410.05, ctx, frame.index[-2], bars_ago=0)
+        # price runs up, dragging the trail above entry, then falls back onto it
+        for px in (24420.0, 24430.0, 24435.75):
+            pos.manager.update(px, ctx)
+        assert pos.manager.sl > pos.entry_price, \
+            "after a 25-point run a 15-point trail must sit above a long's entry"
+        out = pos.manager.check_tick(float(pos.manager.sl))
+        assert out and out[1] == "Trailing Stop"
+        trade = square_off(out[1], out[0])
+        assert trade is not None and trade["PnL"] > 0, \
+            f"a trailing stop that fires above entry is a WINNING trade, got {trade['PnL']}"
+        assert trade["Exit Reason"] == "Trailing Stop"
+
+        ledger = live_ledger_frame()
+        wins = ledger["PnL"][ledger["PnL"] > 0]
+        assert len(wins) == 1, \
+            (f"the ledger counted {len(wins)} winners from one profitable trailing exit. "
+             f"'0 winners' must only ever mean there were none.")
+        print("   trailing exits: operator's -11.20 reproduced to the paisa, trailed stop "
+              "named apart from the entry stop, profitable trail counted as a win  OK")
     finally:
         globals()["st"] = real_st
         globals().update(saved)
@@ -26784,6 +26939,7 @@ def run_selftest() -> int:
         _test_live_entry_and_gates()
         _test_every_crossover_enters_on_the_next_candle()
         _test_live_dashboard_layout()
+        _test_trailing_exit_is_labelled_and_counted()
         _test_universe_resolution()
         _test_timeframe_period_scaling()
         _test_search_grid_and_quality()
