@@ -207,9 +207,41 @@ class RateLimiter:
         return _Ctx()
 
 
+LIMITER_VERSION = 3  # bump whenever RateLimiter changes → a running server never reuses a stale cached instance
+
+
 @st.cache_resource
-def _limiters() -> Dict[str, RateLimiter]:
+def _limiter_store(version: int) -> Dict[str, RateLimiter]:
     return {"yf": RateLimiter(YF_DELAY), "dhan": RateLimiter(DHAN_DELAY), "dhan_oc": RateLimiter(3.05)}
+
+
+def _limiters() -> Dict[str, RateLimiter]:
+    return _limiter_store(LIMITER_VERSION)
+
+
+class _HoldLock:
+    """Serialise a whole request on a limiter (works even with an older cached RateLimiter instance)."""
+
+    def __init__(self, lim):
+        self.lim = lim
+
+    def __enter__(self):
+        lk = getattr(self.lim, "_lock", None)
+        if lk is None:
+            self.lim.wait()
+            return self
+        lk.acquire()
+        gap = time.monotonic() - getattr(self.lim, "_last", 0.0)
+        if gap < self.lim.min_gap:
+            time.sleep(self.lim.min_gap - gap)
+        return self
+
+    def __exit__(self, *exc):
+        lk = getattr(self.lim, "_lock", None)
+        if lk is not None:
+            self.lim._last = time.monotonic()
+            lk.release()
+        return False
 
 
 # =============================================================================
@@ -312,7 +344,7 @@ def yf_history(symbol: str, interval: str, start: datetime = None, end: datetime
     last_err = None
     for attempt in range(retries):
         try:
-            with lim.hold():  # one yfinance request at a time process-wide, ≥0.3 s apart (multi-user safe)
+            with _HoldLock(lim):  # one yfinance request at a time process-wide, ≥0.3 s apart (multi-user safe)
                 tk = yf.Ticker(symbol)
                 if period:
                     raw = tk.history(period=period, interval=interval, auto_adjust=False, prepost=False, actions=False)
@@ -323,7 +355,8 @@ def yf_history(symbol: str, interval: str, start: datetime = None, end: datetime
             last_err = RuntimeError("empty response")
         except Exception as e:  # rate limit / network – back off, never crash
             last_err = e
-        time.sleep(0.6 * (attempt + 1))
+        if attempt < retries - 1:
+            time.sleep(0.6 * (attempt + 1))
     raise RuntimeError(f"yfinance fetch failed for {symbol} {interval}: {last_err}")
 
 
@@ -336,7 +369,7 @@ def fetch_yf(symbol: str, tf: str, period: str, kind: str, live_tail: bool = Fal
     base = YF_INTERVAL[tf]
     if live_tail:
         tail_period = {"1m": "1d", "5m": "5d", "15m": "5d", "1h": "1mo", "1d": "3mo", "1wk": "1y", "1mo": "2y"}[base]
-        df = yf_history(symbol, base, period=tail_period)
+        df = yf_history(symbol, base, period=tail_period, retries=1)  # live: fail fast, next tick retries
     else:
         s, e = warmup_fetch_window(tf, period)
         df = yf_history(symbol, base, start=s, end=e)
@@ -2686,6 +2719,9 @@ div[data-testid="stMetricValue"], div[data-testid="stMetricValue"] *{font-size:1
 .qe-kv{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:6px 14px;font-size:.86rem}
 .qe-kv b{color:#9fb0c8;font-weight:500}
 .qe-kv div{color:#e6edf7}
+/* live fragment refreshes in place: never fade/flicker elements while a refresh is running */
+[data-testid="stStatusWidget"]{visibility:hidden}  /* hide the top-right "Running…" spinner on every fragment tick */
+[data-stale="true"], .stale-element, .element-container.stale-element{opacity:1 !important;transition:none !important;filter:none !important}
 </style>
 """
 
