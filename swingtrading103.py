@@ -187,6 +187,25 @@ class RateLimiter:
                 time.sleep(self.min_gap - gap)
             self._last = time.monotonic()
 
+    def hold(self):
+        """Context manager: hold the lock for the WHOLE request (serialises it across all users/threads) and
+        guarantee ≥ min_gap seconds between the end of one request and the start of the next."""
+        lim = self
+
+        class _Ctx:
+            def __enter__(self_inner):
+                lim._lock.acquire()
+                gap = time.monotonic() - lim._last
+                if gap < lim.min_gap:
+                    time.sleep(lim.min_gap - gap)
+
+            def __exit__(self_inner, *exc):
+                lim._last = time.monotonic()
+                lim._lock.release()
+                return False
+
+        return _Ctx()
+
 
 @st.cache_resource
 def _limiters() -> Dict[str, RateLimiter]:
@@ -292,13 +311,13 @@ def yf_history(symbol: str, interval: str, start: datetime = None, end: datetime
     lim = _limiters()["yf"]
     last_err = None
     for attempt in range(retries):
-        lim.wait()  # 0.3 s mandatory gap between every request
         try:
-            tk = yf.Ticker(symbol)
-            if period:
-                raw = tk.history(period=period, interval=interval, auto_adjust=False, prepost=False, actions=False)
-            else:
-                raw = tk.history(start=start, end=end, interval=interval, auto_adjust=False, prepost=False, actions=False)
+            with lim.hold():  # one yfinance request at a time process-wide, ≥0.3 s apart (multi-user safe)
+                tk = yf.Ticker(symbol)
+                if period:
+                    raw = tk.history(period=period, interval=interval, auto_adjust=False, prepost=False, actions=False)
+                else:
+                    raw = tk.history(start=start, end=end, interval=interval, auto_adjust=False, prepost=False, actions=False)
             if raw is not None and not raw.empty:
                 return _normalize_ohlc(raw)
             last_err = RuntimeError("empty response")
@@ -2510,9 +2529,22 @@ def _render_tpl(tpl: str, ctx: dict) -> str:
         return tpl + "\n" + "\n".join(f"{k}: {v}" for k, v in ctx.items())
 
 
+def _session_errors() -> List[str]:
+    """Per-user (per browser session) error list — never shared between users."""
+    try:
+        return st.session_state.setdefault("_notify_errors", [])
+    except Exception:
+        return []
+
+
 def notify(cfg: dict, event: str, ctx: dict):
     ctx = dict(ctx, event=event, time=now_ist().strftime("%Y-%m-%d %H:%M:%S"))
     nc = cfg["notify"]
+    errs = _session_errors()  # captured here (script thread); worker threads append to THIS user's list only
+
+    def _log_global(msg: str):
+        errs.append(f"{now_ist():%H:%M:%S} {msg}")
+        del errs[:-50]
 
     def _email():
         try:
@@ -2544,14 +2576,6 @@ def notify(cfg: dict, event: str, ctx: dict):
         threading.Thread(target=_email, daemon=True).start()
     if nc.get("wa_on") and nc.get("wa_to"):
         threading.Thread(target=_wa, daemon=True).start()
-
-
-_GLOBAL_ERRORS: List[str] = []
-
-
-def _log_global(msg: str):
-    _GLOBAL_ERRORS.append(f"{now_ist():%H:%M:%S} {msg}")
-    del _GLOBAL_ERRORS[:-50]
 
 
 # =============================================================================
@@ -2912,7 +2936,14 @@ def _strike_widgets(sb, symbol: str, meta: dict, stock: bool) -> dict:
 def sidebar_config() -> dict:
     sb = st.sidebar
     sb.markdown(f"## ⚡ {APP_NAME}")
-    user = w_txt(sb, "👤 Trader ID (multi-user workspace)", "trader_id", "default").strip() or "default"
+    if "_guest_id" not in st.session_state:
+        st.session_state["_guest_id"] = f"guest-{uuid.uuid4().hex[:6]}"
+    user = w_txt(sb, "👤 Trader ID (your private workspace)", "trader_id", st.session_state["_guest_id"],
+                 help="Each Trader ID has its own live-trade history. A unique guest ID is created per browser session; "
+                      "type your own ID (e.g. your name) to keep the same history across sessions/devices. "
+                      "Users who type the SAME ID share one history.").strip() or st.session_state["_guest_id"]
+    if user.startswith("guest-"):
+        sb.caption("ℹ️ Guest workspace — set your own Trader ID to keep trade history across sessions.")
     use_dhan_data = w_cb(sb, "Use Dhan as data source (default: yfinance)", "use_dhan_data", False)
     cfg: Dict[str, Any] = {"user": user}
 
@@ -3242,19 +3273,23 @@ def aux_for(cfg: dict) -> dict:
     return aux
 
 
-_RESOLVE_CACHE: Dict[tuple, dict] = {}
+_RESOLVE_CACHE: Dict[tuple, dict] = {}   # public scrip-master lookups only (no user data) → safe to share
+_RESOLVE_LOCK = threading.Lock()
 
 
 def cached_resolve(und: str, exch: str, kind: str, opt_type: str, stock: bool, strike: Optional[float], day: str) -> dict:
     """Successful resolutions are cached per day; failures are retried on the next rerun."""
     key = (und, exch, kind, opt_type, stock, strike, day)
-    if key in _RESOLVE_CACHE:
-        return _RESOLVE_CACHE[key]
+    with _RESOLVE_LOCK:
+        hit = _RESOLVE_CACHE.get(key)
+    if hit is not None:
+        return dict(hit)  # copy → one user's changes can never leak into another's
     r = resolve_derivative(und, exch, kind, float(strike or 0), opt_type, 0, stock=stock, strike_value=strike)
     if r.get("security_id"):
-        if len(_RESOLVE_CACHE) > 2000:
-            _RESOLVE_CACHE.clear()
-        _RESOLVE_CACHE[key] = r
+        with _RESOLVE_LOCK:
+            if len(_RESOLVE_CACHE) > 2000:
+                _RESOLVE_CACHE.clear()
+            _RESOLVE_CACHE[key] = dict(r)
     return r
 
 
@@ -3943,7 +3978,7 @@ def _render_live(cfg: dict, L: dict):
     with st.expander("📜 Event log", expanded=False):
         if L["log"]:
             st.dataframe(pd.DataFrame(L["log"]), hide_index=True, **WIDE, height=240)
-        for e in _GLOBAL_ERRORS[-5:]:
+        for e in _session_errors()[-5:]:
             st.caption(e)
 
 
@@ -4100,7 +4135,7 @@ def sidebar_keys_for_symbol(sym: str) -> dict:
     return {"tsel": "Custom Ticker", "custom_sym": sym}
 
 
-_NON_SIDEBAR = {"live", "bt", "history", "resolved", "scr", "rates_ed", "_tick"}
+_NON_SIDEBAR = {"live", "bt", "history", "resolved", "scr", "rates_ed", "_tick", "trader_id"}
 
 
 def sidebar_snapshot() -> dict:
