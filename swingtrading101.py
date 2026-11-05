@@ -5191,6 +5191,9 @@ _STATE_DEFAULTS = {
     "last_seen_ltp": None, "last_ltp_change_ts": 0.0, "pending_ticker": None,
     "last_closed_bar": None, "option_metrics": None, "live_last_signal_time": None,
     "live_first_cycle": False, "last_good_quote": None, "suspect_ticks": 0,
+    # The newest closed candle the entry engine has already evaluated. Every
+    # closed bar after it is still to be looked at, however late the poll.
+    "live_cursor_time": None, "live_started_at": None,
     "order_book": None, "live_panel_errors": 0,
     "optimizer_results": None, "pattern_results": None, "pending_combo": None,
     "pattern_rows": None, "pattern_frames": None, "pattern_hits": None,
@@ -5296,6 +5299,8 @@ def reset_live_runtime() -> None:
     st.session_state.live_position = None
     st.session_state.live_last_bar = None
     st.session_state.live_last_signal_time = None
+    st.session_state.live_cursor_time = None
+    st.session_state.live_started_at = None
     st.session_state.live_snapshot = None
     st.session_state.live_error = None
     st.session_state.live_poll_count = 0
@@ -6110,6 +6115,15 @@ def run_cycle(cfg: dict) -> None:
                             f"through them.",
                             when=sig_time, ago=snapshot.recent_signal_bars_ago,
                             direction=fresh_sig)
+            # One position at a time, so these bars are decided: move the cursor
+            # past them. Without this, squaring off would replay every signal
+            # that fired during the trade. The reverse branch above deliberately
+            # does NOT come through here -- its signal still has to be taken.
+            try:
+                st.session_state.live_cursor_time = \
+                    snapshot.frame.index[len(snapshot.frame) + snapshot.closed_index]
+            except (IndexError, TypeError):
+                pass
             st.session_state.live_last_bar = snapshot.last_closed_time
             return
 
@@ -6131,145 +6145,136 @@ def run_cycle(cfg: dict) -> None:
                         f"of {fmt(risk.daily_loss_limit)}. No further entries today.")
             return
 
-    # -- the one source of truth for "something fired that we have not acted on"
+    # -- the cursor: every closed candle is evaluated exactly once
     #
-    # Earlier versions asked "does the NEWEST CLOSED candle carry a signal?" and
-    # that question is unanswerable in practice. A signal is only visible on the
-    # single poll where its bar happens to be the newest closed one, and that
-    # poll is missed constantly: a delayed feed delivers ten candles in one
-    # burst so the trigger lands in the middle of the batch, the browser tab
-    # sleeps, a rerun lands mid-candle, the liveness gate holds the cycle for
-    # its first few ticks. Every one of those drops the trade silently, which is
-    # exactly the reported failure -- two clean 9/21 crossovers on Nifty, no
-    # entry, no explanation.
+    # WHY THIS IS A CURSOR AND NOT AN AGE TEST.
     #
-    # So the engine now asks the durable question instead: what is the newest
-    # closed candle carrying a signal anywhere in the frame, and have we already
-    # made a decision about it? That is independent of which poll saw the bar
-    # close, which makes batch arrival, missed polls and held cycles harmless.
-    pending_dir = int(snapshot.recent_signal)
-    pending_time = snapshot.recent_signal_time
-    pending_ago = snapshot.recent_signal_bars_ago
-    decided = st.session_state.get("live_last_signal_time")
-    st.session_state.live_last_bar = snapshot.last_closed_time
-
-    if strat.immediate:
-        cfg["_ltp_at_fill"] = snapshot.ltp
-        _open_live_position(cfg, 1 if "Buy" in strat.name else -1, snapshot.ltp, closed_ctx,
-                            snapshot.last_closed_time, bars_ago=0,
-                            route="immediate profile, no candle wait")
-        st.session_state.live_first_cycle = False
+    # The rule is simple and absolute: a signal on candle N is entered at the
+    # open of candle N+1. Earlier versions tried to honour it by asking "what
+    # is the newest signal in the frame, and how many candles ago was it?",
+    # then refusing anything older than a small window. That question is about
+    # NOW, not about the candle, so the answer depended entirely on whether a
+    # poll happened to land in the couple of candles after the cross. Measured
+    # by replaying this very function over a 9/15 series with seven crossovers:
+    # 7 entries of 7 when every candle was polled, 3 of 7 at one poll per five
+    # candles, 2 of 7 at one per eight. And because a signal refused for age
+    # was marked decided, it never came back. A browser tab that sleeps, a feed
+    # that delivers a burst, a rerun that lands mid-candle -- each one threw a
+    # trade away in silence. That is the reported failure exactly: clean
+    # crossovers on the chart, not one entry in the ledger.
+    #
+    # A cursor removes the dependence on polling cadence completely. The engine
+    # remembers the last closed candle it has already looked at, and each cycle
+    # evaluates every closed candle that has appeared since, in order. A bar is
+    # considered exactly once -- whether the engine saw it alone or arrived to
+    # find forty waiting. Nothing is dropped for being "late", because lateness
+    # is a property of the poll, not of the trade.
+    frame_idx = snapshot.frame.index
+    closed_pos = len(frame_idx) + snapshot.closed_index
+    if closed_pos < 1:
         return
-
+    sig_col = snapshot.frame["signal"]
+    cursor = st.session_state.get("live_cursor_time")
     first_cycle = bool(st.session_state.get("live_first_cycle"))
-    if pending_dir == 0 or pending_time is None:
-        st.session_state.live_first_cycle = False
-        entry_trace("Waiting — no signal",
-                    f"No candle in the loaded window carries a {cfg['strategy']} signal yet. "
-                    f"The newest closed candle is {fmt_time(snapshot.last_closed_time)}.")
-        return
-    if decided is not None and pd.Timestamp(pending_time) == pd.Timestamp(decided):
-        st.session_state.live_first_cycle = False
-        entry_trace("Waiting — newest signal already handled",
-                    "The most recent signal in the window has already been acted on or ruled "
-                    "out. The engine is flat and waiting for the NEXT one.",
-                    when=pending_time, ago=pending_ago, direction=pending_dir)
-        return
 
-    # -- how old a signal may be and still be worth taking
-    #
-    # On the first cycle the operator has just pressed Start, usually because a
-    # screener showed a signal, so a wider window is the intent. Afterwards the
-    # window only has to cover a burst of late candles. It is configurable, and
-    # zero is honoured: it then means "the newest closed candle only".
-    if first_cycle:
-        window = int(cfg.get("join_window", 3) or 3)
+    # Where to start looking. On the first cycle the operator has just pressed
+    # Start, usually because a screener showed a signal, so the join window
+    # reaches back a few candles deliberately. If the cursor has fallen out of
+    # the loaded window -- the frame rolls forward as the day goes on -- the
+    # entry window is the honest fallback; scanning all of history would fire
+    # on a cross from last Tuesday.
+    if cursor is None:
+        span = int(cfg.get("join_window", 3) or 3) if first_cycle else 0
+        start = max(0, closed_pos - max(0, span))
     else:
-        window = int(cfg.get("entry_lookback", DEFAULT_ENTRY_LOOKBACK))
-    ago = int(pending_ago or 0)
+        try:
+            start = int(frame_idx.get_loc(pd.Timestamp(cursor))) + 1
+        except (KeyError, TypeError, ValueError):
+            span = max(0, int(cfg.get("entry_lookback", DEFAULT_ENTRY_LOOKBACK)))
+            start = max(0, closed_pos - span)
+    start = max(0, min(start, closed_pos))
 
-    # A burst widens the window to cover itself, for one poll only. Ten candles
-    # arriving together means the tenth-oldest was invisible until this instant,
-    # and there is no sense in calling it "too old to act on" when this is the
-    # first moment it could be acted on at all. The real economic test -- has
-    # price already run to the stop or target the signal implied -- is applied
-    # below regardless, so this widening cannot wave through a dead trade.
-    burst = int(st.session_state.get("bars_added_last_refresh", 0) or 0)
-    if burst > window and ago <= burst:
-        window = min(burst, int(cfg.get("max_burst_entry", 12)))
-        log_event(f"The feed delivered {burst} candles in one refresh, so the entry window is "
-                  f"widened to {window} for this poll: the signal on {fmt_time(pending_time)} "
-                  f"became visible only now. Whether anything is left of the trade is still "
-                  f"checked against the price.", "info")
+    pending = [i for i in range(start, closed_pos + 1) if int(sig_col.iloc[i]) != 0]
 
-    if ago > max(0, window):
-        # Mark it decided so this does not re-log on every poll, and say why.
-        st.session_state.live_last_signal_time = pending_time
+    if not pending:
+        st.session_state.live_cursor_time = frame_idx[closed_pos]
+        st.session_state.live_last_signal_time = snapshot.recent_signal_time
         st.session_state.live_first_cycle = False
-        log_event(f"A {'LONG' if pending_dir > 0 else 'SHORT'} signal is present on "
-                  f"{fmt_time(pending_time)}, {ago} candle(s) back. The entry window is "
-                  f"{max(0, window)} candle(s), so it is too old to take -- chasing it would "
-                  f"buy a move that has already happened. Raise 'Enter on signals up to N "
-                  f"candles old' in the sidebar if you want stale signals taken.", "warn")
-        entry_trace("Refused — older than the entry window",
-                    f"{ago} candles old against a window of {max(0, window)}. Raise "
-                    f"'Live: act on a signal up to N candles old' in the sidebar to take it.",
-                    when=pending_time, ago=ago, direction=pending_dir)
+        entry_trace("Waiting — no new signal",
+                    f"Every closed candle through {fmt_time(frame_idx[closed_pos])} has been "
+                    f"evaluated. The engine is flat and waiting for the next cross.")
         return
 
     # -- liveness: hold, never discard
     #
-    # A dead tape must not produce fills, but the old code returned here BEFORE
-    # looking at the signal, so a trigger that fired while the engine was still
-    # gathering tick evidence was passed over and never revisited. Now the
-    # candidate is simply HELD: it stays undecided, and the next cycle that has
-    # its evidence takes it, as long as it is still inside the window above.
+    # A dead tape must not produce fills. The candidate is HELD rather than
+    # consumed: the cursor is NOT advanced, so the next cycle that has its tick
+    # evidence sees the same candle again and takes it. Nothing ages out while
+    # it is being held, which is what went wrong before.
     if snapshot.frozen and not cfg.get("allow_stale_entries"):
         held = int(st.session_state.get("held_signal_polls", 0)) + 1
         st.session_state.held_signal_polls = held
+        hold_i = pending[0]
         if held in (1, 5, 20) or held % 50 == 0:
             ticks = int(st.session_state.get("live_poll_count", 0))
-            log_event(f"Holding a {'LONG' if pending_dir > 0 else 'SHORT'} signal from "
-                      f"{fmt_time(pending_time)}: candles are lagging and the quote has not "
-                      f"been seen to move yet ({ticks} of {QUOTE_EVIDENCE_TICKS} confirming "
-                      f"ticks). The signal is NOT discarded -- it will be taken as soon as the "
-                      f"tape proves it is live, or dropped once it ages past the entry window.",
-                      "warn")
+            log_event(f"Holding a {'LONG' if int(sig_col.iloc[hold_i]) > 0 else 'SHORT'} signal "
+                      f"from {fmt_time(frame_idx[hold_i])}: candles are lagging and the quote "
+                      f"has not been seen to move yet ({ticks} of {QUOTE_EVIDENCE_TICKS} "
+                      f"confirming ticks). The signal is NOT discarded and cannot age out -- "
+                      f"the cursor stays put until the tape proves it is live.", "warn")
         entry_trace("Held — waiting for proof the venue is open",
-                    "Candles are lagging and the quote has not been seen to move. The signal "
-                    "is kept, not discarded. Tick 'Live: allow entries on a frozen feed' to "
-                    "override.", when=pending_time, ago=ago, direction=pending_dir)
+                    "Candles are lagging and the quote has not been seen to move. The candle "
+                    "stays under the cursor rather than being discarded. Tick 'Live: allow "
+                    "entries on a frozen feed' to override.",
+                    when=frame_idx[hold_i], ago=closed_pos - hold_i,
+                    direction=int(sig_col.iloc[hold_i]))
         return
     st.session_state.held_signal_polls = 0
 
-    # -- is there anything left of the trade?
-    #
-    # A late entry is only worth taking if price has not already run to the stop
-    # or the target that the original signal implied. Checking this stops the
-    # engine opening a position that a faithful backtest would have closed
-    # already, which is the cheapest way to manufacture a fake losing streak.
-    frame_idx = snapshot.frame.index
-    sig_pos = int(frame_idx.get_loc(pending_time))
-    original_fill = (float(snapshot.frame["Open"].iloc[sig_pos + 1])
-                     if sig_pos + 1 < len(frame_idx) else snapshot.ltp)
-    if ago > 0:
-        probe = ExitManager(cfg["risk"], original_fill, pending_dir, closed_ctx)
-        done = probe.check_tick(snapshot.ltp)
-        if done:
-            st.session_state.live_last_signal_time = pending_time
-            st.session_state.live_first_cycle = False
-            log_event(f"A {'LONG' if pending_dir > 0 else 'SHORT'} signal fired {ago} candle(s) "
-                      f"ago at {fmt(original_fill)}, but price has already reached its "
-                      f"{done[1].lower()} at {fmt(snapshot.ltp)}. Not entering -- there is "
-                      f"nothing left of that trade.", "warn")
-            entry_trace("Refused — the trade is already over",
-                        f"Signalled at {fmt(original_fill)}; price is now {fmt(snapshot.ltp)}, "
-                        f"which is past the {done[1].lower()} that signal implied.",
-                        when=pending_time, ago=ago, direction=pending_dir)
-            return
-
-    st.session_state.live_last_signal_time = pending_time
+    # Every candle in this span is accounted for now, whatever happens below.
+    st.session_state.live_cursor_time = frame_idx[closed_pos]
     st.session_state.live_first_cycle = False
+
+    # -- take the OLDEST unconsumed signal, whose N+1 open is the honest fill.
+    #
+    # A signal whose trade has already run to its stop or target is stepped
+    # OVER, not entered: a backtest would have opened and closed it, so opening
+    # it now would be buying a move that is finished. No live trade is invented
+    # for it either -- it was never placed. The engine then looks at the next
+    # signal in the span, which is how a burst of late candles resolves to the
+    # one trade that is still live.
+    chosen = None
+    for i in pending:
+        direction = int(sig_col.iloc[i])
+        bar_time = frame_idx[i]
+        age = closed_pos - i
+        fill_open = (float(snapshot.frame["Open"].iloc[i + 1])
+                     if i + 1 < len(frame_idx) else snapshot.ltp)
+        if age > 0:
+            probe = ExitManager(cfg["risk"], fill_open, direction, closed_ctx)
+            done = probe.check_tick(snapshot.ltp)
+            if done:
+                log_event(f"A {'LONG' if direction > 0 else 'SHORT'} signal on "
+                          f"{fmt_time(bar_time)} would have filled at {fmt(fill_open)}, but "
+                          f"price has since reached its {done[1].lower()} at "
+                          f"{fmt(snapshot.ltp)}. Stepping over it -- that trade is finished, "
+                          f"and no live trade is recorded for a fill that never happened.",
+                          "warn")
+                entry_trace("Stepped over — that trade is already finished",
+                            f"Signalled at {fmt(fill_open)}; price is now "
+                            f"{fmt(snapshot.ltp)}, past the {done[1].lower()} it implied. "
+                            f"Looking at the next signal in the span instead.",
+                            when=bar_time, ago=age, direction=direction)
+                continue
+        chosen = (i, direction, bar_time, age, fill_open)
+        break
+
+    if chosen is None:
+        st.session_state.live_last_signal_time = frame_idx[pending[-1]]
+        return
+
+    _sig_i, pending_dir, pending_time, ago, original_fill = chosen
+    st.session_state.live_last_signal_time = pending_time
 
     # Signal on candle N -> the backtest fills at the open of candle N+1. Live,
     # that open has already passed, so the fill is the price actually available.
@@ -6561,15 +6566,19 @@ def render_sidebar() -> dict:
         help="Kept deliberately small and matched to the Screener's default window, so the two "
              "tabs agree about what counts as a live signal.") if enter_on_start else 3
     entry_lookback = sb.number_input(
-        "Live: act on a signal up to N candles old", min_value=0, max_value=20,
+        "Live: how far back to resume after losing the thread", min_value=0, max_value=20,
         value=DEFAULT_ENTRY_LOOKBACK, step=1, disabled=live, key="cfg_entry_look",
-        help="How stale a signal may be and still be taken. 0 is the strict rule — only the "
-             "candle that is newest on this exact poll — and it is why crossovers got missed: "
-             "a delayed feed delivers several candles at once, so the trigger is rarely the "
-             "newest bar on the poll that sees it. The default of 2 survives a burst without "
-             "chasing. Past the first candle the N+1 open has gone, so the fill is the live "
-             "price while the stop and target stay anchored to the original signal, and the "
-             "trade row says so.")
+        help="This is NOT a staleness window, and it is not what decides whether a crossover "
+             "is traded. The engine keeps a cursor on the newest closed candle it has already "
+             "judged and acts on every signal after it, so a cross on candle N is entered on "
+             "candle N+1 whether the poll that sees it arrives on time, late, or carrying "
+             "forty candles at once. This number only covers the one case where the cursor is "
+             "lost — the loaded window has rolled forward past it, usually after a long gap — "
+             "and says how many candles back to resume from rather than rescanning the day. "
+             "A signal whose stop or target has already been reached is stepped over on its "
+             "own merits, not on its age; past the first candle the N+1 open has gone, so the "
+             "fill is the live price while the stop and target stay anchored to the original "
+             "signal, and the trade row says so.")
     reverse_on_opposite = sb.checkbox(
         "Exit and reverse on an opposite signal", value=False, disabled=live,
         key="cfg_reverse",
@@ -7858,6 +7867,8 @@ def _live_controls(cfg: dict) -> None:
         st.session_state.live_started_at = pd.Timestamp.now()
         st.session_state.live_last_poll = 0.0
         st.session_state.live_first_cycle = True
+        st.session_state.live_cursor_time = None
+        st.session_state.live_started_at = pd.Timestamp.now()
         log_event(f"Core started :: {cfg['symbol']} | {cfg['interval']} | {cfg['strategy']} | "
                   f"{cfg['risk'].as_summary()} | poll {fmt(cfg['poll_seconds'],1)}s", "success")
         st.rerun(scope="app")
@@ -7970,24 +7981,50 @@ def _live_body_inner() -> None:
         st.warning(w)
 
     _metric_style()
+    # The feed banner draws ONLY when something is wrong with the tape, so a
+    # healthy session shows nothing here and the dashboard starts at the top.
     _feed_banner(cfg, snapshot)
-    _heartbeat(cfg, snapshot)
-    _market_data_panel(cfg, snapshot)
     position = st.session_state.live_position
-    if position is not None:
-        _position_dashboard(position, snapshot, cfg["currency"])
-        # The entry gate stays visible while a trade runs: it is the only way to
-        # see whether the profile would still take this trade right now.
-        with st.expander("Entry conditions (still evaluated while the position is open)",
-                         expanded=False):
-            render_condition_checklist(cfg, snapshot)
-    else:
-        _searching_widget(cfg, snapshot)
-    _strategy_status_panel(cfg, snapshot)
-    _entry_decision_log(cfg)
+
+    # ---- the dashboard: state, twelve numbers, the strategy's own verdict ----
+    _live_status_header(cfg, snapshot, position)
+    _strategy_board(cfg, snapshot)
+    st.divider()
     _live_chart(cfg, snapshot)
-    _recent_trades()
-    _feed_diagnostics()
+
+    # ---- everything else behind tabs ----
+    #
+    # All of it was previously stacked down one page, which buried the numbers
+    # that matter during a trade. Tabs rather than expanders because several of
+    # these panels contain expanders of their own, and Streamlit cannot nest
+    # them. Nothing has been removed -- it is one click away instead of in the
+    # way.
+    t_cond, t_pos, t_filt, t_log, t_feed, t_trades = st.tabs(
+        ["Entry conditions", "Position detail", "Filters & strategy",
+         "Entry decision log", "Feed & diagnostics", "Closed trades"])
+    with t_cond:
+        if position is not None:
+            st.caption("Still evaluated while the position is open: this is the only way to "
+                       "see whether the profile would take this same trade right now.")
+            render_condition_checklist(cfg, snapshot)
+        else:
+            _searching_widget(cfg, snapshot)
+    with t_pos:
+        if position is not None:
+            _position_dashboard(position, snapshot, cfg["currency"])
+        else:
+            st.caption("No position is open, so there is nothing to detail. The risk a fill "
+                       "would be given right now is on the dashboard above.")
+    with t_filt:
+        _strategy_status_panel(cfg, snapshot)
+    with t_log:
+        _entry_decision_log(cfg)
+    with t_feed:
+        _heartbeat(cfg, snapshot)
+        _market_data_panel(cfg, snapshot)
+        _feed_diagnostics()
+    with t_trades:
+        _recent_trades()
     _filter_panel(snapshot)
     _broker_panel()
     _event_feed()
@@ -8348,6 +8385,220 @@ def _human_age(seconds: float) -> str:
     return f"{seconds/86400:.1f}d"
 
 
+def _ist(ts) -> str:
+    """A timestamp as IST wall-clock text, whatever tz it arrived in."""
+    if ts is None:
+        return "--"
+    t = pd.Timestamp(ts)
+    try:
+        t = t.tz_localize(DISPLAY_TZ) if t.tz is None else t.tz_convert(DISPLAY_TZ)
+    except (TypeError, ValueError):
+        pass
+    return t.strftime("%H:%M:%S")
+
+
+def _duration_words(entry_time) -> str:
+    """How long the trade has been open, in compact words."""
+    if entry_time is None:
+        return "--"
+    start = pd.Timestamp(entry_time)
+    now = pd.Timestamp.now(tz=start.tz) if start.tz is not None else pd.Timestamp.now()
+    secs = max(0.0, float((now - start).total_seconds()))
+    if secs < 60:
+        return f"{secs:.0f}s"
+    if secs < 3600:
+        return f"{int(secs // 60)}m {int(secs % 60)}s"
+    return f"{int(secs // 3600)}h {int((secs % 3600) // 60)}m"
+
+
+def _position_badge(position: Position | None, snapshot: LiveSnapshot, currency: str) -> None:
+    """
+    One line that answers "what am I in?" before any number is read.
+
+    This replaces a screenful of stacked banners. The state is carried by the
+    badge's colour and its words, never by colour alone.
+    """
+    if position is None:
+        label, tint, edge = "FLAT — no position open", "rgba(130,130,130,0.14)", "#7c7c7c"
+        tail = (f"scanning {snapshot.frame.index.name or ''} for the next "
+                f"signal").replace("  ", " ")
+    else:
+        side = "LONG" if position.direction > 0 else "SHORT"
+        pnl = position.pnl(snapshot.ltp)
+        good = pnl >= 0
+        tint = "rgba(28,160,90,0.16)" if good else "rgba(205,60,60,0.16)"
+        edge = "#1ca05a" if good else "#cd3c3c"
+        label = f"{side} {position.symbol} · {position.interval}"
+        tail = (f"{currency}{fmt_signed(pnl)} "
+                f"({fmt_signed(position.points(snapshot.ltp))} pts) · "
+                f"qty {fmt(position.quantity, 0)}")
+    st.markdown(
+        f"<div style='background:{tint};border-left:4px solid {edge};border-radius:6px;"
+        f"padding:0.55rem 0.9rem;margin:0.1rem 0 0.9rem 0;'>"
+        f"<span style='font-size:1.05rem;font-weight:600;'>{label}</span>"
+        f"<span style='opacity:0.72;margin-left:0.6rem;font-size:0.92rem;'>{tail}</span>"
+        f"</div>", unsafe_allow_html=True)
+
+
+def _live_status_header(cfg: dict, snapshot: LiveSnapshot, position: Position | None) -> None:
+    """
+    The whole live state in a badge, twelve metrics and one caption.
+
+    WHY IT IS SHAPED LIKE THIS. The previous layout stacked a feed banner, a
+    six-metric heartbeat, a market-data panel and a fifteen-metric position
+    grid, each with its own heading and prose, before anything could be read --
+    the operator's words were "a vegetable market". The numbers that matter in
+    a live trade are few and always the same, so they get fixed positions in
+    two rows and never move. When the engine is FLAT the same twelve slots show
+    what WOULD happen on a fill, so the layout does not reflow when a position
+    opens and the risk is visible before it is taken, not after.
+    """
+    currency = cfg.get("currency", "\u20b9")
+    _position_badge(position, snapshot, currency)
+    risk = cfg["risk"]
+    mgr = position.manager if position is not None else None
+    ltp = float(snapshot.ltp)
+
+    if position is not None:
+        entry = position.entry_price
+        sl, tp = mgr.sl, mgr.tp
+        hi = position.high_since_entry or ltp
+        lo = position.low_since_entry or ltp
+        pnl, pts = position.pnl(ltp), position.points(ltp)
+        direction = position.direction
+    else:
+        # Prospective: the levels a fill at this instant would be given.
+        sl_d, tp_d = risk.distances(ltp)
+        entry, direction = ltp, 1
+        sl, tp = ltp - sl_d, ltp + tp_d
+        hi = lo = ltp
+        pnl = pts = 0.0
+
+    def _gap(level):
+        """Points from here to a level, signed so positive means 'not yet hit'."""
+        if level is None or not np.isfinite(level):
+            return None
+        return abs(float(level) - ltp)
+
+    r1 = st.columns(6)
+    r1[0].metric("LTP", f"{currency}{fmt(ltp)}",
+                 help=f"Live quote from {snapshot.ltp_source}. Updates every tick.")
+    r1[1].metric("Entry" if position is not None else "Entry if filled now",
+                 f"{currency}{fmt(entry)}",
+                 None if position is None else f"{_ist(position.entry_time)} IST")
+    r1[2].metric("Stop-loss", f"{currency}{fmt(sl)}" if sl is not None else "none",
+                 None if mgr is None or mgr.initial_sl is None
+                 else f"from {fmt(mgr.initial_sl)}",
+                 help="Checked against the LTP on every tick. A trailing stop only ever "
+                      "moves in the trade's favour." if position is not None else
+                      f"Where a stop would sit right now — {risk.sl_type}.")
+    r1[3].metric("Target (display)" if mgr is not None and mgr.tp_display_only else "Target",
+                 f"{currency}{fmt(tp)}" if tp is not None else "none",
+                 help=None if position is not None else
+                      f"Where a target would sit right now — {risk.tp_type}.")
+    # The slot keeps its name whether or not a trade is open: a label that
+    # changes under the operator makes the row harder to read at a glance, and
+    # reading these at a glance is the entire point of a fixed dashboard.
+    r1[4].metric(f"Live P&L {currency}",
+                 fmt_signed(pnl) if position is not None else "--",
+                 f"{fmt_signed(pts)} pts" if position is not None else None)
+    r1[5].metric("Duration", _duration_words(position.entry_time) if position is not None
+                 else "--", f"{mgr.bars_held} bars" if mgr is not None else None)
+
+    sl_gap, tp_gap = _gap(sl), _gap(tp)
+    r2 = st.columns(6)
+    r2[0].metric("Highest in trade", f"{currency}{fmt(hi)}" if position is not None else "--",
+                 help="True high while the trade has been open. For a SHORT this is the pain "
+                      "side, not the good news.")
+    r2[1].metric("Lowest in trade", f"{currency}{fmt(lo)}" if position is not None else "--",
+                 help="True low while the trade has been open. For a SHORT this is the "
+                      "favourable extreme.")
+    r2[2].metric("Distance to SL", fmt(sl_gap) if sl_gap is not None else "--",
+                 None if not sl_gap or not ltp else f"{sl_gap / ltp * 100:0.2f}%")
+    r2[3].metric("Distance to Target", fmt(tp_gap) if tp_gap is not None else "--",
+                 None if not tp_gap or not ltp else f"{tp_gap / ltp * 100:0.2f}%")
+    r2[4].metric("Entry time (IST)",
+                 _ist(position.entry_time) if position is not None else "--",
+                 None if position is None
+                 else f"signal {_ist(position.signal_bar_time)}")
+    # The routed leg's own price, and ONLY when the engine actually has it. A
+    # number invented from the underlying here would be read as the option
+    # premium, which it is not.
+    leg = None if position is None else (position.option_leg or None)
+    contract_priced = str(snapshot.ltp_source or "").startswith("Dhan")
+    if position is not None and leg and contract_priced:
+        r2[5].metric(f"Option LTP ({leg})", f"{currency}{fmt(ltp)}",
+                     help="The routed contract is the price source, so this is the leg's own "
+                          "traded price.")
+    else:
+        r2[5].metric("Option/Fut LTP", "--",
+                     help="Shown once Dhan is the price source and the entry is routed on an "
+                          "option or futures contract. It is deliberately left blank rather "
+                          "than filled with the underlying price, which would read as a "
+                          "premium it is not.")
+
+    forming = ("current candle forming" if snapshot.last_is_forming
+               else f"newest candle closed, {_human_age(snapshot.feed_age_seconds)} old")
+    started = st.session_state.get("live_started_at")
+    st.caption(
+        f"Ticks {int(st.session_state.get('live_poll_count', 0)):,} · "
+        f"last update {_ist(snapshot.fetched_at)} IST · {forming} · "
+        f"candle {fmt_time(snapshot.last_closed_time)}"
+        + (f" · started {_ist(started)}" if started else ""))
+
+
+def _strategy_board(cfg: dict, snapshot: LiveSnapshot) -> None:
+    """
+    Two columns: what the indicators READ, and what the strategy MAKES of it.
+
+    The left column is the arithmetic, taken off the last CLOSED candle so it
+    can be checked against any charting package. The right column is the
+    verdict, in the strategy's own words, including the raw signal before
+    filters -- which is the one line that distinguishes "the setup never
+    happened" from "it happened and something vetoed it".
+    """
+    left, right = st.columns([1, 1.25])
+
+    with left:
+        st.markdown("##### Strategy parameters (last closed candle)")
+        rows = [{"Indicator": label, "Value": value}
+                for label, value in snapshot.status.metrics]
+        if rows:
+            st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+        else:
+            st.caption("This profile exposes no indicator values.")
+        st.caption(f"Read off the candle closed at {fmt_time(snapshot.last_closed_time)}, so "
+                   f"they step at the candle interval rather than on every tick. The LTP above "
+                   f"is the only value that moves between candles.")
+
+    with right:
+        st.markdown("##### Strategy status board")
+        raw_l = snapshot.raw_signal == 1
+        raw_s = snapshot.raw_signal == -1
+        bullets = [snapshot.status.headline,
+                   f"**LONG needs** — {snapshot.status.long_condition}",
+                   f"**SHORT needs** — {snapshot.status.short_condition}",
+                   f"Last closed candle {fmt_time(snapshot.last_closed_time)}: "
+                   f"raw L={raw_l} S={raw_s}"]
+
+        cursor = st.session_state.get("live_cursor_time")
+        if cursor is not None:
+            bullets.append(f"Candles evaluated through {fmt_time(cursor)} — a cross on candle N "
+                           f"is entered on candle N+1, so nothing here waits on a poll landing "
+                           f"at the right moment.")
+        if snapshot.recent_signal != 0 and snapshot.recent_signal_time is not None:
+            bullets.append(f"Most recent signal in the window: "
+                           f"**{'LONG' if snapshot.recent_signal > 0 else 'SHORT'}** on "
+                           f"{fmt_time(snapshot.recent_signal_time)} "
+                           f"({snapshot.recent_signal_bars_ago} candle(s) back).")
+        vetoed = [r for r in snapshot.filter_reports
+                  if (raw_l and not r.long_ok) or (raw_s and not r.short_ok)]
+        if vetoed:
+            bullets.append("**A signal fired and filters vetoed it** — blocked by "
+                           + ", ".join(f"{r.label} ({r.value})" for r in vetoed))
+        st.markdown("\n".join(f"- {b}" for b in bullets))
+
+
 def _position_dashboard(position: Position, snapshot, currency: str) -> None:
     ltp = snapshot.ltp if snapshot else position.entry_price
     mgr = position.manager
@@ -8503,37 +8754,51 @@ def engine_checks(cfg: dict, snapshot: LiveSnapshot) -> list[ConditionCheck]:
                           need_long=rep.need_long or "filter must allow a long",
                           need_short=rep.need_short or "filter must allow a short"))
 
+    # -- has the engine still to act on this signal?
+    #
+    # This used to ask whether the newest signal was within N candles of NOW,
+    # mirroring an engine that worked the same way. Both were wrong, and for
+    # the same reason: the answer changed depending on when the poll landed,
+    # so a real crossover could read "too old" seconds after it printed. The
+    # engine now keeps a CURSOR -- the newest closed candle it has already
+    # evaluated -- and acts on every signal after it. The checklist asks that
+    # same question, so the panel and the engine can never disagree.
     ago = snapshot.recent_signal_bars_ago
-    lookback = int(cfg.get("entry_lookback", 0) or 0)
-    if snapshot.last_closed_signal != 0:
-        fresh = True
-        detail = "signal on the newest closed candle"
-    elif snapshot.recent_signal != 0 and ago is not None:
-        fresh = bool(lookback >= ago > 0)
-        detail = (f"last signal {ago} candle(s) ago; catch-up allows {lookback}"
-                  if not fresh else f"{ago} candle(s) ago, inside the catch-up window")
+    cursor = st.session_state.get("live_cursor_time")
+    sig_time = snapshot.recent_signal_time
+    has_signal = snapshot.recent_signal != 0 and sig_time is not None
+    if not has_signal:
+        pending = False
+        detail = "no signal on any closed candle in the loaded window"
+    elif cursor is None:
+        pending = True
+        detail = ("the engine has not evaluated any candle yet, so this signal is still "
+                  "to be acted on")
     else:
-        fresh = False
-        detail = "no signal on any recent closed candle"
-    side_long = fresh and (snapshot.last_closed_signal == 1 or snapshot.recent_signal == 1)
-    side_short = fresh and (snapshot.last_closed_signal == -1 or snapshot.recent_signal == -1)
-    checks.append(_ck("Signal fresh enough to act on", side_long, side_short, detail,
-                      current=("no recent signal" if snapshot.recent_signal == 0 else
-                               f"{'LONG' if snapshot.recent_signal > 0 else 'SHORT'}, "
-                               f"{ago} candle(s) ago"),
-                      need_long="a LONG signal on the newest closed candle"
-                                + (f" (or within {lookback})" if lookback else ""),
-                      need_short="a SHORT signal on the newest closed candle"
-                                 + (f" (or within {lookback})" if lookback else "")))
+        try:
+            pending = pd.Timestamp(sig_time) > pd.Timestamp(cursor)
+        except (TypeError, ValueError):
+            pending = False
+        detail = (f"signalled {fmt_time(sig_time)}, which is after the cursor at "
+                  f"{fmt_time(cursor)} -- still to be acted on" if pending else
+                  f"signalled {fmt_time(sig_time)}; the engine has already evaluated every "
+                  f"candle through {fmt_time(cursor)}, so this one is settled")
+    side_long = pending and snapshot.recent_signal == 1
+    side_short = pending and snapshot.recent_signal == -1
+    checks.append(_ck("Signal still to be acted on", side_long, side_short, detail,
+                      current=("no recent signal" if not has_signal else
+                               f"{'LONG' if snapshot.recent_signal > 0 else 'SHORT'} on "
+                               f"{fmt_time(sig_time)}"
+                               + (f", {ago} candle(s) back" if ago is not None else "")),
+                      need_long="a LONG signal on a candle the cursor has not reached",
+                      need_short="a SHORT signal on a candle the cursor has not reached"))
 
-    already = st.session_state.get("live_last_signal_time")
-    sig_time = snapshot.last_closed_time if snapshot.last_closed_signal != 0 \
-        else snapshot.recent_signal_time
-    unused = already != sig_time
-    checks.append(_ck("Signal not already traded", unused, unused,
-                      "fresh" if unused else "this exact signal was already taken",
-                      current=fmt_time(already) if already else "none taken yet",
-                      need_long="an untraded signal", need_short="an untraded signal"))
+    checks.append(_ck("Candles evaluated up to", None, None,
+                      "every closed candle through here has been judged exactly once, "
+                      "whatever the polling cadence",
+                      current=fmt_time(cursor) if cursor is not None
+                      else "nothing evaluated yet",
+                      need_long="--", need_short="--"))
     return checks
 
 
@@ -8620,7 +8885,7 @@ def strategy_checks(name: str, frame: pd.DataFrame, params: dict,
     from closed candles and legitimately step only at a candle close — except
     the EMAs, which are projected to the live price so a crossover distance is
     not frozen between bars. The actual signal is still evaluated on the closed
-    candle; that is what condition "Signal fresh enough to act on" reports.
+    candle; that is what condition "Signal still to be acted on" reports.
     """
     def last(col):
         return safe_last(frame[col]) if col in frame.columns else None
@@ -8867,7 +9132,7 @@ def render_condition_checklist(cfg: dict, snapshot: LiveSnapshot) -> None:
                "update on every tick; EMAs are projected to the live price; zones, gaps and "
                "boxes are drawn from closed candles and step only when a candle closes. The "
                "trade itself still triggers on a closed candle, which is what condition "
-               "*Signal fresh enough to act on* reports.")
+               "*Signal still to be acted on* reports.")
 
 
 def _searching_widget(cfg: dict, snapshot: LiveSnapshot) -> None:
@@ -22557,6 +22822,275 @@ def _test_live_entry_is_not_poll_dependent():
         globals().update(saved)
 
 
+def _test_live_dashboard_layout():
+    """
+    The live tab's twelve slots are fixed, and they say what they show.
+
+    THE COMPLAINT THIS EXISTS FOR. The tab had grown a feed banner, a
+    six-metric heartbeat, a market-data panel, a fifteen-metric position grid
+    and two more metric rows below that, each with its own heading and prose --
+    "a vegetable market". The remedy is a fixed dashboard, so what is asserted
+    here is the SHAPE: the same twelve labels in the same order whether or not
+    a position is open, so nothing reflows under the operator's eyes at the
+    moment a trade opens.
+
+    Also asserted: the distances are real arithmetic against the live price,
+    and the option slot stays EMPTY unless the routed contract is genuinely the
+    price source -- filling it with the underlying would read as a premium.
+    """
+    class Recorder(_FakeStreamlit):
+        def __init__(self):
+            super().__init__()
+            self.metrics: list[tuple[str, str]] = []
+            self.text: list[str] = []
+
+        def metric(self, label="", value="", delta=None, **kw):
+            self.metrics.append((str(label), str(value)))
+
+        def markdown(self, body="", **kw):
+            self.text.append(str(body))
+
+        def caption(self, body="", **kw):
+            self.text.append(str(body))
+
+        def dataframe(self, data=None, **kw):
+            self.text.append("<table>")
+
+    real_st = globals()["st"]
+    try:
+        n = 300
+        rng = np.random.default_rng(3)
+        close = 24000 + np.cumsum(rng.normal(0, 3, n))
+        idx = pd.date_range(end=pd.Timestamp.now(tz=DISPLAY_TZ).floor("1min"),
+                            periods=n, freq="1min", tz=DISPLAY_TZ)
+        raw = pd.DataFrame({"Open": close, "High": close + 5, "Low": close - 5,
+                            "Close": close, "Volume": 1e5}, index=idx)
+        raw["High"] = raw[["Open", "High", "Close"]].max(axis=1)
+        raw["Low"] = raw[["Open", "Low", "Close"]].min(axis=1)
+        params = dict(DEFAULT_PARAMS, ema_fast=9, ema_slow=15)
+        name = "01 · Dual EMA Crossover"
+        cfg = {"symbol": "^NSEI", "interval": "1m", "strategy": name, "params": params,
+               "risk": RiskConfig("ATR Multiple", 1.5, "Risk : Reward Multiple", 2.0, 1.0,
+                                  costs=CostModel()),
+               "poll_seconds": 5, "candle_seconds": 15.0, "quantity": 1.0, "currency": "\u20b9",
+               "filter_cfg": {}, "filter_extras": {}, "broker": {}, "costs": CostModel(),
+               "entry_lookback": DEFAULT_ENTRY_LOOKBACK, "join_window": 3,
+               "tick_candles": False}
+
+        def setup():
+            fake = Recorder()
+            globals()["st"] = fake
+            for k, v in _STATE_DEFAULTS.items():
+                fake.session_state[k] = (list(v) if isinstance(v, list)
+                                         else dict(v) if isinstance(v, dict) else v)
+            fake.session_state["live_poll_count"] = 137
+            fake.session_state["live_started_at"] = pd.Timestamp.now()
+            return fake
+
+        WANT = ["LTP", "Stop-loss", "Live P&L", "Duration", "Highest in trade",
+                "Lowest in trade", "Distance to SL", "Distance to Target",
+                "Entry time (IST)"]
+
+        # ---- flat: the same slots, showing what a fill would be given ----
+        fake = setup()
+        frame, reports = prepare(raw, name, params, None, {})
+        ltp = float(frame["Close"].iloc[-1]) + 1.2
+        snap = build_snapshot(cfg, frame, reports, [], None, ltp, "Yahoo quote")
+        _live_status_header(cfg, snap, None)
+        _strategy_board(cfg, snap)
+        flat_labels = [lab for lab, _ in fake.metrics]
+        assert len(fake.metrics) == 12, \
+            f"the dashboard must draw exactly 12 metrics when flat, drew {len(fake.metrics)}"
+        assert "Entry if filled now" in flat_labels, \
+            "when flat the entry slot must show the prospective fill, not sit blank"
+        for want in WANT:
+            assert any(want in lab for lab in flat_labels), f"missing slot while flat: {want}"
+        sl_flat = dict(fake.metrics)["Distance to SL"]
+        assert sl_flat not in ("--", ""), \
+            "the stop distance a fill would carry must be visible BEFORE the trade, " \
+            "which is the only time it can still be changed"
+
+        # ---- in a trade: identical slots, now with trade values ----
+        fake = setup()
+        ctx = bar_ctx(frame, len(frame) - 2)
+        pos = _open_live_position(cfg, 1, float(frame["Close"].iloc[-2]), ctx,
+                                  frame.index[-2], bars_ago=0)
+        pos.high_since_entry = float(frame["High"].iloc[-6:].max())
+        pos.low_since_entry = float(frame["Low"].iloc[-6:].min())
+        fake.metrics.clear()
+        _live_status_header(cfg, snap, pos)
+        live = dict(fake.metrics)
+        assert len(fake.metrics) == 12, \
+            f"the dashboard must draw exactly 12 metrics in a trade, drew {len(fake.metrics)}"
+        for want in WANT:
+            assert any(want in lab for lab in live), f"missing slot in a trade: {want}"
+        assert live["Duration"] != "--", "an open trade must report how long it has run"
+        # the distances are arithmetic, not decoration
+        sl_shown = float(str(live["Distance to SL"]).replace(",", ""))
+        assert abs(sl_shown - abs(pos.manager.sl - snap.ltp)) < 0.02, \
+            "'Distance to SL' must be the real gap between the live price and the stop"
+
+        # ---- the option slot: blank unless the contract IS the price source ----
+        assert live["Option/Fut LTP"] == "--", \
+            "with no routed contract the option slot must stay blank rather than echo the " \
+            "underlying, which would be read as a premium"
+        pos.option_leg = "CE"
+        fake.metrics.clear()
+        dhan = build_snapshot(cfg, frame, reports, [], None, ltp, "Dhan (real-time quote)")
+        _live_status_header(cfg, dhan, pos)
+        assert any(lab.startswith("Option LTP") for lab, _ in fake.metrics), \
+            "once Dhan prices the routed leg, the option slot must show it"
+
+        # ---- the status board must state the raw signal and the cursor ----
+        fake = setup()
+        fake.session_state["live_cursor_time"] = frame.index[-2]
+        _strategy_board(cfg, snap)
+        board = "\n".join(fake.text)
+        assert "raw L=" in board and "S=" in board, \
+            "the board must show the RAW signal: it is what separates 'the setup never " \
+            "happened' from 'it happened and a filter vetoed it'"
+        assert "evaluated through" in board, \
+            "the board must say how far the entry cursor has read, so a missing trade can " \
+            "be told apart from a missing signal"
+        print("   live dashboard: 12 fixed slots flat and in-trade, real SL/TP distances, "
+              "option slot honest, board states raw signal and cursor  OK")
+    finally:
+        globals()["st"] = real_st
+
+
+def _test_every_crossover_enters_on_the_next_candle():
+    """
+    THE RULE, AS AN ASSERTION: a signal on candle N is entered on candle N+1.
+
+    THE BUG THIS EXISTS FOR. The operator ran a plain 9/15 EMA crossover and the
+    ledger stayed empty all session while the chart showed cross after cross.
+    Every existing live test polled right at a single crossover and passed, so
+    nothing caught it. The cause was that the engine judged a signal by its age
+    at the moment of the poll -- "is the newest signal within N candles of now?"
+    -- and then marked anything older as decided, permanently. Replaying this
+    function over a seven-crossover series showed 7 entries of 7 when every
+    candle was polled, 3 of 7 at one poll per five candles and 2 of 7 at one per
+    eight, with the misses never revisited. A sleeping tab, a burst, a rerun
+    landing mid-candle: each quietly cost a trade.
+
+    So the two properties asserted here are the ones the old design could not
+    hold, and neither is about a single crossover:
+
+    1. EVERY crossover in a multi-signal session produces an entry, and does it
+       on the candle immediately after the signal (``signal_bars_ago == 0``).
+    2. Blacking the engine out across whole crossovers loses NO entry
+       permanently -- the signal is taken late if it is still live, and the
+       crossovers that follow are unaffected.
+    """
+    real_st = globals()["st"]
+    fake = _FakeStreamlit()
+    globals()["st"] = fake
+    saved = {name: globals()[name] for name in
+             ("refresh_candles", "fetch_live_ltp", "db_save_position", "send_email",
+              "_maybe_route_broker")}
+    try:
+        # A gently oscillating series, so 9/15 crosses repeatedly instead of
+        # trending once. Timestamps are FIXED: a real feed never restamps a bar.
+        n = 420
+        rng = np.random.default_rng(11)
+        wave = 24000 + 40 * np.sin(np.arange(n) / 11.0) + np.cumsum(rng.normal(0, 1.2, n))
+        idx = pd.date_range(end=pd.Timestamp.now(tz=DISPLAY_TZ).floor("1min"),
+                            periods=n, freq="1min", tz=DISPLAY_TZ)
+        raw = pd.DataFrame({"Open": wave, "High": wave + 4, "Low": wave - 4,
+                            "Close": wave, "Volume": 1e5}, index=idx)
+        raw["High"] = raw[["Open", "High", "Close"]].max(axis=1)
+        raw["Low"] = raw[["Open", "Low", "Close"]].min(axis=1)
+
+        name = "01 · Dual EMA Crossover"
+        params = dict(DEFAULT_PARAMS, ema_fast=9, ema_slow=15)
+        full, _ = prepare(raw, name, params)
+        WARM = 200
+        crosses = [i for i in range(WARM, n) if int(full["signal"].iloc[i]) != 0]
+        assert len(crosses) >= 5, f"the fixture needs several crossovers, got {len(crosses)}"
+
+        cfg = {"symbol": "^NSEI", "interval": "1m", "strategy": name, "params": params,
+               "risk": RiskConfig("ATR Multiple", 1.5, "Risk : Reward Multiple", 2.0, 1.0,
+                                  costs=CostModel()),
+               "poll_seconds": 5, "candle_seconds": 15.0, "quantity": 1.0, "currency": "\u20b9",
+               "filter_cfg": {}, "filter_extras": {}, "broker": {}, "costs": CostModel(),
+               "entry_lookback": DEFAULT_ENTRY_LOOKBACK, "join_window": 3,
+               "square_off_eod": False, "tick_candles": False}
+
+        served = {"upto": 0, "drift": 0.0}
+        globals()["refresh_candles"] = lambda c: (full.iloc[:served["upto"]].copy(), [], [], None)
+
+        def _ltp(c, f):
+            served["drift"] += 1.0
+            return float(f["Close"].iloc[-1]) + (served["drift"] % 5) * 0.2, "stub"
+        globals()["fetch_live_ltp"] = _ltp
+        for stub in ("db_save_position", "send_email", "_maybe_route_broker"):
+            globals()[stub] = lambda *a, **k: None
+
+        def session(blackout=frozenset()):
+            """Run a whole session, skipping the blacked-out bars. Returns entries."""
+            fake.session_state.clear()
+            fake.session_state.update({
+                "live_running": True, "live_position": None, "live_trades": [],
+                "live_events": [], "live_last_bar": None, "live_last_signal_time": None,
+                "live_cursor_time": None, "live_snapshot": None, "live_error": None,
+                "live_poll_count": 0, "live_frame": None, "live_frame_at": 0.0,
+                "candle_refreshes": 0, "feed_log": [], "last_seen_ltp": None,
+                "last_ltp_change_ts": 0.0, "live_fail_streak": 0, "live_backoff_until": 0.0,
+                "live_first_cycle": True, "suspect_ticks": 0, "live_reports": [],
+                "live_frame_warnings": [], "live_vix": None, "order_book": None,
+                "live_config": cfg, "last_closed_bar": None, "held_signal_polls": 0,
+                "entry_trace": [], "newest_bar_seen": None, "newest_bar_advanced_ts": 0.0,
+                "bars_added_last_refresh": 0,
+            })
+            out = []
+            for upto in range(WARM, n + 1):
+                if upto in blackout:
+                    continue
+                served["upto"] = upto
+                fake.session_state["live_frame_at"] = 0.0
+                before = fake.session_state.get("live_position")
+                run_cycle(cfg)
+                pos = fake.session_state.get("live_position")
+                if pos is not None and before is None:
+                    out.append((upto, pos.signal_bars_ago, pos.direction))
+            return out
+
+        # 1. the headline property: one entry per crossover, each on the NEXT candle
+        entries = session()
+        assert len(entries) == len(crosses), \
+            (f"{len(crosses)} crossovers produced {len(entries)} entries. Every crossover "
+             f"must be traded -- an empty ledger beside a chart full of crosses is the "
+             f"original reported failure.")
+        ages = [a for _, a, _ in entries]
+        assert all(a == 0 for a in ages), \
+            (f"entries were filled at signal ages {ages}; a signal on candle N must be "
+             f"entered on candle N+1, which is an age of 0 closed candles")
+        for (upto, _, direction), cross in zip(entries, crosses):
+            assert upto == cross + 1, \
+                f"the cross on bar {cross} was entered at bar {upto}, not {cross + 1}"
+            assert direction == int(full["signal"].iloc[cross]), \
+                f"the entry on bar {cross} took the wrong side"
+
+        # 2. a blackout must not cost a trade permanently. Blank the engine out
+        #    across the first three crossovers, the way a sleeping tab does.
+        dark = set()
+        for c in crosses[:3]:
+            dark.update(range(c - 1, c + 6))
+        recovered = session(blackout=frozenset(dark))
+        assert len(recovered) == len(crosses), \
+            (f"after a blackout across three crossovers only {len(recovered)} of "
+             f"{len(crosses)} entries happened. A missed poll must delay a trade, never "
+             f"cancel it, and must never affect the crossovers that follow.")
+        late = [a for _, a, _ in recovered if a and a > 0]
+        assert late, "the blackout should have forced at least one late fill"
+
+        print(f"   N -> N+1 entry: {len(crosses)}/{len(crosses)} crossovers traded on the "
+              f"next candle; blackout delayed {len(late)} but lost none  OK")
+    finally:
+        globals()["st"] = real_st
+        globals().update(saved)
+
+
 def _test_every_signal_gets_a_recorded_verdict():
     """
     Across a whole simulated session, no signal may be passed over in silence,
@@ -26248,6 +26782,8 @@ def run_selftest() -> int:
         _test_pattern_library()
         _test_signal_detail()
         _test_live_entry_and_gates()
+        _test_every_crossover_enters_on_the_next_candle()
+        _test_live_dashboard_layout()
         _test_universe_resolution()
         _test_timeframe_period_scaling()
         _test_search_grid_and_quality()
