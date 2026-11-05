@@ -47,6 +47,25 @@ except Exception:  # pragma: no cover
     import pytz
     IST = pytz.timezone("Asia/Kolkata")
 
+def _harden_streamlit_runtime() -> None:
+    """Fix for the intermittent 'Connection error: Cached ForwardMsg MISS' popup.
+
+    Streamlit caches large messages (charts / tables ≥10 KB) in the browser and later sends only a hash reference.
+    The browser evicts those entries after `maxCachedMessageAge` script runs (default 2). With a live fragment
+    re-running every few seconds plus app-reruns after exits, the server can reference an entry the browser has already
+    evicted → MISS. Disabling the cache (min size = ∞) makes every message self-contained. The server reads this option
+    per message, so setting it here at import time is effective without config.toml or CLI flags."""
+    try:
+        from streamlit import config as _stc
+        _stc.get_config_options()  # force config parse first, otherwise a later lazy parse would reset our values
+        _stc._set_option("global.minCachedMessageSize", 1e15, "QuantEdge: ForwardMsg cache disabled (MISS fix)")
+        _stc._set_option("global.maxCachedMessageAge", 10_000, "QuantEdge: ForwardMsg cache disabled (MISS fix)")
+    except Exception:  # option names differ in very old/new versions → harmless no-op
+        pass
+
+
+_harden_streamlit_runtime()
+
 APP_NAME = "QuantEdge Pro"
 DATA_DIR = os.environ.get("QE_DATA_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "algo_data"))
 os.makedirs(DATA_DIR, exist_ok=True)
