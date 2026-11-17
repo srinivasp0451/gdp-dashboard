@@ -17,7 +17,7 @@ dhanhq==2.0.2
 #dhanhq==2.2.0
 nest-asyncio
 Dhan-Tradehull
-#sqlite3
+sqlite3
 #pysqlite
 curl_cffi
 openpyxl
@@ -31,5 +31,6 @@ opencv-python==4.9.0.80
 ortools>=9.8
 playwright
 webdriver-manager
+sqlalchemy
 
 
